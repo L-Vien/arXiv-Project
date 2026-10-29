@@ -433,43 +433,7 @@ def is_download_complete(
     versioned_id: str,
     output_dir: str | Path,
 ) -> bool:
-    validate_versioned_id(versioned_id)
-    output_dir = Path(output_dir)
-
-    output_path = output_dir / f"{versioned_id}.source"
-    success_marker = output_dir / f"{versioned_id}.source.ok"
-
-    if not output_path.is_file() or not success_marker.is_file():
-        return False
-
-    actual_size = output_path.stat().st_size
-
-    if actual_size <= 0:
-        return False
-
-    try:
-        value = success_marker.read_text(encoding="utf-8")
-
-        # Legacy marker
-        if value.strip() == "downloaded":
-            return True
-
-        metadata = json.loads(value)
-
-        return (
-            isinstance(metadata, dict)
-            and metadata.get("status") == "downloaded"
-            and type(metadata.get("size_bytes")) is int
-            and metadata["size_bytes"] == actual_size
-            and isinstance(metadata.get("sha256"), str)
-            and re.fullmatch(
-                r"[0-9a-f]{64}",
-                metadata["sha256"],
-            ) is not None
-        )
-
-    except (OSError, UnicodeError, ValueError, TypeError):
-        return False
+    return verify_integrity(versioned_id, output_dir) is True
 
 def download_with_status(versioned_id: str, output_dir: str | Path) -> dict[str, str | None]:
     try: 

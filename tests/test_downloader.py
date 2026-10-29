@@ -861,13 +861,17 @@ def test_integrity_detects_same_size_corruption(tmp_path):
     source = tmp_path / f"{versioned_id}.source"
     source.write_bytes(b"ABCDEF")
     write_integrity_marker(source)
+
+    # Original file is valid
     assert verify_integrity(versioned_id, tmp_path) is True
+    assert is_download_complete(versioned_id, tmp_path) is True
+
     # Modify contents without changing the file size
     source.write_bytes(b"XXXXXX")
-    # Fast Check does not hash the file
-    assert is_download_complete(versioned_id, tmp_path) is True
-    # Full Integrity Check detects corruption
+
+    # SHA-256 must detect the corruption
     assert verify_integrity(versioned_id, tmp_path) is False
+    assert is_download_complete(versioned_id, tmp_path) is False
 
 
 def test_integrity_legacy_marker(tmp_path):
@@ -876,7 +880,8 @@ def test_integrity_legacy_marker(tmp_path):
     marker = tmp_path / f"{versioned_id}.source.ok"
     source.write_bytes(b"Legacy source")
     marker.write_text("downloaded\n", encoding="utf-8")
-    assert is_download_complete(versioned_id, tmp_path) is True
+
+    assert is_download_complete(versioned_id, tmp_path) is False
     # No stored checksum to verify
     assert verify_integrity(versioned_id, tmp_path) is None
 
@@ -896,8 +901,9 @@ def test_integrity_detects_size_mismatch(tmp_path):
     source = tmp_path / f"{versioned_id}.source"
     source.write_bytes(b"Original content")
     write_integrity_marker(source)
+
     assert is_download_complete(versioned_id, tmp_path) is True
-# Truncate source after creating its marker
+    # Truncate source after creating its marker
     source.write_bytes(b"Short")
     assert is_download_complete(versioned_id, tmp_path) is False
     assert verify_integrity(versioned_id, tmp_path) is False
@@ -952,10 +958,55 @@ def test_batch_dedup_retries_failed_id(tmp_path):
             versioned_ids,
             tmp_path,
         )
-    # Failed result must not enter the success cache
+# Failed result must not enter the success cache
     assert mock_download.call_count == 2
     assert [result["status"] for result in results] == [
         "failed",
         "downloaded",
         "skipped",
     ]
+
+def test_redownload_corrupted_source(tmp_path):
+    versioned_id = "2607.28694v1"
+    payload = gzip.compress(b"Valid arXiv source")
+
+    def make_response():
+        response = BytesIO(payload)
+        response.headers = {
+            "Content-Length": str(len(payload))
+        }
+        return response
+
+    with patch(
+        "src.downloader.urlopen",
+        side_effect=[make_response(), make_response()]
+    ) as mock_urlopen:
+
+        with patch(
+            "src.downloader.DEFAULT_RATE_LIMITER",
+            RateLimiter(0)
+        ):
+            # First download
+            first = download_with_status(
+                versioned_id, tmp_path
+            )
+
+            source = tmp_path / f"{versioned_id}.source"
+
+            assert first["status"] == "downloaded"
+            assert verify_integrity(versioned_id, tmp_path) is True
+
+            # Corrupt file without changing its size
+            source.write_bytes(b"X" * len(payload))
+
+            assert verify_integrity(versioned_id, tmp_path) is False
+
+            # Second download must repair corrupted source
+            second = download_with_status(
+                versioned_id, tmp_path
+            )
+
+    assert second["status"] == "downloaded"
+    assert mock_urlopen.call_count == 2
+    assert source.read_bytes() == payload
+    assert verify_integrity(versioned_id, tmp_path) is True
