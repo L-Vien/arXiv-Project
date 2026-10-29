@@ -3,18 +3,25 @@ import json
 import re
 import argparse
 import time
+import random
+
+from src.logger import get_logger, setup_logging
+
+logger = get_logger(__name__)
+
+# Configuration
+BATCH_SIZE = 100
+MAX_RETRIES = 3
+RETRY_DELAY = 5
 
 client = arxiv.Client(
-    page_size=100,
+    page_size=BATCH_SIZE,
     delay_seconds=3,
     num_retries=0
 )
 
-BATCH_SIZE = 50
-MAX_RETRIES = 3
-RETRY_DELAY = 5
 
-# Parse from command line, 
+# Parse command-line input
 def parse_input():
     parser = argparse.ArgumentParser()
 
@@ -31,10 +38,15 @@ def parse_input():
     if not (1 <= start_month <= 12 and 1 <= end_month <= 12):
         parser.error("Month must be between 01 and 12")
 
-    if not (1 <= args.start_id <= 99999 and 1 <= args.end_id <= 99999):
+    if not (
+        1 <= args.start_id <= 99999
+        and 1 <= args.end_id <= 99999
+    ):
         parser.error("Paper ID must be between 1 and 99999")
 
-    if (start_year, start_month, args.start_id) > (end_year, end_month, args.end_id):
+    if (start_year, start_month, args.start_id) > (
+        end_year, end_month, args.end_id
+    ):
         parser.error("Start must not be later than end")
 
     return {
@@ -46,8 +58,16 @@ def parse_input():
         "end_id": args.end_id
     }
 
-# From the input of command line, extract each command into a list of arxiv ids
-def generate_arxiv_ids(start_month, start_year, end_month, end_year, start_id, end_id):
+
+# Generate arXiv IDs
+def generate_arxiv_ids(
+    start_month,
+    start_year,
+    end_month,
+    end_year,
+    start_id,
+    end_id
+):
     start = start_year * 12 + (start_month - 1)
     end = end_year * 12 + (end_month - 1)
 
@@ -58,120 +78,304 @@ def generate_arxiv_ids(start_month, start_year, end_month, end_year, start_id, e
         if start == end:
             first_id = start_id
             last_id = end_id
+
         elif month_index == start:
             first_id = start_id
             last_id = 99999
+
         elif month_index == end:
             first_id = 1
             last_id = end_id
+
         else:
             first_id = 1
             last_id = 99999
 
         for i in range(first_id, last_id + 1):
-            yield f"{year % 100:02d}{month:02d}.{i:05d}" # arxiv id format: YYMM.XXXXX
+            yield f"{year % 100:02d}{month:02d}.{i:05d}"
 
-def extract_revised_dates(arxiv_id, latest_version):
-    revised_dates = []
 
-    for version in range(2, latest_version + 1):
-        versioned_id = f"{arxiv_id}v{version}"
+# Batch utilities
+def batch_ids(ids, batch_size=BATCH_SIZE):
+    ids = iter(ids)
 
-        search = arxiv.Search(
-            id_list=[versioned_id]
-        )
+    while True:
+        batch = []
 
-        paper = next(client.results(search), None)
+        for _ in range(batch_size):
+            try:
+                batch.append(next(ids))
+            except StopIteration:
+                break
 
-        if paper is None:
-            raise RuntimeError(
-                f"Cannot retrieve version {versioned_id}"
+        if not batch:
+            return
+
+        yield batch
+
+
+# Fetch a batch with retry
+def fetch_batch(ids):
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            search = arxiv.Search(
+                id_list=ids,
+                max_results=len(ids)
             )
 
-        revised_dates.append(
-            paper.updated.date().isoformat()
-        )
+            papers = list(client.results(search))
 
-    return revised_dates
-
-def discover_paper(arxiv_id):
-    search = arxiv.Search(
-        id_list=[arxiv_id]
-    )
-
-    paper = next(client.results(search), None)
-
-    if paper is None:
-        return None
-
-    return paper
-
-def discover_ids(arxiv_ids):
-    results = []
-    failed_ids = []
-
-    for arxiv_id in arxiv_ids:
-        try:
-            metadata = fetch_arxiv_metadata(arxiv_id)
-
-            if metadata is None:
-                print(f"[NOT FOUND] {arxiv_id}")
-                continue
-
-            results.append(metadata)
-            print(f"[SUCCESS] {arxiv_id}")
+            return papers
 
         except Exception as e:
-            failed_ids.append(arxiv_id)
-            print(f"[ERROR] {arxiv_id}: {e}")
+            if attempt == MAX_RETRIES:
+                logger.exception(
+                    "Batch request failed after %d retries; batch_size=%d",
+                    MAX_RETRIES,
+                    len(ids)
+                )
+                raise
 
-    return results, failed_ids
+            delay = RETRY_DELAY * (2 ** attempt)
+            delay += random.uniform(0, 1)
 
-def fetch_arxiv_metadata(arxiv_id):
-    paper = discover_paper(arxiv_id)
+            logger.warning(
+                "Retry attempt %d/%d failed; batch_size=%d; error=%s",
+                attempt + 1,
+                MAX_RETRIES,
+                len(ids),
+                e
+            )
 
-    if paper is None:
-        return None
+            logger.info(
+                "Waiting %.2f seconds before retry",
+                delay
+            )
 
-    return parse_entry(paper, arxiv_id)
+            time.sleep(delay)
 
 
-def parse_entry(paper, arxiv_id):
-    versions = extract_versions(paper)
+# Extract version information
+def get_base_id(paper):
+    return re.sub(r"v\d+$", "", paper.get_short_id())
 
-    latest_version = len(versions)
-
-    revised_dates = extract_revised_dates(
-        arxiv_id,
-        latest_version
-    )
-
-    return {
-        "arxiv_id": arxiv_id,
-        "title": paper.title,
-        "authors": [author.name for author in paper.authors],
-        "submission_date": paper.published.date().isoformat(),
-        "revised_dates": revised_dates,
-        "venue": paper.journal_ref
-    }
+def get_latest_version(paper):
+    match = re.search(r"v(\d+)$", paper.get_short_id())
+    return int(match.group(1)) if match else 1
 
 
 def extract_versions(paper):
-    paper_id = paper.get_short_id()
-    match = re.search(r"v(\d+)$", paper_id)
+    latest_version = get_latest_version(paper)
 
-    latest_version = int(match.group(1)) if match else 1
-
-    versions = [
+    return [
         f"v{i}"
         for i in range(1, latest_version + 1)
     ]
 
-    return versions
 
+# Batch discovery
+def discover_ids(arxiv_ids):
+    start_time = time.perf_counter()
+
+    results = []
+    failed_ids = []
+    not_found_ids = []
+    paper_map = {}
+
+    logger.info("Starting discovery")
+
+    for batch_number, batch in enumerate(
+        batch_ids(arxiv_ids),
+        start=1
+    ):
+        batch_start = time.perf_counter()
+
+        logger.info(
+            "PROCESSING initial metadata | Batch %d | Papers %s - %s | Size: %d",
+            batch_number,
+            batch[0],
+            batch[-1],
+            len(batch)
+        )
+
+        try:
+            papers = fetch_batch(batch) or []
+
+        except Exception:
+            logger.exception(
+                "Failed to fetch initial metadata: batch=%d, size=%d",
+                batch_number,
+                len(batch)
+            )
+
+            failed_ids.extend(batch)
+            continue
+
+        for paper in papers:
+            base_id = get_base_id(paper)
+            paper_map[base_id] = paper
+
+        # Identify IDs not returned by the API.
+        returned_ids = {
+            get_base_id(paper)
+            for paper in papers
+        }
+
+        for arxiv_id in batch:
+            if arxiv_id not in returned_ids:
+                not_found_ids.append(arxiv_id)
+
+                logger.warning(
+                    "Paper not found: %s",
+                    arxiv_id
+                )
+
+        logger.debug(
+            "Initial metadata batch completed: batch=%d, returned=%d, elapsed=%.2fs",
+            batch_number,
+            len(papers),
+            time.perf_counter() - batch_start
+        )
+
+    # Collect historical revision IDs.
+    revision_ids = []
+
+    for arxiv_id, paper in paper_map.items():
+        latest_version = get_latest_version(paper)
+
+        for version in range(2, latest_version):
+            revision_ids.append(
+                f"{arxiv_id}v{version}"
+            )
+
+    logger.info(
+        "Collected %d historical revision IDs",
+        len(revision_ids)
+    )
+
+    revision_map = {}
+
+    for batch_number, batch in enumerate(
+        batch_ids(revision_ids),
+        start=1
+    ):
+        batch_start = time.perf_counter()
+
+        logger.info(
+            "PROCESSING revision metadata | Batch %d | Versions %s - %s | Size: %d",
+            batch_number,
+            batch[0],
+            batch[-1],
+            len(batch)
+        )
+
+        try:
+            papers = fetch_batch(batch) or []
+
+        except Exception:
+            logger.exception(
+                "Revision batch failed: batch=%d, size=%d",
+                batch_number,
+                len(batch)
+            )
+            continue
+
+        for paper in papers:
+            revision_map[paper.get_short_id()] = paper
+
+        logger.debug(
+            "Revision batch completed: batch=%d, returned=%d, elapsed=%.2fs",
+            batch_number,
+            len(papers),
+            time.perf_counter() - batch_start
+        )
+
+    # Build metadata records.
+    for arxiv_id, paper in paper_map.items():
+        latest_version = get_latest_version(paper)
+        versions = extract_versions(paper)
+
+        revised_dates = []
+        missing_revision = False
+
+        for version in range(2, latest_version):
+            versioned_id = f"{arxiv_id}v{version}"
+            version_paper = revision_map.get(versioned_id)
+
+            if version_paper is None:
+                logger.warning(
+                    "Revision metadata missing: %s",
+                    versioned_id
+                )
+
+                missing_revision = True
+                break
+
+            revised_dates.append(
+                version_paper.updated.date().isoformat()
+            )
+
+        if latest_version >= 2:
+            revised_dates.append(
+                paper.updated.date().isoformat()
+            )
+
+        if missing_revision:
+            failed_ids.append(arxiv_id)
+
+            logger.error(
+                "Cannot retrieve all revision metadata for: %s",
+                arxiv_id
+            )
+            continue
+
+        metadata = {
+            "arxiv_id": arxiv_id,
+            "title": paper.title,
+            "authors": [
+                author.name
+                for author in paper.authors
+            ],
+            "submission_date": (
+                paper.published.date().isoformat()
+            ),
+            "revised_dates": revised_dates,
+            "venue": paper.journal_ref,
+            "versions": versions
+        }
+
+        results.append(metadata)
+
+        logger.info(
+            "PROCESSED paper | ID: %s | Versions: %d",
+            arxiv_id,
+            latest_version
+        )
+
+    # Preserve order and re move duplicate failed IDs.
+    failed_ids = list(dict.fromkeys(failed_ids))
+
+    elapsed = time.perf_counter() - start_time
+
+    logger.info(
+        "Discovery summary | successful=%d | failed=%d | not_found=%d | elapsed=%.2fs",
+        len(results),
+        len(failed_ids),
+        len(not_found_ids),
+        elapsed
+    )
+
+    return results, failed_ids, not_found_ids
+
+
+# Main execution
 def main():
+    setup_logging()
+
     args = parse_input()
     start_time = time.perf_counter()
+
+    logger.info("Starting arXiv discovery pipeline")
 
     arxiv_ids = generate_arxiv_ids(
         start_month=args["start_month"],
@@ -182,21 +386,68 @@ def main():
         end_id=args["end_id"]
     )
 
-    results, failed_ids = discover_ids(arxiv_ids)
+    results, failed_ids, not_found_ids = discover_ids(
+        arxiv_ids
+    )
 
-    with open("discovery_results.json", "w", encoding="utf-8") as file:
-        json.dump(results, file, ensure_ascii=False, indent=4)
+    with open(
+        "discovery_results.json",
+        "w",
+        encoding="utf-8"
+    ) as file:
+        json.dump(
+            results,
+            file,
+            ensure_ascii=False,
+            indent=4
+        )
 
-    with open("failed_ids.json", "w", encoding="utf-8") as file:
-        json.dump(failed_ids, file, ensure_ascii=False, indent=4)
-        
-    end_time = time.perf_counter()
-    elapsed_time = end_time - start_time    
+    logger.info(
+        "Saved discovery results: discovery_results.json"
+    )
 
-    print(f"\nTotal papers discovered: {len(results)}")
-    print(f"Total failed IDs: {len(failed_ids)}")
-    print(f"Total execution time: {elapsed_time:.2f} seconds")
-    print(f"Total execution time: {elapsed_time / 60:.2f} minutes")
+    with open(
+        "failed_ids.json",
+        "w",
+        encoding="utf-8"
+    ) as file:
+        json.dump(
+            failed_ids,
+            file,
+            ensure_ascii=False,
+            indent=4
+        )
+
+    logger.info("Saved failed IDs: failed_ids.json")
+
+    with open(
+        "not_found_ids.json",
+        "w",
+        encoding="utf-8"
+    ) as file:
+        json.dump(
+            not_found_ids,
+            file,
+            ensure_ascii=False,
+            indent=4
+        )
+
+    logger.info("Saved not-found IDs: not_found_ids.json")
+
+    elapsed_time = time.perf_counter() - start_time
+
+    logger.info(
+        "Pipeline summary | successful=%d | failed=%d | not_found=%d",
+        len(results),
+        len(failed_ids),
+        len(not_found_ids)
+    )
+
+    logger.info(
+        "Total execution time: %.2f seconds (%.2f minutes)",
+        elapsed_time,
+        elapsed_time / 60
+    )
 
 
 if __name__ == "__main__":
