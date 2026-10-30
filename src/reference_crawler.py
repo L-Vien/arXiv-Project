@@ -310,18 +310,32 @@ class ReferenceCrawler:
             standardized_list.append(std_ref)
         return standardized_list
 
-    def save_paper_references(self, arxiv_id: str, references: List[Dict[str, Any]]) -> Path:
+    def save_paper_references(
+        self,
+        arxiv_id: str,
+        references: Optional[List[Dict[str, Any]]],
+        status: str = "success",
+        error_message: Optional[str] = None
+    ) -> Path:
         """
-        Save standardized references to local disk under corpus/<paper_id>/references.json.
+        Save standardized references with wrapper status to local disk under corpus/<paper_id>/references.json.
         Creates parent directories as needed.
         """
         folder_name = arxiv_id.replace('/', '-')
         paper_dir = self.corpus_dir / folder_name
         paper_dir.mkdir(parents=True, exist_ok=True)
 
+        data = {
+            "arxiv_id": arxiv_id,
+            "status": status,
+            "error_message": error_message,
+            "references_count": len(references) if references is not None else 0,
+            "references": references
+        }
+
         output_file = paper_dir / "references.json"
         with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(references, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
         return output_file
 
@@ -338,22 +352,36 @@ class ReferenceCrawler:
         if not force_refresh and output_file.exists():
             try:
                 with open(output_file, "r", encoding="utf-8") as f:
-                    std_refs = json.load(f)
-                logger.success(f"Loaded cached references for {arxiv_id} from {output_file} (skipping API call).")
+                    data = json.load(f)
 
-                with self.metrics_lock:
-                    self.metrics["total_papers_processed"] += 1
-                    self.metrics["successful_crawls"] += 1
-                    self.metrics["total_references_fetched"] += len(std_refs)
-                    for ref in std_refs:
-                        if ref.get("ref_arxiv_id"):
-                            self.metrics["references_with_arxiv_id"] += 1
+                # Backward compatibility with old list format or handle new wrapper dict format
+                if isinstance(data, list):
+                    std_refs = data
+                    status = "success"
+                elif isinstance(data, dict):
+                    status = data.get("status", "success")
+                    std_refs = data.get("references") or []
+                else:
+                    std_refs = []
 
-                    if PSUTIL_AVAILABLE:
-                        mem_mb = self._get_process_memory_mb()
-                        self.metrics["memory_samples"].append(mem_mb)
+                if status == "success":
+                    logger.success(f"Loaded cached references for {arxiv_id} from {output_file} (skipping API call).")
 
-                return std_refs
+                    with self.metrics_lock:
+                        self.metrics["total_papers_processed"] += 1
+                        self.metrics["successful_crawls"] += 1
+                        self.metrics["total_references_fetched"] += len(std_refs)
+                        for ref in std_refs:
+                            if ref.get("ref_arxiv_id"):
+                                self.metrics["references_with_arxiv_id"] += 1
+
+                        if PSUTIL_AVAILABLE:
+                            mem_mb = self._get_process_memory_mb()
+                            self.metrics["memory_samples"].append(mem_mb)
+
+                    return std_refs
+                else:
+                    logger.warning(f"Cached status for {arxiv_id} is 'failed'. Re-fetching from API...")
             except Exception as e:
                 logger.warning(f"Failed to load cache for {arxiv_id}: {e}. Re-fetching from API...")
 
@@ -369,15 +397,15 @@ class ReferenceCrawler:
             if not std_refs and output_file.exists():
                 try:
                     with open(output_file, "r", encoding="utf-8") as f:
-                        existing_refs = json.load(f)
+                        existing_data = json.load(f)
+                    existing_refs = existing_data.get("references", []) if isinstance(existing_data, dict) else existing_data
                     if existing_refs:
                         logger.warning(f"API returned 0 references for {arxiv_id}. Preserving existing cached data ({len(existing_refs)} refs).")
                         std_refs = existing_refs
                 except Exception:
                     pass
 
-            if std_refs or not output_file.exists():
-                self.save_paper_references(arxiv_id, std_refs)
+            self.save_paper_references(arxiv_id, std_refs, status="success", error_message=None)
 
             with self.metrics_lock:
                 self.metrics["total_papers_processed"] += 1
@@ -387,7 +415,9 @@ class ReferenceCrawler:
                     if ref.get("ref_arxiv_id"):
                         self.metrics["references_with_arxiv_id"] += 1
         else:
-            logger.fail(f"Không thể crawl references cho {arxiv_id} sau các lần thử (FAIL).")
+            error_msg = f"Không thể crawl references cho {arxiv_id} sau các lần thử (FAIL)."
+            logger.fail(error_msg)
+            self.save_paper_references(arxiv_id, references=None, status="failed", error_message=error_msg)
             with self.metrics_lock:
                 self.metrics["total_papers_processed"] += 1
                 self.metrics["failed_crawls"] += 1

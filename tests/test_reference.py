@@ -97,12 +97,33 @@ class TestReferenceCrawlerStandardization(unittest.TestCase):
         arxiv_id = "2310.12345"
         sample_data = [{"arxiv_id": arxiv_id, "ref_title": "Test Ref"}]
 
-        saved_path = self.crawler.save_paper_references(arxiv_id, sample_data)
+        saved_path = self.crawler.save_paper_references(arxiv_id, sample_data, status="success", error_message=None)
         self.assertTrue(saved_path.exists())
 
         with open(saved_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        self.assertEqual(data, sample_data)
+
+        self.assertIsInstance(data, dict)
+        self.assertEqual(data["arxiv_id"], arxiv_id)
+        self.assertEqual(data["status"], "success")
+        self.assertIsNone(data["error_message"])
+        self.assertEqual(data["references_count"], 1)
+        self.assertEqual(data["references"], sample_data)
+
+    def test_save_paper_references_failed(self):
+        arxiv_id = "2310.99999"
+        saved_path = self.crawler.save_paper_references(arxiv_id, references=None, status="failed", error_message="HTTP 403 Forbidden")
+        self.assertTrue(saved_path.exists())
+
+        with open(saved_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.assertIsInstance(data, dict)
+        self.assertEqual(data["arxiv_id"], arxiv_id)
+        self.assertEqual(data["status"], "failed")
+        self.assertEqual(data["error_message"], "HTTP 403 Forbidden")
+        self.assertEqual(data["references_count"], 0)
+        self.assertIsNone(data["references"])
 
 
 if __name__ == "__main__":
