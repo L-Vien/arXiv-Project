@@ -10,15 +10,36 @@ from src.logger import get_logger, setup_logging
 logger = get_logger(__name__)
 
 # Configuration
-BATCH_SIZE = 100
+BATCH_SIZE = 200
 MAX_RETRIES = 3
 RETRY_DELAY = 5
+MAX_CONSECUTIVE_NOT_FOUND_PER_MONTH = 200
 
 client = arxiv.Client(
     page_size=BATCH_SIZE,
     delay_seconds=3,
     num_retries=0
 )
+
+
+def is_valid_month(month):
+    return 1 <= month <= 12
+
+
+def parse_year_month(value, argument_name, parser):
+    try:
+        year_value, month_value = value.split("-")
+        year, month = int(year_value), int(month_value)
+    except ValueError:
+        parser.error(f"{argument_name} must be in YYYY-MM format")
+
+    if year < 1:
+        parser.error(f"{argument_name} year must be positive")
+
+    if not is_valid_month(month):
+        parser.error(f"{argument_name} month must be between 01 and 12")
+
+    return year, month
 
 
 # Parse command-line input
@@ -32,11 +53,16 @@ def parse_input():
 
     args = parser.parse_args()
 
-    start_year, start_month = map(int, args.start_month.split("-"))
-    end_year, end_month = map(int, args.end_month.split("-"))
-
-    if not (1 <= start_month <= 12 and 1 <= end_month <= 12):
-        parser.error("Month must be between 01 and 12")
+    start_year, start_month = parse_year_month(
+        args.start_month,
+        "--start_month",
+        parser
+    )
+    end_year, end_month = parse_year_month(
+        args.end_month,
+        "--end_month",
+        parser
+    )
 
     if not (
         1 <= args.start_id <= 99999
@@ -68,6 +94,15 @@ def generate_arxiv_ids(
     start_id,
     end_id
 ):
+    if not is_valid_month(start_month) or not is_valid_month(end_month):
+        raise ValueError("Month must be between 1 and 12")
+
+    if start_year < 1 or end_year < 1:
+        raise ValueError("Year must be positive")
+
+    if (start_year, start_month) > (end_year, end_month):
+        raise ValueError("Start month must not be later than end month")
+
     start = start_year * 12 + (start_month - 1)
     end = end_year * 12 + (end_month - 1)
 
@@ -115,8 +150,8 @@ def batch_ids(ids, batch_size=BATCH_SIZE):
 
 
 # Fetch a batch with retry
-def fetch_batch(ids):
-    for attempt in range(MAX_RETRIES + 1):
+def fetch_batch(ids, max_retries=MAX_RETRIES):
+    for attempt in range(max_retries + 1):
         try:
             search = arxiv.Search(
                 id_list=ids,
@@ -128,10 +163,10 @@ def fetch_batch(ids):
             return papers
 
         except Exception as e:
-            if attempt == MAX_RETRIES:
+            if attempt == max_retries:
                 logger.exception(
                     "Batch request failed after %d retries; batch_size=%d",
-                    MAX_RETRIES,
+                    max_retries,
                     len(ids)
                 )
                 raise
@@ -142,7 +177,7 @@ def fetch_batch(ids):
             logger.warning(
                 "Retry attempt %d/%d failed; batch_size=%d; error=%s",
                 attempt + 1,
-                MAX_RETRIES,
+                max_retries,
                 len(ids),
                 e
             )
@@ -181,6 +216,10 @@ def discover_ids(arxiv_ids):
     failed_ids = []
     not_found_ids = []
     paper_map = {}
+    consecutive_not_found = 0
+    current_month = None
+    month_not_found_streak = 0
+    skipped_months = set()
 
     logger.info("Starting discovery")
 
@@ -188,6 +227,15 @@ def discover_ids(arxiv_ids):
         batch_ids(arxiv_ids),
         start=1
     ):
+        batch = [
+            arxiv_id
+            for arxiv_id in batch
+            if arxiv_id[:4] not in skipped_months
+        ]
+
+        if not batch:
+            continue
+
         batch_start = time.perf_counter()
 
         logger.info(
@@ -199,7 +247,15 @@ def discover_ids(arxiv_ids):
         )
 
         try:
-            papers = fetch_batch(batch) or []
+            max_retries = (
+                1
+                if consecutive_not_found > 3
+                else MAX_RETRIES
+            )
+            papers = fetch_batch(
+                batch,
+                max_retries=max_retries
+            ) or []
 
         except Exception:
             logger.exception(
@@ -211,24 +267,46 @@ def discover_ids(arxiv_ids):
             failed_ids.extend(batch)
             continue
 
-        for paper in papers:
-            base_id = get_base_id(paper)
-            paper_map[base_id] = paper
-
         # Identify IDs not returned by the API.
-        returned_ids = {
-            get_base_id(paper)
+        papers_by_id = {
+            get_base_id(paper): paper
             for paper in papers
         }
 
         for arxiv_id in batch:
-            if arxiv_id not in returned_ids:
+            month_key = arxiv_id[:4]
+            if month_key != current_month:
+                current_month = month_key
+                month_not_found_streak = 0
+
+            if month_key in skipped_months:
+                continue
+
+            paper = papers_by_id.get(arxiv_id)
+            if paper is None:
                 not_found_ids.append(arxiv_id)
+                consecutive_not_found += 1
+                month_not_found_streak += 1
 
                 logger.warning(
                     "Paper not found: %s",
                     arxiv_id
                 )
+
+                if (
+                    month_not_found_streak
+                    > MAX_CONSECUTIVE_NOT_FOUND_PER_MONTH
+                ):
+                    skipped_months.add(month_key)
+                    logger.warning(
+                        "Skipping remaining papers for month %s after %d consecutive not-found IDs",
+                        month_key,
+                        month_not_found_streak
+                    )
+            else:
+                paper_map[arxiv_id] = paper
+                consecutive_not_found = 0
+                month_not_found_streak = 0
 
         logger.debug(
             "Initial metadata batch completed: batch=%d, returned=%d, elapsed=%.2fs",
