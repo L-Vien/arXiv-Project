@@ -114,3 +114,35 @@ def save_metadata(raw_metadata: dict, paper_root_dir: str | Path) -> str:
 
     logger.info(f"Đã xuất metadata.json cho bài báo: {clean_meta['arxiv_id']}")
     return str(file_path)
+
+_REQUIRED_KEYS = {"arxiv_id", "title", "authors", "submission_date", "revised_dates", "venue"}
+
+
+def validate_metadata(path: str | Path) -> bool:
+    """True nếu metadata.json đọc được và đủ field đúng kiểu (dùng khi resume).
+
+    path là file metadata.json hoặc thư mục bài báo chứa nó.
+    """
+    p = Path(path)
+    if p.is_dir():
+        p = p / "metadata.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict) or not _REQUIRED_KEYS <= data.keys():
+        return False
+    try:
+        parse_arxiv_id(data["arxiv_id"])
+    except ValueError:
+        return False
+    authors, revised = data["authors"], data["revised_dates"]
+    return (
+        isinstance(data["title"], str) and data["title"].strip() != ""
+        and isinstance(authors, list) and len(authors) > 0
+        and all(isinstance(a, str) and a for a in authors)
+        and isinstance(data["submission_date"], str) and data["submission_date"] != ""
+        and isinstance(revised, list)
+        and all(isinstance(d, str) and d for d in revised)
+        and (data["venue"] is None or isinstance(data["venue"], str))
+    )
