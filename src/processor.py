@@ -137,9 +137,11 @@ def _extract_members(members: Iterator[_Member], out_dir: Path, result: ProcessR
         target.parent.mkdir(parents=True, exist_ok=True)
         with opener() as src, open(target, "wb") as dst:
             shutil.copyfileobj(src, dst)
-        result.kept_files.append(target.relative_to(out_root).as_posix())
-        result.kept_size += target.stat().st_size
+        rel = target.relative_to(out_root).as_posix()
+        if rel not in result.kept_files:
+            result.kept_files.append(rel)
 
+    result.kept_size = sum((out_root / f).stat().st_size for f in result.kept_files)
 
 def _extract_single_gz(path: Path, out_dir: Path, result: ProcessResult) -> None:
     """File .gz đơn: nội dung là một file TeX duy nhất (arXiv đặt tên là main.tex)."""
@@ -175,8 +177,14 @@ def read_status(output_dir: str | Path) -> ProcessResult | None:
 
 
 def _is_complete(output_dir: Path, status: ProcessResult) -> bool:
-    """Mọi file đã ghi trong status còn tồn tại thật trên đĩa."""
-    return all((output_dir / f).is_file() for f in status.kept_files)
+    """Mọi file đã ghi còn tồn tại và tổng dung lượng khớp với status."""
+    total = 0
+    for f in status.kept_files:
+        p = output_dir / f
+        if not p.is_file():
+            return False
+        total += p.stat().st_size
+    return total == status.kept_size
 
 
 def process_version(
