@@ -27,6 +27,7 @@ from src.downloader import (
     validate_tar,
     verify_integrity,
     write_integrity_marker,
+    remove_cached_source
 )
 
 # 01. Metadata & input validation
@@ -228,6 +229,14 @@ def test_download_version_success(tmp_path):
     assert marker_data["size_bytes"] == len(payload)
     assert marker_data["sha256"] == calculate_sha256(expected_path)
     assert not (tmp_path / f"{versioned_id}.source.ok.tmp").exists()
+
+    assert "completed_at" in marker_data
+
+    completed_at = datetime.fromisoformat(
+        marker_data["completed_at"]
+    )
+
+    assert completed_at.tzinfo is not None
 
 
 def test_download_pdf_source(tmp_path):
@@ -436,11 +445,11 @@ def test_parse_retry_after_http_date():
     assert result == 30.0
 
 
+
 def test_retry_http_429(tmp_path):
     versioned_id = "2607.28694v1"
     expected_path = tmp_path / f"{versioned_id}.source"
 
-    # Simulate HTTP 429 with Retry-After
     error = HTTPError(
         url=f"https://export.arxiv.org/src/{versioned_id}",
         code=429,
@@ -449,15 +458,14 @@ def test_retry_http_429(tmp_path):
         fp=None
     )
 
-    # First attempt fails, second succeeds
     with patch(
         "src.downloader.download_version",
         side_effect=[error, expected_path]
     ) as mock_download:
 
         with patch(
-            "src.downloader.time.sleep"
-        ) as mock_sleep:
+            "src.downloader.DEFAULT_RATE_LIMITER.cooldown"
+        ) as mock_cooldown:
 
             result = download_with_retry(
                 versioned_id,
@@ -467,15 +475,14 @@ def test_retry_http_429(tmp_path):
 
     assert result == expected_path
     assert mock_download.call_count == 2
-    mock_sleep.assert_called_once_with(8.0)
+
+    # max(fallback=30s, Retry-After=8s)
+    mock_cooldown.assert_called_once_with(30.0)
 
 
 def test_retry_http_429_missing_headers(tmp_path):
     versioned_id = "2607.28694v1"
-
-    expected_path = (
-        tmp_path / f"{versioned_id}.source"
-    )
+    expected_path = tmp_path / f"{versioned_id}.source"
 
     error = HTTPError(
         url=f"https://export.arxiv.org/src/{versioned_id}",
@@ -491,8 +498,8 @@ def test_retry_http_429_missing_headers(tmp_path):
     ) as mock_download:
 
         with patch(
-            "src.downloader.time.sleep"
-        ) as mock_sleep:
+            "src.downloader.DEFAULT_RATE_LIMITER.cooldown"
+        ) as mock_cooldown:
 
             result = download_with_retry(
                 versioned_id,
@@ -503,8 +510,63 @@ def test_retry_http_429_missing_headers(tmp_path):
     assert result == expected_path
     assert mock_download.call_count == 2
 
-    # Không có Retry-After nên dùng Exponential Backoff
-    mock_sleep.assert_called_once_with(3)
+    # No Retry-After → fallback cooldown = 30s
+    mock_cooldown.assert_called_once_with(30.0)
+
+
+def test_rate_limiter_respects_cooldown():
+    limiter = RateLimiter(min_interval=3.0)
+
+    with patch(
+        "src.downloader.time.monotonic",
+        side_effect=[100.0, 101.0, 131.0]
+    ):
+        with patch(
+            "src.downloader.time.sleep"
+        ) as mock_sleep:
+
+            limiter.cooldown(30)
+            limiter.wait()
+
+    # Cooldown ends at t=130.
+    # At t=101, the limiter must wait 29 seconds.
+    mock_sleep.assert_called_once_with(29.0)
+
+    assert limiter.last_request_time == 131.0
+
+
+def test_retry_http_429_long_retry_after(tmp_path):
+    versioned_id = "2607.28694v1"
+    expected_path = tmp_path / f"{versioned_id}.source"
+
+    error = HTTPError(
+        url=f"https://export.arxiv.org/src/{versioned_id}",
+        code=429,
+        msg="Too Many Requests",
+        hdrs={"Retry-After": "90"},
+        fp=None
+    )
+
+    with patch(
+        "src.downloader.download_version",
+        side_effect=[error, expected_path]
+    ) as mock_download:
+        with patch(
+            "src.downloader.DEFAULT_RATE_LIMITER.cooldown"
+        ) as mock_cooldown:
+
+            result = download_with_retry(
+                versioned_id,
+                tmp_path,
+                max_attempts=2
+            )
+
+    assert result == expected_path
+    assert mock_download.call_count == 2
+
+    # max(fallback=30, Retry-After=90)
+    mock_cooldown.assert_called_once_with(90.0)
+
 
 
 @pytest.mark.parametrize("status_code", [403, 404])
@@ -1010,3 +1072,53 @@ def test_redownload_corrupted_source(tmp_path):
     assert mock_urlopen.call_count == 2
     assert source.read_bytes() == payload
     assert verify_integrity(versioned_id, tmp_path) is True
+
+def test_remove_stale_part_before_download(tmp_path):
+    versioned_id = "2607.28694v1"
+
+    temp_path = tmp_path / f"{versioned_id}.source.part"
+    temp_path.write_bytes(b"Interrupted download")
+
+    payload = gzip.compress(b"Valid source")
+
+    response = BytesIO(payload)
+    response.headers = {
+        "Content-Length": str(len(payload))
+    }
+
+    with patch(
+        "src.downloader.urlopen",
+        return_value=response
+    ):
+        path = download_version(
+            versioned_id,
+            tmp_path,
+            limiter=RateLimiter(0)
+        )
+
+    assert path.read_bytes() == payload
+    assert not temp_path.exists()
+    assert is_download_complete(versioned_id, tmp_path)
+
+
+def test_remove_cached_source(tmp_path):
+    versioned_id = "2607.28694v1"
+
+    source = tmp_path / f"{versioned_id}.source"
+    marker = tmp_path / f"{versioned_id}.source.ok"
+
+    source.write_bytes(b"Valid source")
+    write_integrity_marker(source)
+
+    # Cache exists and is valid
+    assert is_download_complete(versioned_id, tmp_path)
+
+    remove_cached_source(versioned_id, tmp_path)
+
+    # Both source and marker must be removed
+    assert not source.exists()
+    assert not marker.exists()
+    assert not is_download_complete(versioned_id, tmp_path)
+
+    # Repeated cleanup must not raise an error
+    remove_cached_source(versioned_id, tmp_path)
