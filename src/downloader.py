@@ -26,23 +26,30 @@ class RateLimiter:
 
         self.min_interval = min_interval
         self.last_request_time = None
+        self.cooldown_until = 0.0
 
     def wait(self) -> None: 
         now = time.monotonic()
+        next_allowed = self.cooldown_until
 
-        if self.last_request_time is not None: 
-            # calculate elapsed time 
-            elapsed = now - self.last_request_time
+        if self.last_request_time is not None:
+            next_allowed = max(
+                next_allowed,
+                self.last_request_time + self.min_interval
+            )
 
-            # calculate remaining wait time 
-            remaining = self.min_interval - elapsed
+        remaining = next_allowed - now
 
-            # sleep if remaining > 0
-            if remaining > 0: 
-                time.sleep(remaining)
+        if remaining > 0:
+            time.sleep(remaining)
 
-        # save the new request start time
         self.last_request_time = time.monotonic()
+
+    def cooldown(self, seconds: float) -> None:
+        self.cooldown_until = max(
+            self.cooldown_until,
+            time.monotonic() + max(0.0, seconds)
+        )
 
 DEFAULT_RATE_LIMITER = RateLimiter(min_interval=settings.arxiv_api_delay)
 
@@ -107,6 +114,7 @@ def write_integrity_marker(source_path: str | Path) -> None:
         "status": "downloaded",
         "size_bytes": source_path.stat().st_size,
         "sha256": calculate_sha256(source_path),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
     }
 
     try:
@@ -191,7 +199,10 @@ def download_version(versioned_id: str, output_dir: str | Path, limiter: RateLim
     # file tạm thời 
     temp_path = output_dir / f"{versioned_id}.source.part"
 
+    
     success_marker = output_dir / f"{versioned_id}.source.ok"
+
+    temp_path.unlink(missing_ok=True)
 
     if is_download_complete(versioned_id, output_dir):
         return output_path
@@ -366,16 +377,47 @@ def download_with_retry(versioned_id: str, output_dir: str | Path, max_attempts:
             # call download_version() 
             # return immediately if successful
             return download_version(versioned_id, output_dir)
-        except HTTPError as e: 
-            # check whether e.code is retryable 
-            if not is_retryable_http_error(e.code): 
+        
+        except HTTPError as e:
+            # Check whether the HTTP status is retryable
+            if not is_retryable_http_error(e.code):
                 raise
 
-            # stop if max_attempts is reached
-            if attempt == max_attempts: 
+            # Special handling for HTTP 429
+            if e.code == 429:
+                retry_after_value = (
+                    e.headers.get("Retry-After")
+                    if e.headers is not None
+                    else None
+                )
+
+                retry_after_seconds = parse_retry_after(retry_after_value)
+
+                # Conservative fallback when Retry-After is absent
+                fallback_delay = 30 * (2 ** (attempt - 1))
+                delay = max(fallback_delay, retry_after_seconds or 0.0)
+
+                # Apply cooldown to subsequent requests
+                DEFAULT_RATE_LIMITER.cooldown(delay)
+
+                logger.warning(
+                    "HTTP 429 cooldown | version=%s | attempt=%s/%s | delay=%.1fs",
+                    versioned_id,
+                    attempt,
+                    max_attempts,
+                    delay
+                )
+
+                if attempt == max_attempts:
+                    raise
+
+                # The next download_version() call invokes limiter.wait()
+                continue
+
+            # Handle other retryable HTTP errors (5xx)
+            if attempt == max_attempts:
                 raise
 
-            # calculate delay using exponential backoff
             delay = calculate_backoff(attempt)
 
             retry_after_value = (
@@ -385,18 +427,20 @@ def download_with_retry(versioned_id: str, output_dir: str | Path, max_attempts:
             )
             retry_after_seconds = parse_retry_after(retry_after_value)
 
-            if retry_after_seconds is not None: 
+            if retry_after_seconds is not None:
                 delay = max(delay, retry_after_seconds)
 
-            logger.warning("Retry scheduled | version=%s | attempt=%s/%s | delay=%.1fs | HTTP=%s",
-                           versioned_id, 
-                           attempt, 
-                           max_attempts, 
-                           delay, 
-                           e.code
+            logger.warning(
+                "Retry scheduled | version=%s | attempt=%s/%s | delay=%.1fs | HTTP=%s",
+                versioned_id,
+                attempt,
+                max_attempts,
+                delay,
+                e.code
             )
-            # wait before the next attempt
+
             time.sleep(delay)
+
         except (URLError, TimeoutError) as e: 
             # check if this is the last attempt 
             if attempt == max_attempts: 
@@ -437,11 +481,17 @@ def is_download_complete(
 
 def download_with_status(versioned_id: str, output_dir: str | Path) -> dict[str, str | None]:
     try: 
-        was_complete = is_download_complete(versioned_id, output_dir)
-        path = download_with_retry(versioned_id, output_dir)
-        # determine status 
-        # "skipped" if was_complete is True otherwise "downloaded"
-        status = "skipped" if was_complete else "downloaded"
+        if is_download_complete(versioned_id, output_dir):
+            path = Path(output_dir) / f"{versioned_id}.source"
+
+            # Clean up stale partial file even on a cache hit.
+            part_path = Path(f"{path}.part")
+            part_path.unlink(missing_ok=True)
+
+            status = "skipped"
+        else:
+            path = download_with_retry(versioned_id, output_dir)
+            status = "downloaded"
 
         logger.info(
             "Download result | version=%s | status=%s | path=%s",
@@ -574,3 +624,18 @@ def validate_tar(path: str | Path) -> None:
                         pass
     except (tarfile.TarError, EOFError) as e: 
         raise IncompleteDownloadError(f"Invalid TAR source: {e}") from e 
+
+def remove_cached_source(
+    versioned_id: str,
+    output_dir: str | Path
+) -> None:
+    validate_versioned_id(versioned_id)
+
+    output_dir = Path(output_dir)
+
+    source_path = output_dir / f"{versioned_id}.source"
+    marker_path = output_dir / f"{versioned_id}.source.ok"
+
+    # Invalidate the completion marker first
+    marker_path.unlink(missing_ok=True)
+    source_path.unlink(missing_ok=True)
