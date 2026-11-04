@@ -1,7 +1,7 @@
 """Xử lý gói nguồn arXiv đã tải về
 
 Nhiệm vụ: nhận một file nguồn của MỘT phiên bản, giữ lại các file text cần cho
-M2 (.tex, .bib, .bbl, .sty, ...), bỏ hình/binary, và ghi lại trạng thái để
+M2 (.tex, .bib, .bbl), bỏ hình/binary, và ghi lại trạng thái để
 phiên bản không có TeX (PDF-only, docx, file hỏng) vẫn có bản ghi trong corpus.
 
 arXiv /src/{id} có thể trả về:
@@ -26,11 +26,10 @@ from src.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Các đuôi file text được giữ lại. .bbl cần cho M2 (\bibitem), .sty/.cls/.bst/...
-# chứa macro tự định nghĩa có thể ảnh hưởng đến việc parse.
-KEEP_EXTS = {
-    ".tex", ".bib", ".bbl", ".sty", ".cls", ".bst", ".def", ".clo", ".cfg", ".ltx",
-}
+# Các đuôi file text được giữ lại. Đề yêu cầu .tex và .bib; .bbl được giữ thêm vì
+# một số bài chỉ nộp .bbl (không có .bib, không có \bibitem trong .tex), khi đó
+# .bbl là nguồn tham khảo duy nhất cho M2. .sty/.cls/.bst... bị bỏ (file mẫu hội nghị).
+KEEP_EXTS = {".tex", ".bib", ".bbl"}
 STATUS_FILENAME = "source_status.json"
 
 # Trạng thái trả về
@@ -138,9 +137,11 @@ def _extract_members(members: Iterator[_Member], out_dir: Path, result: ProcessR
         target.parent.mkdir(parents=True, exist_ok=True)
         with opener() as src, open(target, "wb") as dst:
             shutil.copyfileobj(src, dst)
-        result.kept_files.append(target.relative_to(out_root).as_posix())
-        result.kept_size += target.stat().st_size
+        rel = target.relative_to(out_root).as_posix()
+        if rel not in result.kept_files:
+            result.kept_files.append(rel)
 
+    result.kept_size = sum((out_root / f).stat().st_size for f in result.kept_files)
 
 def _extract_single_gz(path: Path, out_dir: Path, result: ProcessResult) -> None:
     """File .gz đơn: nội dung là một file TeX duy nhất (arXiv đặt tên là main.tex)."""
@@ -156,11 +157,13 @@ def _extract_single_gz(path: Path, out_dir: Path, result: ProcessResult) -> None
 
 
 def write_status(output_dir: str | Path, result: ProcessResult) -> Path:
-    """Ghi source_status.json vào thư mục của phiên bản."""
+    """Ghi source_status.json (qua file tạm để không để lại JSON dở dang)."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / STATUS_FILENAME
-    path.write_text(json.dumps(result.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(result.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
     return path
 
 
@@ -173,6 +176,17 @@ def read_status(output_dir: str | Path) -> ProcessResult | None:
         return None
 
 
+def _is_complete(output_dir: Path, status: ProcessResult) -> bool:
+    """Mọi file đã ghi còn tồn tại và tổng dung lượng khớp với status."""
+    total = 0
+    for f in status.kept_files:
+        p = output_dir / f
+        if not p.is_file():
+            return False
+        total += p.stat().st_size
+    return total == status.kept_size
+
+
 def process_version(
     archive_path: str | Path,
     output_dir: str | Path,
@@ -181,24 +195,22 @@ def process_version(
 ) -> ProcessResult:
     """Xử lý nguồn của một phiên bản vào output_dir và luôn ghi source_status.json.
 
-    Không bao giờ ném exception vì file nguồn xấu: lỗi được ghi vào result.status/error
-    để pipeline tiếp tục với bài khác. File nén chỉ bị xóa khi xử lý thành công
-    (ok / no_tex); nếu lỗi thì giữ lại để chạy lại.
+    Giải nén vào thư mục tạm rồi đổi tên một lần, nên output_dir không bao giờ ở
+    trạng thái dở dang. Không ném exception vì file nguồn xấu: lỗi ghi vào
+    result.status/error. File nén chỉ bị xóa khi xử lý thành công (ok / no_tex).
 
-    skip_if_done=True: nếu output_dir đã có source_status.json với status ok/no_tex thì
-    trả về kết quả cũ, không xử lý lại (dùng khi chạy lại sau gián đoạn).
+    skip_if_done=True: nếu output_dir đã có source_status.json với status ok/no_tex
+    VÀ mọi file đã ghi vẫn còn đủ thì trả về kết quả cũ, không xử lý lại.
     """
     archive_path, output_dir = Path(archive_path), Path(output_dir)
 
-    # Chạy lại sau khi bị gián đoạn: version đã xử lý xong (ok / no_tex) thì bỏ qua.
-    # Version lỗi (extract_error / missing) vẫn được thử lại.
     if skip_if_done:
         previous = read_status(output_dir)
-        if previous is not None and previous.status in (STATUS_OK, STATUS_NO_TEX):
+        if (previous is not None
+                and previous.status in (STATUS_OK, STATUS_NO_TEX)
+                and _is_complete(output_dir, previous)):
             logger.info(f"Bỏ qua {output_dir} (đã xử lý: {previous.status})")
             return previous
-
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     if not archive_path.is_file():
         logger.error(f"Không tìm thấy file {archive_path}")
@@ -209,16 +221,21 @@ def process_version(
     result = ProcessResult(status=STATUS_ERROR, archive_size=archive_path.stat().st_size)
     logger.info(f"Đang xử lý source: {archive_path} ({result.archive_size} bytes)")
 
+    # Giải nén vào thư mục tạm (tên bắt đầu bằng "." để không lẫn với v1, v2...)
+    tmp_dir = output_dir.with_name(f".{output_dir.name}.tmp")
+    shutil.rmtree(tmp_dir, ignore_errors=True)   # dọn rác của lần chạy bị ngắt
+    tmp_dir.mkdir(parents=True)
+
     try:
         result.source_type = detect_source_type(archive_path)
         if result.source_type in ("tar_gz", "tar"):
             with tarfile.open(archive_path, "r:*") as tar:
-                _extract_members(_iter_tar(tar), output_dir, result)
+                _extract_members(_iter_tar(tar), tmp_dir, result)
         elif result.source_type == "zip":
             with zipfile.ZipFile(archive_path) as zf:
-                _extract_members(_iter_zip(zf), output_dir, result)
+                _extract_members(_iter_zip(zf), tmp_dir, result)
         elif result.source_type == "gz_single":
-            _extract_single_gz(archive_path, output_dir, result)
+            _extract_single_gz(archive_path, tmp_dir, result)
         else:  # pdf, unknown: không có TeX để lấy
             result.raw_size = result.archive_size
         has_tex = any(f.lower().endswith(".tex") for f in result.kept_files)
@@ -229,7 +246,20 @@ def process_version(
         result.error = f"{type(e).__name__}: {e}"
         logger.error(f"Lỗi giải nén {archive_path}: {result.error}")
 
-    write_status(output_dir, result)
+    if result.status in (STATUS_OK, STATUS_NO_TEX):
+        write_status(tmp_dir, result)
+        try:
+            shutil.rmtree(output_dir, ignore_errors=True)   # bỏ dữ liệu cũ hoặc dở dang
+            os.replace(tmp_dir, output_dir)                  # đổi tên một lần
+        except OSError as e:
+            result.status = STATUS_ERROR
+            result.error = f"{type(e).__name__}: {e}"
+            logger.error(f"Không đổi tên được {tmp_dir} -> {output_dir}: {result.error}")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            write_status(output_dir, result)
+    else:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        write_status(output_dir, result)
 
     if delete_archive and result.status in (STATUS_OK, STATUS_NO_TEX):
         try:

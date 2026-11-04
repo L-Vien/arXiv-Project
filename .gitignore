@@ -19,6 +19,8 @@ data/
 outputs/
 logs/
 *.log
+samples/
+out/
 
 # OS files
 .DS_Store

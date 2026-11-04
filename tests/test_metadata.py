@@ -6,7 +6,7 @@ from pathlib import Path
 
 from src.metadata import (
     base_arxiv_id, normalize_paper_metadata, paper_dir_name,
-    parse_arxiv_id, save_metadata, version_dir,
+    parse_arxiv_id, save_metadata, validate_metadata, version_dir,
 )
 
 
@@ -90,6 +90,35 @@ class TestSave(unittest.TestCase):
             self.assertEqual(data["arxiv_id"], "2310.12345")
             self.assertEqual(data["authors"], ["A"])
             self.assertFalse(list(Path(d).rglob("*.tmp")))
+
+
+class TestValidate(unittest.TestCase):
+    GOOD = {"arxiv_id": "2310.12345", "title": "T", "authors": ["A"],
+            "submission_date": "2026-10-01", "revised_dates": [], "venue": None}
+
+    def _write(self, d, obj):
+        p = Path(d) / "metadata.json"
+        p.write_text(json.dumps(obj), encoding="utf-8")
+        return p
+
+    def test_valid_after_save(self):
+        with tempfile.TemporaryDirectory() as d:
+            save_metadata({**self.GOOD}, d)
+            self.assertTrue(validate_metadata(d))
+
+    def test_missing_file_or_bad_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(validate_metadata(d))
+            (Path(d) / "metadata.json").write_text("{dở dang", encoding="utf-8")
+            self.assertFalse(validate_metadata(d))
+
+    def test_missing_or_empty_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            for bad in ({k: v for k, v in self.GOOD.items() if k != "title"},
+                        {**self.GOOD, "title": ""},
+                        {**self.GOOD, "authors": []},
+                        {**self.GOOD, "arxiv_id": "abc"}):
+                self.assertFalse(validate_metadata(self._write(d, bad)))
 
 
 if __name__ == "__main__":

@@ -36,13 +36,14 @@ class TestProcessor(unittest.TestCase):
         return sorted(p.relative_to(self.out).as_posix()
                       for p in self.out.rglob("*") if p.is_file() and p.name != "source_status.json")
 
-    def test_tar_filtering_keeps_text_sources_only(self):
+    def test_tar_filtering_keeps_tex_bib_bbl_only(self):
         tar = self.base / "a.tar.gz"
         make_tar(tar, {"main.tex": b"x", "refs.bib": b"y", "main.bbl": b"z", "my.sty": b"s",
+                       "style.cls": b"c", "ref.bst": b"b",
                        "image.png": b"\x89PNG" * 100, "fig.pdf": b"%PDF", "script.py": b"p"})
         r = process_version(tar, self.out)
         self.assertEqual(r.status, STATUS_OK)
-        self.assertEqual(self.kept(), ["main.bbl", "main.tex", "my.sty", "refs.bib"])
+        self.assertEqual(self.kept(), ["main.bbl", "main.tex", "refs.bib"])
         self.assertFalse(tar.exists())                      # xử lý xong thì xóa archive
 
     def test_subdirs_and_uppercase_extension(self):
@@ -138,11 +139,11 @@ class TestProcessor(unittest.TestCase):
         make_tar(tar, {"main.tex": b"x"})
         first = process_version(tar, self.out)
         self.assertEqual(first.status, STATUS_OK)
-        (self.out / "main.tex").write_text("đã sửa tay")      # nếu bị xử lý lại sẽ bị ghi đè
+        (self.out / "main.tex").write_text("y", encoding="utf-8")   # cùng kích thước, nếu xử lý lại sẽ bị ghi đè thành "x"
         second = process_version(self.base / "a.tar.gz", self.out)  # archive đã bị xóa
         self.assertEqual(second.status, STATUS_OK)
         self.assertEqual(second.kept_files, ["main.tex"])
-        self.assertEqual((self.out / "main.tex").read_text(), "đã sửa tay")
+        self.assertEqual((self.out / "main.tex").read_text(encoding="utf-8"), "y")
 
     def test_skip_if_done_no_tex_also_skipped(self):
         p = self.base / "x.pdf"
@@ -164,6 +165,48 @@ class TestProcessor(unittest.TestCase):
         r = process_version(self.base / "a.tar.gz", self.out, skip_if_done=False)
         self.assertEqual(r.status, STATUS_MISSING)             # archive đã xóa -> xử lý thật sự chạy lại
 
+    def test_skip_if_done_reprocesses_when_files_missing(self):
+        tar = self.base / "a.tar.gz"
+        make_tar(tar, {"main.tex": b"x"})
+        process_version(tar, self.out, delete_archive=False)
+        (self.out / "main.tex").unlink()                  # mất file sau khi đã ok
+        r = process_version(tar, self.out)
+        self.assertEqual(r.status, STATUS_OK)
+        self.assertTrue((self.out / "main.tex").exists())
 
+    def test_stale_tmp_dir_is_cleaned(self):
+        tar = self.base / "a.tar.gz"
+        make_tar(tar, {"main.tex": b"x"})
+        stale = self.out.with_name(".v1.tmp")
+        stale.mkdir(parents=True)
+        (stale / "junk.tex").write_text("rác", encoding="utf-8")
+        process_version(tar, self.out)
+        self.assertFalse(stale.exists())
+        self.assertEqual(self.kept(), ["main.tex"])
+
+    def test_skip_if_done_reprocesses_when_size_changed(self):
+        tar = self.base / "a.tar.gz"
+        make_tar(tar, {"main.tex": b"x"})
+        process_version(tar, self.out, delete_archive=False)
+        (self.out / "main.tex").write_text("xxxx", encoding="utf-8")   # file bị hỏng/sửa
+        r = process_version(tar, self.out)
+        self.assertEqual(r.status, STATUS_OK)
+        self.assertEqual((self.out / "main.tex").read_bytes(), b"x")   # đã giải nén lại
+
+    def test_duplicate_members_counted_once(self):
+        tar = self.base / "dup.tar.gz"
+        with tarfile.open(tar, "w:gz") as t:
+            for data in (b"old", b"newer"):               # hai member cùng tên main.tex
+                info = tarfile.TarInfo("main.tex")
+                info.size = len(data)
+                t.addfile(info, io.BytesIO(data))
+        r = process_version(tar, self.out)
+        self.assertEqual(r.kept_files, ["main.tex"])
+        self.assertEqual(r.kept_size, 5)                  # bản sau ghi đè bản trước
+        self.assertEqual((self.out / "main.tex").read_bytes(), b"newer")
+        # version đã hoàn tất nên skip_if_done phải bỏ qua, dù archive đã bị xóa
+        self.assertEqual(process_version(self.base / "gone.tar.gz", self.out).status, STATUS_OK)    
+
+    
 if __name__ == "__main__":
     unittest.main()
