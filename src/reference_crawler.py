@@ -4,9 +4,12 @@ Description:
     Crawl paper references from Semantic Scholar API for Milestone 1 of IntroDS Project.
     Features:
     - Multi-Key Rotation (APIKeyPool): Automatically rotates Semantic Scholar API keys (S2_API_KEY_1, S2_API_KEY_2, etc.) to handle 429 Rate Limits.
-    - Multithreaded Batch Processing (ThreadPoolExecutor): Concurrent paper crawling for high throughput.
-    - Robust Caching / Resume mechanism: Skips re-fetching if references.json already exists for a paper.
+    - Multithreaded Batch Processing (ThreadPoolExecutor) with Bounded Submission: Concurrent paper crawling with controlled task queue size for high throughput and low RAM footprint.
+    - Robust Caching / Resume mechanism with retryable failure distinction: Skips re-fetching if valid cache exists, retries only retryable failures.
+    - Atomic File Writing: Writes references and temp files safely using .tmp and os.replace.
+    - Streaming Metrics (reference_metrics.jsonl): Appends per-paper metrics line-by-line to avoid keeping unbounded state in RAM.
     - Data Standardization: Normalizes references to match the required project schema (arxiv_id, ref_arxiv_id, ref_title, ref_authors, ref_submission_date, ref_s2_id).
+    - Unified Corpus Folder Naming: Replaces both '/' and '.' with '-' (e.g. 2604.25535 -> 2604-25535) to match Processor module.
     - Performance & Memory Tracking: Measures execution time, wall time per paper, and RAM usage via psutil.
     - Custom Logging: File and console logging with custom levels (SUCCESS, FAIL).
 
@@ -22,7 +25,7 @@ import logging
 import threading
 import concurrent.futures
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import requests
 
 try:
@@ -92,7 +95,7 @@ class APIKeyPool:
 class ReferenceCrawler:
     """
     Main crawler class to fetch, standardize, cache, and save paper references from Semantic Scholar API.
-    Supports multi-key rotation and multithreaded batch processing.
+    Supports multi-key rotation, bounded multithreaded batch processing, atomic saves, and streaming metrics.
     """
     def __init__(
         self,
@@ -184,7 +187,7 @@ class ReferenceCrawler:
         # Thread lock for updating metrics safely across threads
         self.metrics_lock = threading.Lock()
 
-        # Performance tracking metrics dictionary
+        # Performance tracking metrics dictionary (lightweight counters)
         self.metrics = {
             "total_papers_processed": 0,
             "successful_crawls": 0,
@@ -212,14 +215,34 @@ class ReferenceCrawler:
     def _get_process_memory_mb(self) -> float:
         """Helper method to query current process RSS memory usage in MB using psutil."""
         if PSUTIL_AVAILABLE:
-            process = psutil.Process(os.getpid())
-            return process.memory_info().rss / (1024 * 1024)
+            try:
+                process = psutil.Process(os.getpid())
+                return process.memory_info().rss / (1024 * 1024)
+            except Exception:
+                pass
         return 0.0
 
-    def fetch_references(self, arxiv_id: str) -> Optional[List[Dict[str, Any]]]:
+    def _log_metric_line(self, metric_record: Dict[str, Any]):
+        """Append a single paper metric record to reference_metrics.jsonl (streaming/line-by-line)."""
+        metrics_file = self.log_dir / "reference_metrics.jsonl"
+        try:
+            with open(metrics_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(metric_record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to write metric line: {e}")
+
+    def _get_folder_name(self, arxiv_id: str) -> str:
+        """
+        Normalize arXiv ID into folder name matching the Processor module (Học's processor):
+        Replaces both '/' and '.' with '-' (e.g. 2604.25535 -> 2604-25535).
+        """
+        return arxiv_id.replace('/', '-').replace('.', '-')
+
+    def fetch_references(self, arxiv_id: str) -> Tuple[Optional[List[Dict[str, Any]]], bool, Optional[str], int]:
         """
         Fetch reference list for a given arXiv ID from Semantic Scholar Graph API.
         Implements automatic key rotation, exponential backoff, and 429 rate limit handling.
+        Returns: (references, retryable, error_message, attempts_used)
         """
         clean_id = arxiv_id.split('v')[0] if 'v' in arxiv_id and not arxiv_id.startswith('hep') else arxiv_id
         url = f"https://api.semanticscholar.org/graph/v1/paper/arXiv:{clean_id}"
@@ -243,8 +266,9 @@ class ReferenceCrawler:
                 if response.status_code == 429:
                     retries_429 += 1
                     if retries_429 > max_429_retries:
-                        logger.fail(f"Exceeded max 429 retries ({max_429_retries}) for paper {arxiv_id}.")
-                        return None
+                        err = f"Exceeded max 429 retries ({max_429_retries}) for paper {arxiv_id}."
+                        logger.fail(err)
+                        return None, True, err, attempt
 
                     logger.warning(
                         f"[429 Rate Limit] Key {current_api_key[:6]}... hit limit for paper {arxiv_id}. "
@@ -253,24 +277,25 @@ class ReferenceCrawler:
                     time.sleep(1.5)
                     continue
 
-                # Handle HTTP 404 Not Found
+                # Handle HTTP 404 Not Found (Permanent failure, not retryable)
                 if response.status_code == 404:
                     logger.warning(f"Paper {arxiv_id} not found on Semantic Scholar (404).")
-                    return []
+                    return [], False, "Paper not found (404)", attempt
 
                 response.raise_for_status()
                 data = response.json()
-                return data.get("references", [])
+                return data.get("references", []), False, None, attempt
 
             except requests.exceptions.RequestException as e:
                 logger.error(f"Error fetching references for {arxiv_id} using key {current_api_key[:6]}... (Attempt {attempt}/{self.max_retries}): {e}")
                 if attempt == self.max_retries:
-                    logger.fail(f"Failed fetching references for {arxiv_id} after {self.max_retries} attempts: {e}")
-                    return None
+                    err = f"Failed fetching references for {arxiv_id} after {self.max_retries} attempts: {e}"
+                    logger.fail(err)
+                    return None, True, err, attempt
                 wait_time = min(2 * attempt, 6)
                 time.sleep(wait_time)
 
-        return None
+        return None, True, "Max retries reached", self.max_retries
 
     def standardize_references(self, arxiv_id: str, raw_references: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -315,54 +340,74 @@ class ReferenceCrawler:
         arxiv_id: str,
         references: Optional[List[Dict[str, Any]]],
         status: str = "success",
-        error_message: Optional[str] = None
+        retryable: bool = False,
+        error_message: Optional[str] = None,
+        attempt: int = 1
     ) -> Path:
         """
-        Save standardized references with wrapper status to local disk under corpus/<paper_id>/references.json.
-        Creates parent directories as needed.
+        Save standardized references with wrapper status and retryable flag to local disk
+        under corpus/<paper_id_normalized>/references.json using atomic file replacement (.tmp -> final).
         """
-        folder_name = arxiv_id.replace('/', '-')
+        folder_name = self._get_folder_name(arxiv_id)
         paper_dir = self.corpus_dir / folder_name
         paper_dir.mkdir(parents=True, exist_ok=True)
 
         data = {
             "arxiv_id": arxiv_id,
             "status": status,
+            "retryable": retryable,
+            "attempt": attempt,
             "error_message": error_message,
             "references_count": len(references) if references is not None else 0,
             "references": references
         }
 
         output_file = paper_dir / "references.json"
-        with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        temp_file = paper_dir / "references.json.tmp"
+
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(temp_file, output_file)
+        except Exception as e:
+            logger.error(f"Failed atomic save for {arxiv_id}: {e}")
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
+            raise
 
         return output_file
 
     def process_single_paper(self, arxiv_id: str, force_refresh: bool = False) -> List[Dict[str, Any]]:
         """
-        Process a single paper: check local cache, fetch from API if missing/forced, standardize,
-        save to disk, and update thread-safe performance metrics.
+        Process a single paper: check local cache (respecting status and retryable flags),
+        fetch from API if missing/retryable/forced, standardize, save atomically,
+        update thread-safe metrics, and stream metric line to reference_metrics.jsonl.
         """
-        folder_name = arxiv_id.replace('/', '-')
+        folder_name = self._get_folder_name(arxiv_id)
         paper_dir = self.corpus_dir / folder_name
         output_file = paper_dir / "references.json"
 
-        # Local Caching / Resume Check: skip API call if references.json already exists
+        # Local Caching / Resume Check: inspect cache status & retryable flag
         if not force_refresh and output_file.exists():
             try:
                 with open(output_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
 
-                # Backward compatibility with old list format or handle new wrapper dict format
                 if isinstance(data, list):
                     std_refs = data
                     status = "success"
+                    retryable = False
                 elif isinstance(data, dict):
                     status = data.get("status", "success")
+                    retryable = data.get("retryable", False)
                     std_refs = data.get("references") or []
                 else:
                     std_refs = []
+                    status = "success"
+                    retryable = False
 
                 if status == "success":
                     logger.success(f"Loaded cached references for {arxiv_id} from {output_file} (skipping API call).")
@@ -375,20 +420,43 @@ class ReferenceCrawler:
                             if ref.get("ref_arxiv_id"):
                                 self.metrics["references_with_arxiv_id"] += 1
 
-                        if PSUTIL_AVAILABLE:
-                            mem_mb = self._get_process_memory_mb()
-                            self.metrics["memory_samples"].append(mem_mb)
-
+                    mem_mb = self._get_process_memory_mb() if PSUTIL_AVAILABLE else 0.0
+                    self._log_metric_line({
+                        "arxiv_id": arxiv_id,
+                        "status": "success",
+                        "source": "cache",
+                        "retryable": False,
+                        "references_count": len(std_refs),
+                        "memory_mb": mem_mb
+                    })
                     return std_refs
+                elif status == "failed" and not retryable and not force_refresh:
+                    logger.warning(f"Cached status for {arxiv_id} is 'failed' and non-retryable (e.g. 404). Skipping re-fetch.")
+                    with self.metrics_lock:
+                        self.metrics["total_papers_processed"] += 1
+                        self.metrics["failed_crawls"] += 1
+                        if arxiv_id not in self.metrics["failed_arxiv_ids"]:
+                            self.metrics["failed_arxiv_ids"].append(arxiv_id)
+
+                    mem_mb = self._get_process_memory_mb() if PSUTIL_AVAILABLE else 0.0
+                    self._log_metric_line({
+                        "arxiv_id": arxiv_id,
+                        "status": "failed",
+                        "source": "cache_skipped",
+                        "retryable": False,
+                        "references_count": 0,
+                        "memory_mb": mem_mb
+                    })
+                    return []
                 else:
-                    logger.warning(f"Cached status for {arxiv_id} is 'failed'. Re-fetching from API...")
+                    logger.warning(f"Cached status for {arxiv_id} is 'failed' (retryable). Re-fetching from API...")
             except Exception as e:
                 logger.warning(f"Failed to load cache for {arxiv_id}: {e}. Re-fetching from API...")
 
         start_t = time.time()
         logger.info(f"Processing references for paper: {arxiv_id}")
 
-        raw_refs = self.fetch_references(arxiv_id)
+        raw_refs, is_retryable, err_msg, attempts_used = self.fetch_references(arxiv_id)
 
         if raw_refs is not None:
             std_refs = self.standardize_references(arxiv_id, raw_refs)
@@ -405,7 +473,14 @@ class ReferenceCrawler:
                 except Exception:
                     pass
 
-            self.save_paper_references(arxiv_id, std_refs, status="success", error_message=None)
+            self.save_paper_references(
+                arxiv_id,
+                std_refs,
+                status="success",
+                retryable=False,
+                error_message=None,
+                attempt=attempts_used
+            )
 
             with self.metrics_lock:
                 self.metrics["total_papers_processed"] += 1
@@ -415,28 +490,48 @@ class ReferenceCrawler:
                     if ref.get("ref_arxiv_id"):
                         self.metrics["references_with_arxiv_id"] += 1
         else:
-            error_msg = f"Không thể crawl references cho {arxiv_id} sau các lần thử (FAIL)."
+            error_msg = err_msg or f"Không thể crawl references cho {arxiv_id} sau các lần thử (FAIL)."
             logger.fail(error_msg)
-            self.save_paper_references(arxiv_id, references=None, status="failed", error_message=error_msg)
+            self.save_paper_references(
+                arxiv_id,
+                references=None,
+                status="failed",
+                retryable=is_retryable,
+                error_message=error_msg,
+                attempt=attempts_used
+            )
             with self.metrics_lock:
                 self.metrics["total_papers_processed"] += 1
                 self.metrics["failed_crawls"] += 1
-                self.metrics["failed_arxiv_ids"].append(arxiv_id)
+                if arxiv_id not in self.metrics["failed_arxiv_ids"]:
+                    self.metrics["failed_arxiv_ids"].append(arxiv_id)
             std_refs = []
 
+        mem_mb = self._get_process_memory_mb() if PSUTIL_AVAILABLE else 0.0
         if PSUTIL_AVAILABLE:
-            mem_mb = self._get_process_memory_mb()
             with self.metrics_lock:
                 self.metrics["memory_samples"].append(mem_mb)
 
         elapsed = time.time() - start_t
         if raw_refs is not None:
             logger.success(f"Crawl thành công {arxiv_id}: tìm thấy {len(std_refs)} references trong {elapsed:.2f}s")
+
+        self._log_metric_line({
+            "arxiv_id": arxiv_id,
+            "status": "success" if raw_refs is not None else "failed",
+            "retryable": is_retryable if raw_refs is None else False,
+            "references_count": len(std_refs),
+            "elapsed_seconds": elapsed,
+            "attempts": attempts_used,
+            "memory_mb": mem_mb
+        })
+
         return std_refs
 
-    def process_batch(self, arxiv_ids: List[str]) -> Dict[str, Any]:
+    def process_batch(self, arxiv_ids: List[str], force_refresh: bool = False) -> Dict[str, Any]:
         """
-        Process a batch of arXiv IDs concurrently using ThreadPoolExecutor.
+        Process a batch of arXiv IDs concurrently using ThreadPoolExecutor with Bounded Submission
+        (submitting at most max_workers * 2 tasks at a time to prevent RAM bloat on large corpora like 25,000 papers).
         Aggregates performance metrics, generates a unique run ID, and writes summary reports to disk.
         """
         import uuid
@@ -446,18 +541,39 @@ class ReferenceCrawler:
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n[Run ID: {run_id}]\n")
 
-        logger.info(f"Starting multithreaded batch crawling for {len(arxiv_ids)} papers using {self.max_workers} worker(s)... [Run ID: {run_id}]")
+        logger.info(f"Starting bounded multithreaded batch crawling for {len(arxiv_ids)} papers using {self.max_workers} worker(s)... [Run ID: {run_id}]")
         self.metrics["start_time"] = time.time()
 
-        # Execute batch processing concurrently across multiple threads
+        max_active = max(1, self.max_workers * 2)
+        iter_ids = iter(arxiv_ids)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(self.process_single_paper, aid): aid for aid in arxiv_ids}
-            for future in concurrent.futures.as_completed(futures):
-                aid = futures[future]
+            futures = {}
+            # Prime initial batch of tasks up to max_active
+            for _ in range(min(max_active, len(arxiv_ids))):
                 try:
-                    future.result()
-                except Exception as exc:
-                    logger.fail(f"Paper {aid} generated an exception during multithreaded crawling: {exc}")
+                    aid = next(iter_ids)
+                    fut = executor.submit(self.process_single_paper, aid, force_refresh)
+                    futures[fut] = aid
+                except StopIteration:
+                    break
+
+            # As tasks complete, submit next tasks dynamically (bounded submission)
+            while futures:
+                done, _ = concurrent.futures.wait(futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
+                for fut in done:
+                    aid = futures.pop(fut)
+                    try:
+                        fut.result()
+                    except Exception as exc:
+                        logger.fail(f"Paper {aid} generated an exception during multithreaded crawling: {exc}")
+
+                    try:
+                        next_aid = next(iter_ids)
+                        new_fut = executor.submit(self.process_single_paper, next_aid, force_refresh)
+                        futures[new_fut] = next_aid
+                    except StopIteration:
+                        pass
 
         self.metrics["end_time"] = time.time()
 
