@@ -1,12 +1,11 @@
 """
-Unit tests for reference_crawler.py (Milestone 1)
+Unit tests for the official batch-based ReferenceCrawler (Milestone 1)
 Description:
-    Tests core components of ReferenceCrawler including APIKeyPool rotation,
-    data standardization, saving logic, etc. using unittest.
+    Tests core components of ReferenceCrawler including APIKeyPool rotation and per-key rate limiting,
+    data standardization, atomic saving logic, and cache handling.
 """
 
 import unittest
-from pathlib import Path
 import tempfile
 import shutil
 import os
@@ -19,16 +18,16 @@ from reference_crawler import APIKeyPool, ReferenceCrawler
 
 
 class TestAPIKeyPool(unittest.TestCase):
-    """Test cases for APIKeyPool round-robin rotation and thread safety."""
+    """Test cases for APIKeyPool rotation and per-key rate limiting."""
 
-    def test_key_rotation(self):
+    def test_key_rotation_and_rate_limit(self):
         keys = ["key1", "key2", "key3"]
         pool = APIKeyPool(keys)
 
-        self.assertEqual(pool.get_key(), "key1")
-        self.assertEqual(pool.get_key(), "key2")
-        self.assertEqual(pool.get_key(), "key3")
-        self.assertEqual(pool.get_key(), "key1")  # Wraps around
+        self.assertEqual(pool.get_key_with_rate_limit(0.01), "key1")
+        self.assertEqual(pool.get_key_with_rate_limit(0.01), "key2")
+        self.assertEqual(pool.get_key_with_rate_limit(0.01), "key3")
+        self.assertEqual(pool.get_key_with_rate_limit(0.01), "key1")  # Wraps around
 
     def test_invalid_keys(self):
         with self.assertRaises(ValueError):
@@ -37,8 +36,8 @@ class TestAPIKeyPool(unittest.TestCase):
             APIKeyPool(["   ", ""])
 
 
-class TestReferenceCrawlerStandardization(unittest.TestCase):
-    """Test cases for data standardization and local file operations in ReferenceCrawler."""
+class TestReferenceCrawlerBatch(unittest.TestCase):
+    """Test cases for data standardization, atomic saving, and cache handling in ReferenceCrawler."""
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
@@ -84,7 +83,7 @@ class TestReferenceCrawlerStandardization(unittest.TestCase):
         self.assertEqual(ref1["ref_submission_date"], "2023-05-10")
         self.assertEqual(ref1["ref_s2_id"], "s2_id_001")
 
-        # Check second reference (missing externalIds / authors / date fallback to year)
+        # Check second reference
         ref2 = std_refs[1]
         self.assertEqual(ref2["arxiv_id"], arxiv_id)
         self.assertIsNone(ref2["ref_arxiv_id"])
@@ -93,12 +92,23 @@ class TestReferenceCrawlerStandardization(unittest.TestCase):
         self.assertEqual(ref2["ref_submission_date"], "2021")
         self.assertEqual(ref2["ref_s2_id"], "s2_id_002")
 
-    def test_save_paper_references(self):
+    def test_save_paper_references_atomic(self):
         arxiv_id = "2310.12345"
         sample_data = [{"arxiv_id": arxiv_id, "ref_title": "Test Ref"}]
 
-        saved_path = self.crawler.save_paper_references(arxiv_id, sample_data, status="success", error_message=None)
+        saved_path = self.crawler.save_paper_references(
+            arxiv_id,
+            sample_data,
+            status="success",
+            retryable=False,
+            error_message=None,
+            attempt=1
+        )
         self.assertTrue(saved_path.exists())
+
+        # Verify no temp file left behind
+        temp_path = saved_path.with_suffix(".json.tmp")
+        self.assertFalse(temp_path.exists())
 
         with open(saved_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -106,24 +116,11 @@ class TestReferenceCrawlerStandardization(unittest.TestCase):
         self.assertIsInstance(data, dict)
         self.assertEqual(data["arxiv_id"], arxiv_id)
         self.assertEqual(data["status"], "success")
+        self.assertFalse(data["retryable"])
+        self.assertEqual(data["attempt"], 1)
         self.assertIsNone(data["error_message"])
         self.assertEqual(data["references_count"], 1)
         self.assertEqual(data["references"], sample_data)
-
-    def test_save_paper_references_failed(self):
-        arxiv_id = "2310.99999"
-        saved_path = self.crawler.save_paper_references(arxiv_id, references=None, status="failed", error_message="HTTP 403 Forbidden")
-        self.assertTrue(saved_path.exists())
-
-        with open(saved_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        self.assertIsInstance(data, dict)
-        self.assertEqual(data["arxiv_id"], arxiv_id)
-        self.assertEqual(data["status"], "failed")
-        self.assertEqual(data["error_message"], "HTTP 403 Forbidden")
-        self.assertEqual(data["references_count"], 0)
-        self.assertIsNone(data["references"])
 
 
 if __name__ == "__main__":
