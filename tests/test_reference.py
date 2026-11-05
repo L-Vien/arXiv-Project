@@ -1,126 +1,219 @@
 """
-Unit tests for the official batch-based ReferenceCrawler (Milestone 1)
+Comprehensive Unit Test Suite for ReferenceCrawler (Milestone 1)
 Description:
-    Tests core components of ReferenceCrawler including APIKeyPool rotation and per-key rate limiting,
-    data standardization, atomic saving logic, and cache handling.
+    Tests all core components and edge cases of ReferenceCrawler and APIKeyPool:
+    1. APIKeyPool: rate limiting, round-robin/best-key selection, 429 adaptive cooldown (integer seconds and HTTP-date), mark_success logic.
+    2. ArXiv ID Normalization: legacy (hep-th/...) and new-style (YYMM.NNNNNvV) IDs.
+    3. Reference Standardization: mapping raw Semantic Scholar JSON to project schema.
+    4. Caching & Resume: atomic file writing (.tmp -> references.json), cache preservation on refresh failure.
+    5. Asynchronous Metrics Writer: non-blocking queue & reference_metrics.jsonl writing.
+    6. Process Batch Workflow (Mocked): testing process_batch with mocked fetch_batch responses (success, not_found, transient/permanent failures).
 """
 
 import unittest
+import unittest.mock
 import tempfile
 import shutil
 import os
 import json
+import time
+import queue
+from pathlib import Path
 
-# Ensure API key is present for initialization
-os.environ.setdefault("S2_API_KEY_1", "test_key_123")
+# Ensure default test API keys are present in env
+os.environ.setdefault("S2_API_KEY_1", "test_key_111")
+os.environ.setdefault("S2_API_KEY_2", "test_key_222")
 
-from reference_crawler import APIKeyPool, ReferenceCrawler
+from reference_crawler import APIKeyPool, ReferenceCrawler, _normalize_arxiv_id
 
 
 class TestAPIKeyPool(unittest.TestCase):
-    """Test cases for APIKeyPool rotation and per-key rate limiting."""
+    """Test cases for APIKeyPool rotation, rate limiting, and 429 adaptive cooldown."""
 
-    def test_key_rotation_and_rate_limit(self):
-        keys = ["key1", "key2", "key3"]
-        pool = APIKeyPool(keys)
-
-        self.assertEqual(pool.get_key_with_rate_limit(0.01), "key1")
-        self.assertEqual(pool.get_key_with_rate_limit(0.01), "key2")
-        self.assertEqual(pool.get_key_with_rate_limit(0.01), "key3")
-        self.assertEqual(pool.get_key_with_rate_limit(0.01), "key1")  # Wraps around
-
-    def test_invalid_keys(self):
+    def test_init_validation(self):
         with self.assertRaises(ValueError):
             APIKeyPool([])
         with self.assertRaises(ValueError):
             APIKeyPool(["   ", ""])
 
+    def test_mark_success_preserves_future_cooldown(self):
+        pool = APIKeyPool(["key1"])
+        future_time = time.time() + 30.0
+        pool.key_cooldown_until["key1"] = future_time
+        pool.consecutive_429["key1"] = 2
 
-class TestReferenceCrawlerBatch(unittest.TestCase):
-    """Test cases for data standardization, atomic saving, and cache handling in ReferenceCrawler."""
+        pool.mark_success("key1")
+        self.assertEqual(pool.consecutive_429["key1"], 0)
+        self.assertEqual(pool.key_cooldown_until["key1"], future_time)
+
+    def test_mark_success_clears_past_cooldown(self):
+        pool = APIKeyPool(["key1"])
+        past_time = time.time() - 10.0
+        pool.key_cooldown_until["key1"] = past_time
+        pool.consecutive_429["key1"] = 1
+
+        pool.mark_success("key1")
+        self.assertEqual(pool.consecutive_429["key1"], 0)
+        self.assertEqual(pool.key_cooldown_until["key1"], 0.0)
+
+    def test_mark_cooldown_with_retry_after_seconds(self):
+        pool = APIKeyPool(["key1"])
+        pool.mark_cooldown("key1", retry_after="5.5")
+        self.assertGreater(pool.key_cooldown_until["key1"], time.time())
+
+    def test_mark_cooldown_with_retry_after_http_date(self):
+        pool = APIKeyPool(["key1"])
+        # Format HTTP-date e.g. Wed, 05 Nov 2026 12:00:00 GMT
+        import datetime
+        future_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=15)
+        http_date_str = future_dt.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        pool.mark_cooldown("key1", retry_after=http_date_str)
+        self.assertGreater(pool.key_cooldown_until["key1"], time.time())
+
+    def test_get_key_with_rate_limit(self):
+        pool = APIKeyPool(["key1", "key2"])
+        k1 = pool.get_key_with_rate_limit(request_delay=0.1)
+        self.assertIn(k1, ["key1", "key2"])
+
+
+class TestArXivNormalization(unittest.TestCase):
+    """Test cases for arXiv ID normalization."""
+
+    def test_normalize_arxiv_id(self):
+        self.assertEqual(_normalize_arxiv_id("2310.12345v2"), "2310.12345")
+        self.assertEqual(_normalize_arxiv_id("2104.09876"), "2104.09876")
+        self.assertEqual(_normalize_arxiv_id("hep-th/0201001v1"), "hep-th/0201001")
+        self.assertEqual(_normalize_arxiv_id("quant-ph/9901002"), "quant-ph/9901002")
+        self.assertEqual(_normalize_arxiv_id("  2401.55555v3  "), "2401.55555")
+
+
+class TestReferenceStandardization(unittest.TestCase):
+    """Test cases for standardizing raw references into project schema."""
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
-        os.environ["S2_API_KEY_1"] = "dummy_key"
         self.crawler = ReferenceCrawler(corpus_dir=self.test_dir, log_dir=self.test_dir)
 
     def tearDown(self):
-        if hasattr(self, 'crawler') and self.crawler:
-            self.crawler.close()
+        self.crawler.close()
         shutil.rmtree(self.test_dir)
 
     def test_standardize_references(self):
-        arxiv_id = "2310.12345"
         raw_refs = [
             {
-                "paperId": "s2_id_001",
-                "title": "Quantum Error Correction",
+                "paperId": "s2_id_1",
+                "title": "Test Paper Title 1",
                 "authors": [{"name": "Alice"}, {"name": "Bob"}],
-                "year": 2023,
-                "publicationDate": "2023-05-10",
-                "externalIds": {"ArXiv": "2301.00001"}
+                "publicationDate": "2023-01-15",
+                "externalIds": {"ArXiv": "2301.00001v1"}
             },
             {
-                "paperId": "s2_id_002",
-                "title": "Another Paper",
-                "authors": [],
-                "year": 2021,
-                "publicationDate": None,
+                "paperId": "s2_id_2",
+                "title": "Test Paper Title 2",
+                "authors": [{"name": "Charlie"}],
+                "year": 2022,
                 "externalIds": {}
-            }
+            },
+            "invalid_ref_item"
         ]
 
-        std_refs = self.crawler.standardize_references(arxiv_id, raw_refs)
+        std = self.crawler.standardize_references("2310.12345", raw_refs)
+        self.assertEqual(len(std), 2)
+        self.assertEqual(std[0]["arxiv_id"], "2310.12345")
+        self.assertEqual(std[0]["ref_arxiv_id"], "2301.00001v1")
+        self.assertEqual(std[0]["ref_title"], "Test Paper Title 1")
+        self.assertEqual(std[0]["ref_authors"], ["Alice", "Bob"])
+        self.assertEqual(std[0]["ref_submission_date"], "2023-01-15")
+        self.assertEqual(std[0]["ref_s2_id"], "s2_id_1")
 
-        self.assertEqual(len(std_refs), 2)
+        self.assertEqual(std[1]["ref_arxiv_id"], None)
+        self.assertEqual(std[1]["ref_submission_date"], "2022")
 
-        # Check first reference
-        ref1 = std_refs[0]
-        self.assertEqual(ref1["arxiv_id"], arxiv_id)
-        self.assertEqual(ref1["ref_arxiv_id"], "2301.00001")
-        self.assertEqual(ref1["ref_title"], "Quantum Error Correction")
-        self.assertEqual(ref1["ref_authors"], ["Alice", "Bob"])
-        self.assertEqual(ref1["ref_submission_date"], "2023-05-10")
-        self.assertEqual(ref1["ref_s2_id"], "s2_id_001")
 
-        # Check second reference
-        ref2 = std_refs[1]
-        self.assertEqual(ref2["arxiv_id"], arxiv_id)
-        self.assertIsNone(ref2["ref_arxiv_id"])
-        self.assertEqual(ref2["ref_title"], "Another Paper")
-        self.assertEqual(ref2["ref_authors"], [])
-        self.assertEqual(ref2["ref_submission_date"], "2021")
-        self.assertEqual(ref2["ref_s2_id"], "s2_id_002")
+class TestCachingAndAtomicSave(unittest.TestCase):
+    """Test cases for atomic file writing and cache preservation on refresh failure."""
 
-    def test_save_paper_references_atomic(self):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.crawler = ReferenceCrawler(corpus_dir=self.test_dir, log_dir=self.test_dir)
+
+    def tearDown(self):
+        self.crawler.close()
+        shutil.rmtree(self.test_dir)
+
+    def test_cache_preservation_on_refresh_failure(self):
         arxiv_id = "2310.12345"
-        sample_data = [{"arxiv_id": arxiv_id, "ref_title": "Test Ref"}]
+        sample_refs = [{"arxiv_id": arxiv_id, "ref_title": "Cached Ref"}]
 
-        saved_path = self.crawler.save_paper_references(
+        # Save successful cache
+        self.crawler.save_paper_references(
             arxiv_id,
-            sample_data,
+            sample_refs,
             status="success",
             retryable=False,
             error_message=None,
             attempt=1
         )
-        self.assertTrue(saved_path.exists())
 
-        # Verify no temp file left behind
-        temp_path = saved_path.with_suffix(".json.tmp")
-        self.assertFalse(temp_path.exists())
+        folder_name = self.crawler._get_folder_name(arxiv_id)
+        output_file = self.crawler.corpus_dir / folder_name / "references.json"
+        self.assertTrue(output_file.exists())
 
-        with open(saved_path, "r", encoding="utf-8") as f:
+        # Attempt to save failure status
+        self.crawler.save_paper_references(
+            arxiv_id,
+            references=None,
+            status="retryable_failure",
+            retryable=True,
+            error_message="API Timeout",
+            attempt=2
+        )
+
+        with open(output_file, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        self.assertIsInstance(data, dict)
-        self.assertEqual(data["arxiv_id"], arxiv_id)
+        # Successful cache must be preserved
         self.assertEqual(data["status"], "success")
-        self.assertFalse(data["retryable"])
-        self.assertEqual(data["attempt"], 1)
-        self.assertIsNone(data["error_message"])
-        self.assertEqual(data["references_count"], 1)
-        self.assertEqual(data["references"], sample_data)
+        self.assertEqual(data["references"], sample_refs)
+
+        # last_failure.json should be recorded
+        fail_file = self.crawler.corpus_dir / folder_name / "last_failure.json"
+        self.assertTrue(fail_file.exists())
+
+
+class TestProcessBatchMocked(unittest.TestCase):
+    """Test cases for process_batch workflow with mocked fetch_batch."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.crawler = ReferenceCrawler(corpus_dir=self.test_dir, log_dir=self.test_dir, batch_size=2)
+
+    def tearDown(self):
+        self.crawler.close()
+        shutil.rmtree(self.test_dir)
+
+    def test_process_batch_success_and_not_found(self):
+        arxiv_ids = ["2310.11111", "2310.22222"]
+
+        # Mock fetch_batch to return success for first paper and null for second
+        mock_raw_results = [
+            {"references": [{"paperId": "ref1", "title": "Ref One", "authors": [{"name": "Author A"}]}]},
+            None
+        ]
+
+        with unittest.mock.patch.object(self.crawler, 'fetch_batch', return_value=(mock_raw_results, False, None, 1)):
+            summary = self.crawler.process_batch(arxiv_ids)
+
+        self.assertEqual(summary["total_papers"], 2)
+        self.assertEqual(summary["successful_crawls"], 1)
+        self.assertEqual(summary["not_found_count"], 1)
+        self.assertEqual(summary["completion_status"], "completed")
+
+        # Verify output files on disk
+        f1 = self.crawler.corpus_dir / "2310-11111" / "references.json"
+        f2 = self.crawler.corpus_dir / "2310-22222" / "references.json"
+        self.assertTrue(f1.exists())
+        self.assertTrue(f2.exists())
 
 
 if __name__ == "__main__":

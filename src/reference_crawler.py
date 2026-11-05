@@ -4,21 +4,23 @@ Description:
     Official Production-Grade Multithreaded Batch Reference Crawler for Milestone 1 of IntroDS Project.
     Utilizes Semantic Scholar Paper Batch API (POST /graph/v1/paper/batch) with ThreadPoolExecutor concurrency.
     Features:
-    - Multi-Key Rotation & Per-Key Rate Limiting (APIKeyPool): Automatically rotates API keys and ensures per-key rate limit compliance (1 req/sec).
-    - Multithreaded Batch Processing (ThreadPoolExecutor): Concurrent batch requests across multiple worker threads.
-    - Robust Caching / Resume mechanism: Inspects per-paper local cache and skips re-fetching if valid cache exists.
-    - Atomic File Writing: Saves per-paper references safely using .tmp and os.replace.
-    - Streaming Metrics (reference_metrics.jsonl): Appends per-paper metrics line-by-line.
-    - Thread-Local Session: Ensures thread-safe HTTP connection pooling across workers.
-    - Performance Tracking & Custom Logging (SUCCESS, FAIL, INFO, ERROR).
+    - Multi-Key Rotation & Per-Key Rate Limiting & 429 Adaptive Cooldown (APIKeyPool).
+    - Separate retry budgets for 429 rate limit attempts vs transient network/server errors.
+    - Strict Batch Response Length Validation.
+    - Cache preservation on refresh failure.
+    - Interruption-resilient atomic summary writing with completion_status and error_reason.
+    - Asynchronous Streaming Metrics via Queue & Background Writer Thread.
 """
 
 import os
 import json
 import time
+import random
 import logging
 import threading
+import queue
 import concurrent.futures
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import requests
@@ -66,51 +68,80 @@ if not logger.handlers:
     logger.addHandler(console_handler)
 
 
+def _normalize_arxiv_id(aid: str) -> str:
+    """Robustly normalize arXiv ID by removing version suffix."""
+    aid = aid.strip()
+    if "/" in aid:
+        cat, rest = aid.split("/", 1)
+        cleaned = re.sub(r"v\d+$", "", rest)
+        return f"{cat}/{cleaned}"
+    return re.sub(r"v\d+$", "", aid)
+
+
 class APIKeyPool:
-    """
-    Thread-safe pool for rotating multiple Semantic Scholar API keys in a round-robin fashion,
-    with per-key rate limiting to ensure compliance with API rate limits (1 req/sec per key).
-    """
+    """Thread-safe pool for rotating Semantic Scholar API keys with per-key rate limiting and 429 adaptive cooldown."""
     def __init__(self, api_keys: List[str]):
         if not api_keys or all(not k.strip() for k in api_keys):
             raise ValueError("Danh sách API Key rỗng hoặc không hợp lệ!")
         self.api_keys = [k.strip() for k in api_keys if k.strip()]
-        self.index = 0
         self.lock = threading.Lock()
-        self.key_last_request = {k: 0.0 for k in self.api_keys}
+        self.key_next_request = {k: 0.0 for k in self.api_keys}
+        self.key_cooldown_until = {k: 0.0 for k in self.api_keys}
+        self.consecutive_429 = {k: 0 for k in self.api_keys}
 
-    def get_key_with_rate_limit(self, request_delay: float = 1.0) -> str:
+    def mark_cooldown(self, key: str, retry_after: Optional[str] = None):
         with self.lock:
-            key = self.api_keys[self.index]
-            self.index = (self.index + 1) % len(self.api_keys)
+            self.consecutive_429[key] += 1
+            cooldown = None
+            if retry_after:
+                try:
+                    cooldown = float(retry_after)
+                except ValueError:
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        import datetime
+                        dt = parsedate_to_datetime(retry_after)
+                        cooldown = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                        if cooldown < 0:
+                            cooldown = 2.0
+                    except Exception:
+                        cooldown = None
 
-            now = time.time()
-            elapsed = now - self.key_last_request[key]
-            if elapsed < request_delay:
-                sleep_time = request_delay - elapsed
-                self.key_last_request[key] = now + sleep_time
-            else:
-                sleep_time = 0.0
-                self.key_last_request[key] = now
+            if cooldown is None:
+                cooldown = min(2.0 * (2 ** (self.consecutive_429[key] - 1)), 300.0) + random.uniform(0.1, 1.0)
 
-        if sleep_time > 0:
+            self.key_cooldown_until[key] = max(self.key_cooldown_until.get(key, 0.0), time.time() + cooldown)
+
+    def mark_success(self, key: str):
+        with self.lock:
+            self.consecutive_429[key] = 0
+            if self.key_cooldown_until.get(key, 0.0) <= time.time():
+                self.key_cooldown_until[key] = 0.0
+
+    def get_key_with_rate_limit(self, request_delay: float = 1.2) -> str:
+        while True:
+            with self.lock:
+                now = time.time()
+                best_key = min(self.api_keys, key=lambda k: max(self.key_next_request[k], self.key_cooldown_until[k]))
+                available_at = max(self.key_next_request[best_key], self.key_cooldown_until[best_key])
+
+                if available_at <= now:
+                    self.key_next_request[best_key] = max(now, self.key_next_request[best_key]) + request_delay
+                    return best_key
+                else:
+                    sleep_time = available_at - now
             time.sleep(sleep_time)
-        return key
 
 
 class ReferenceCrawler:
-    """
-    Official Production-Grade Multithreaded Batch Reference Crawler utilizing Semantic Scholar Paper Batch endpoint (POST /graph/v1/paper/batch).
-    Supports multi-key rotation, per-key rate limiting, concurrent batch execution via ThreadPoolExecutor,
-    per-paper caching, atomic saves, and streaming metrics.
-    """
+    """Multithreaded Batch Reference Crawler utilizing Semantic Scholar Paper Batch endpoint."""
     def __init__(
         self,
         corpus_dir: str = "data/corpus",
         log_dir: str = "log",
         request_delay: float = 1.2,
         max_retries: int = 5,
-        batch_size: int = 25,
+        batch_size: int = 100,
         api_key: Optional[str] = None,
         max_workers: Optional[int] = None
     ):
@@ -125,58 +156,40 @@ class ReferenceCrawler:
             curr = curr.parent
 
         if log_dir == "log":
-            if data_parent:
-                self.log_dir = data_parent / "log"
-            else:
-                self.log_dir = self.corpus_dir.parent.parent / "log" if len(self.corpus_dir.parts) >= 2 else Path("log")
+            self.log_dir = data_parent / "log" if data_parent else (self.corpus_dir.parent.parent / "log" if len(self.corpus_dir.parts) >= 2 else Path("log"))
         else:
             self.log_dir = Path(log_dir)
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
-
         self.request_delay = request_delay
         self.max_retries = max_retries
         self.batch_size = batch_size
 
-        # Setup file logging (reference_crawler.log inside log directory)
         log_file = self.log_dir / "reference_crawler.log"
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-
+        self.file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        self.file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
         if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
-            logger.addHandler(file_handler)
+            logger.addHandler(self.file_handler)
 
         raw_keys = []
         if api_key:
             raw_keys = [k.strip() for k in api_key.split(",") if k.strip()]
         else:
-            env_keys_dict = {}
-            for k, v in os.environ.items():
-                k_upper = k.upper()
-                if (k_upper.startswith("S2_API_KEY_") or k_upper.startswith("SEMANTIC_SCHOLAR_API_KEY_")) and v.strip():
-                    env_keys_dict[k_upper] = v.strip()
-
+            env_keys_dict = {k.upper(): v.strip() for k, v in os.environ.items() if (k.upper().startswith("S2_API_KEY_") or k.upper().startswith("SEMANTIC_SCHOLAR_API_KEY_")) and v.strip()}
             if env_keys_dict:
-                sorted_env_keys = [v for _, v in sorted(env_keys_dict.items(), key=lambda x: (len(x[0]), x[0]))]
-                raw_keys.extend(sorted_env_keys)
-
+                raw_keys.extend([v for _, v in sorted(env_keys_dict.items(), key=lambda x: (len(x[0]), x[0]))])
             if not raw_keys:
                 single_env = os.getenv("SEMANTIC_SCHOLAR_API_KEYS") or os.getenv("S2_API_KEY") or os.getenv("SEMANTIC_SCHOLAR_API_KEY")
                 if single_env:
                     raw_keys = [k.strip() for k in single_env.split(",") if k.strip()]
 
         if not raw_keys:
-            raise ValueError(
-                "Lỗi: Không tìm thấy Semantic Scholar API Key! "
-                "Vui lòng cấu hình S2_API_KEY_1, S2_API_KEY_2... trong file .env"
-            )
+            raise ValueError("Lỗi: Không tìm thấy Semantic Scholar API Key trong .env hoặc môi trường!")
 
         self.key_pool = APIKeyPool(raw_keys)
         self.max_workers = max_workers if max_workers is not None else len(self.key_pool.api_keys)
 
-        logger.info(f"Semantic Scholar API Key Pool initialized with {len(self.key_pool.api_keys)} key(s).")
-        logger.info(f"Reference Crawler configured with batch_size={self.batch_size}, max_workers={self.max_workers}.")
-        logger.info(f"Log directory set to: {self.log_dir.absolute()}")
+        logger.info(f"Initialized APIKeyPool with {len(self.key_pool.api_keys)} key(s), max_workers={self.max_workers}.")
 
         self.thread_local = threading.local()
         self.base_headers = {
@@ -184,20 +197,16 @@ class ReferenceCrawler:
             "Content-Type": "application/json"
         }
 
-        self.metrics_lock = threading.Lock()
-        self.metrics = {
-            "total_papers_processed": 0,
-            "successful_crawls": 0,
-            "failed_crawls": 0,
-            "failed_arxiv_ids": [],
-            "total_references_fetched": 0,
-            "references_with_arxiv_id": 0,
-            "start_time": None,
-            "end_time": None,
-            "peak_memory_mb": 0.0,
-            "avg_memory_mb": 0.0,
-            "memory_samples": []
-        }
+        self.metrics_queue = queue.Queue()
+        self._stop_metrics_writer = threading.Event()
+        self._metrics_writer_thread = threading.Thread(target=self._metrics_writer_worker, daemon=True)
+        self._metrics_writer_thread.start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
     def _get_session(self) -> requests.Session:
         if not hasattr(self.thread_local, "session"):
@@ -207,77 +216,67 @@ class ReferenceCrawler:
         return self.thread_local.session
 
     def close(self):
-        """Close file handlers to release file locks on Windows."""
-        for h in list(logger.handlers):
-            if isinstance(h, logging.FileHandler):
-                try:
-                    h.close()
-                    logger.removeHandler(h)
-                except Exception:
-                    pass
+        self._stop_metrics_writer.set()
+        try:
+            self.metrics_queue.join()
+        except Exception:
+            pass
+        if hasattr(self, '_metrics_writer_thread') and self._metrics_writer_thread.is_alive():
+            try:
+                self._metrics_writer_thread.join(timeout=5.0)
+            except Exception:
+                pass
+        if hasattr(self, 'file_handler') and self.file_handler:
+            try:
+                self.file_handler.close()
+                if self.file_handler in logger.handlers:
+                    logger.removeHandler(self.file_handler)
+            except Exception:
+                pass
 
     def _get_process_memory_mb(self) -> float:
         if PSUTIL_AVAILABLE:
             try:
-                process = psutil.Process(os.getpid())
-                return process.memory_info().rss / (1024 * 1024)
+                return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
             except Exception:
                 pass
         return 0.0
 
-    def _log_metric_line(self, metric_record: Dict[str, Any]):
-        """Append a single paper metric record to reference_metrics.jsonl (streaming/line-by-line)."""
+    def _metrics_writer_worker(self):
         metrics_file = self.log_dir / "reference_metrics.jsonl"
-        try:
-            with open(metrics_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(metric_record, ensure_ascii=False) + "\n")
-        except Exception as e:
-            logger.error(f"Failed to write metric line: {e}")
+        while not self._stop_metrics_writer.is_set() or not self.metrics_queue.empty():
+            try:
+                try:
+                    record = self.metrics_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                with open(metrics_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                self.metrics_queue.task_done()
+            except Exception as e:
+                logger.error(f"Failed to write metric line: {e}")
+
+    def _log_metric_line(self, record: Dict[str, Any]):
+        self.metrics_queue.put(record)
 
     def _get_folder_name(self, arxiv_id: str) -> str:
-        """
-        Normalize arXiv ID into folder name matching the Processor module:
-        Replaces both '/' and '.' with '-' (e.g. 2604.25535 -> 2604-25535).
-        """
         return arxiv_id.replace('/', '-').replace('.', '-')
 
     def standardize_references(self, arxiv_id: str, raw_references: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Normalize raw reference dictionaries from Semantic Scholar API into the standardized project schema:
-        - arxiv_id: ID of the citing paper
-        - ref_arxiv_id: arXiv ID of the reference (if available)
-        - ref_title: Title of the referenced paper
-        - ref_authors: List of author names
-        - ref_submission_date: Publication date or year
-        - ref_s2_id: Semantic Scholar paper ID
-        """
-        standardized_list = []
+        std_list = []
         for ref in raw_references:
-            ref_s2_id = ref.get("paperId")
-            ref_title = ref.get("title")
-
-            raw_authors = ref.get("authors", [])
-            ref_authors = [author.get("name", "") for author in raw_authors if author.get("name")]
-
-            ref_date = ref.get("publicationDate") or str(ref.get("year", ""))
-
+            if not isinstance(ref, dict):
+                continue
             external_ids = ref.get("externalIds", {}) or {}
-            ref_arxiv_id = external_ids.get("ArXiv")
-
-            if ref_arxiv_id:
-                with self.metrics_lock:
-                    self.metrics["references_with_arxiv_id"] += 1
-
-            std_ref = {
+            std_list.append({
                 "arxiv_id": arxiv_id,
-                "ref_arxiv_id": ref_arxiv_id,
-                "ref_title": ref_title,
-                "ref_authors": ref_authors,
-                "ref_submission_date": ref_date,
-                "ref_s2_id": ref_s2_id
-            }
-            standardized_list.append(std_ref)
-        return standardized_list
+                "ref_arxiv_id": external_ids.get("ArXiv") if isinstance(external_ids, dict) else None,
+                "ref_title": ref.get("title"),
+                "ref_authors": [a.get("name", "") for a in ref.get("authors", []) if isinstance(a, dict) and a.get("name")],
+                "ref_submission_date": ref.get("publicationDate") or str(ref.get("year", "")),
+                "ref_s2_id": ref.get("paperId")
+            })
+        return std_list
 
     def save_paper_references(
         self,
@@ -288,27 +287,38 @@ class ReferenceCrawler:
         error_message: Optional[str] = None,
         attempt: int = 1
     ) -> Path:
-        """
-        Save standardized references with wrapper status and retryable flag to local disk
-        under corpus/<paper_id_normalized>/references.json using atomic file replacement (.tmp -> final).
-        """
         folder_name = self._get_folder_name(arxiv_id)
         paper_dir = self.corpus_dir / folder_name
         paper_dir.mkdir(parents=True, exist_ok=True)
+        output_file = paper_dir / "references.json"
+
+        # Cache preservation on refresh failure
+        if status in ("retryable_failure", "permanent_failure") and output_file.exists():
+            try:
+                with open(output_file, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict) and existing.get("status") == "success" and existing.get("references"):
+                    fail_record = paper_dir / "last_failure.json"
+                    with open(fail_record, "w", encoding="utf-8") as ff:
+                        json.dump({"status": status, "retryable": retryable, "error_message": error_message, "attempt": attempt, "timestamp": time.time()}, ff, ensure_ascii=False, indent=2)
+                    return output_file
+            except Exception:
+                pass
 
         data = {
+            "schema_version": 1,
+            "crawler_version": "1.0.0",
             "arxiv_id": arxiv_id,
             "status": status,
             "retryable": retryable,
-            "attempt": attempt,
             "error_message": error_message,
+            "attempt": attempt,
+            "timestamp": time.time(),
             "references_count": len(references) if references is not None else 0,
-            "references": references
+            "references": references if references is not None else []
         }
 
-        output_file = paper_dir / "references.json"
         temp_file = paper_dir / "references.json.tmp"
-
         try:
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -321,262 +331,262 @@ class ReferenceCrawler:
                 except Exception:
                     pass
             raise
-
         return output_file
 
     def fetch_batch(self, arxiv_ids: List[str]) -> Tuple[Optional[List[Dict[str, Any]]], bool, Optional[str], int]:
-        """
-        Fetch a batch of papers using POST https://api.semanticscholar.org/graph/v1/paper/batch
-        Implements per-key rate limiting, automatic key rotation, and 429 rate limit handling.
-        Returns: (response_json_list, retryable, error_message, attempts_used)
-        """
-        clean_ids = [f"ARXIV:{aid.split('v')[0] if 'v' in aid and not aid.startswith('hep') else aid}" for aid in arxiv_ids]
+        clean_ids = [f"ARXIV:{_normalize_arxiv_id(aid)}" for aid in arxiv_ids]
         url = "https://api.semanticscholar.org/graph/v1/paper/batch"
-        params = {
-            "fields": "references.title,references.authors,references.year,references.publicationDate,references.venue,references.externalIds"
-        }
+        params = {"fields": "references.title,references.authors,references.year,references.publicationDate,references.externalIds"}
         body = {"ids": clean_ids}
 
-        max_429_retries = 3
-        retries_429 = 0
+        transient_attempts = 0
+        rate_limit_attempts = 0
+        max_rate_limit_attempts = 2 * len(self.key_pool.api_keys)
 
-        for attempt in range(1, self.max_retries + 1):
-            current_api_key = self.key_pool.get_key_with_rate_limit(self.request_delay)
-            headers = {**self.base_headers, "x-api-key": current_api_key}
+        while transient_attempts < self.max_retries:
+            key = self.key_pool.get_key_with_rate_limit(self.request_delay)
+            headers = {**self.base_headers, "x-api-key": key}
 
             try:
-                session = self._get_session()
-                response = session.post(url, params=params, json=body, headers=headers, timeout=45)
+                response = self._get_session().post(url, params=params, json=body, headers=headers, timeout=45)
+
+                if response.status_code in (401, 403, 400, 404):
+                    err = f"Permanent HTTP error {response.status_code}. Do not retry."
+                    logger.fail(err)
+                    return None, False, err, transient_attempts + 1
 
                 if response.status_code == 429:
-                    retries_429 += 1
-                    if retries_429 > max_429_retries:
-                        err = f"Exceeded max 429 retries for batch of size {len(arxiv_ids)}."
+                    rate_limit_attempts += 1
+                    retry_after = response.headers.get("Retry-After")
+                    self.key_pool.mark_cooldown(key, retry_after)
+                    logger.warning(f"[429 Rate Limit] Batch hit limit with key {key[:6]}... Rotating key and retrying ({rate_limit_attempts}/{max_rate_limit_attempts})...")
+                    if rate_limit_attempts >= max_rate_limit_attempts:
+                        err = f"Exceeded max rate limit attempts ({max_rate_limit_attempts})."
                         logger.fail(err)
-                        return None, True, err, attempt
-                    logger.warning(f"[429 Rate Limit] Batch hit limit with key {current_api_key[:6]}... Rotating key and retrying ({retries_429}/{max_429_retries})...")
-                    time.sleep(2.0)
+                        return None, True, err, transient_attempts + 1
+                    continue
+
+                if 500 <= response.status_code <= 599:
+                    transient_attempts += 1
+                    err = f"Server error {response.status_code}"
+                    if transient_attempts >= self.max_retries:
+                        return None, True, err, transient_attempts
+                    time.sleep(min(2 * transient_attempts, 6) + random.uniform(0.1, 0.5))
                     continue
 
                 response.raise_for_status()
-                data = response.json()
-                return data, False, None, attempt
+                self.key_pool.mark_success(key)
 
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Error fetching batch using key {current_api_key[:6]}... (Attempt {attempt}/{self.max_retries}): {e}")
-                if attempt == self.max_retries:
-                    err = f"Failed batch request after {self.max_retries} attempts: {e}"
+                try:
+                    data = response.json()
+                except (requests.exceptions.JSONDecodeError, json.JSONDecodeError) as jde:
+                    transient_attempts += 1
+                    if transient_attempts >= self.max_retries:
+                        return None, True, f"JSONDecodeError: {jde}", transient_attempts
+                    time.sleep(2.0 + random.uniform(0.1, 0.5))
+                    continue
+
+                if not isinstance(data, list) or len(data) != len(clean_ids):
+                    transient_attempts += 1
+                    err = f"Malformed or truncated batch response (expected {len(clean_ids)}, got {len(data) if isinstance(data, list) else type(data)})"
+                    if transient_attempts >= self.max_retries:
+                        return None, True, err, transient_attempts
+                    time.sleep(2.0 + random.uniform(0.1, 0.5))
+                    continue
+
+                return [item if isinstance(item, dict) else None for item in data], False, None, transient_attempts + 1
+
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
+                transient_attempts += 1
+                if transient_attempts >= self.max_retries:
+                    err = f"Network/HTTP error after {self.max_retries} attempts: {e}"
                     logger.fail(err)
-                    return None, True, err, attempt
-                time.sleep(min(2 * attempt, 6))
+                    return None, True, err, transient_attempts
+                time.sleep(min(2 * transient_attempts, 6) + random.uniform(0.1, 0.5))
+            except Exception as e:
+                logger.exception(f"Unexpected error in fetch_batch: {e}")
+                return None, False, f"Unexpected error: {e}", transient_attempts + 1
 
-        return None, True, "Max retries reached", self.max_retries
+        return None, True, "Max transient retries reached", self.max_retries
+
+    def _save_summary(self, summary: Dict[str, Any]):
+        try:
+            summary_path = self.log_dir / "crawler_performance_summary.jsonl"
+            with open(summary_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to save summary JSONL: {e}")
+
+        try:
+            summary_json_path = self.log_dir / "crawler_performance_summary.json"
+            temp_json_path = summary_json_path.with_suffix(".json.tmp")
+            existing = []
+            if summary_json_path.exists():
+                with open(summary_json_path, "r", encoding="utf-8") as f:
+                    content = json.load(f)
+                    existing = [item for item in (content if isinstance(content, list) else [content]) if item != "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"]
+            existing.append(summary)
+            with open(temp_json_path, "w", encoding="utf-8") as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+            os.replace(temp_json_path, summary_json_path)
+        except Exception as e:
+            logger.error(f"Failed to save summary JSON: {e}")
 
     def process_batch(self, arxiv_ids: List[str], force_refresh: bool = False) -> Dict[str, Any]:
-        """
-        Process a list of arXiv IDs using the batch endpoint concurrently via ThreadPoolExecutor.
-        Checks cache first, fetches missing items in parallel batches, standardizes, saves atomically,
-        updates thread-safe metrics, and streams metric lines to reference_metrics.jsonl.
-        """
         import uuid
         run_id = f"run_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+        empty_summary = {
+            "run_id": run_id, "completion_status": "completed", "error_reason": None,
+            "total_papers": 0, "successful_crawls": 0, "not_found_count": 0, "failed_crawls": 0,
+            "failed_arxiv_ids": [], "total_references_collected": 0, "references_with_arxiv_id": 0,
+            "total_wall_time_seconds": 0.0, "average_time_per_paper_seconds": 0.0,
+            "peak_memory_mb": 0.0, "average_memory_mb": 0.0
+        }
+
+        if not arxiv_ids:
+            self._save_summary(empty_summary)
+            return empty_summary
+
+        unique_arxiv_ids = list(dict.fromkeys([_normalize_arxiv_id(aid) for aid in arxiv_ids]))
+        start_time = time.time()
+        memory_samples = []
+        run_metrics_lock = threading.Lock()
 
         log_file = self.log_dir / "reference_crawler.log"
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n[Run ID: {run_id}]\n")
 
-        logger.info(f"Starting multithreaded batch reference crawling for {len(arxiv_ids)} papers using {self.max_workers} worker(s) (Batch Size: {self.batch_size})... [Run ID: {run_id}]")
-        self.metrics["start_time"] = time.time()
+        logger.info(f"Starting crawl for {len(unique_arxiv_ids)} unique papers with {self.max_workers} worker(s)... [Run ID: {run_id}]")
 
-        # Check cache and resume
-        pending_ids = []
-        for aid in arxiv_ids:
-            folder_name = self._get_folder_name(aid)
-            output_file = self.corpus_dir / folder_name / "references.json"
-            if not force_refresh and output_file.exists():
-                try:
-                    with open(output_file, "r", encoding="utf-8") as f:
-                        cache_data = json.load(f)
-                    status = cache_data.get("status") if isinstance(cache_data, dict) else "success"
-                    if status == "success":
-                        logger.success(f"Loaded cached references for {aid} (skipping API call).")
-                        with self.metrics_lock:
-                            self.metrics["total_papers_processed"] += 1
-                            self.metrics["successful_crawls"] += 1
-                            refs = cache_data.get("references", []) if isinstance(cache_data, dict) else cache_data
-                            self.metrics["total_references_fetched"] += len(refs)
+        completion_status = "completed"
+        error_reason = None
 
-                        mem_mb = self._get_process_memory_mb()
-                        self._log_metric_line({
-                            "arxiv_id": aid,
-                            "status": "success",
-                            "source": "cache",
-                            "retryable": False,
-                            "references_count": len(refs),
-                            "memory_mb": mem_mb
-                        })
-                        continue
-                except Exception:
-                    pass
-            pending_ids.append(aid)
+        try:
+            pending_ids = []
+            for aid in unique_arxiv_ids:
+                output_file = self.corpus_dir / self._get_folder_name(aid) / "references.json"
+                if not force_refresh and output_file.exists():
+                    try:
+                        with open(output_file, "r", encoding="utf-8") as f:
+                            cache = json.load(f)
+                        if isinstance(cache, dict) and cache.get("schema_version") == 1:
+                            status = cache.get("status")
+                            if status == "success":
+                                std_refs = self.standardize_references(aid, cache.get("references", []))
+                                logger.success(f"Loaded cached references for {aid} (skipping API call).")
+                                mem_mb = self._get_process_memory_mb()
+                                with run_metrics_lock:
+                                    memory_samples.append(mem_mb)
+                                self._log_metric_line({"run_id": run_id, "arxiv_id": aid, "status": "success", "source": "cache", "retryable": False, "references_count": len(std_refs), "memory_mb": mem_mb})
+                                continue
+                            elif status == "not_found":
+                                with run_metrics_lock:
+                                    memory_samples.append(self._get_process_memory_mb())
+                                continue
+                    except Exception:
+                        pass
+                pending_ids.append(aid)
 
-        # Chunk pending IDs into batches
-        batches = [pending_ids[i:i + self.batch_size] for i in range(0, len(pending_ids), self.batch_size)]
+            batches = [pending_ids[i:i + self.batch_size] for i in range(0, len(pending_ids), self.batch_size)]
 
-        def process_single_batch(batch_idx: int, batch: List[str]):
-            start_t = time.time()
-            logger.info(f"Processing batch {batch_idx + 1}/{len(batches)} containing {len(batch)} paper(s)...")
+            def process_single_batch(batch_idx: int, batch: List[str]):
+                start_t = time.time()
+                logger.info(f"Processing batch {batch_idx + 1}/{len(batches)} containing {len(batch)} paper(s)...")
+                raw_results, is_retryable, err_msg, attempts = self.fetch_batch(batch)
+                elapsed = time.time() - start_t
+                mem_mb = self._get_process_memory_mb()
 
-            raw_results, is_retryable, err_msg, attempts = self.fetch_batch(batch)
-            elapsed = time.time() - start_t
-            mem_mb = self._get_process_memory_mb()
+                with run_metrics_lock:
+                    memory_samples.append(mem_mb)
 
-            if raw_results is not None:
-                for i, aid in enumerate(batch):
-                    paper_data = raw_results[i] if i < len(raw_results) else None
-                    if paper_data and isinstance(paper_data, dict):
-                        raw_refs = paper_data.get("references", [])
-                        std_refs = self.standardize_references(aid, raw_refs)
+                if raw_results is not None:
+                    for i, aid in enumerate(batch):
+                        paper_data = raw_results[i] if i < len(raw_results) else None
+                        if paper_data and isinstance(paper_data, dict):
+                            std_refs = self.standardize_references(aid, paper_data.get("references", []))
+                            self.save_paper_references(aid, std_refs, status="success", retryable=False, attempt=attempts)
+                            logger.success(f"Crawl thành công {aid}: tìm thấy {len(std_refs)} references trong {elapsed:.2f}s")
+                            self._log_metric_line({"run_id": run_id, "arxiv_id": aid, "status": "success", "retryable": False, "references_count": len(std_refs), "elapsed_seconds": elapsed, "attempts": attempts, "memory_mb": mem_mb})
+                        else:
+                            logger.warning(f"Paper {aid} not found or null in batch response.")
+                            self.save_paper_references(aid, [], status="not_found", retryable=False, error_message="Not found", attempt=attempts)
+                            self._log_metric_line({"run_id": run_id, "arxiv_id": aid, "status": "not_found", "retryable": False, "references_count": 0, "elapsed_seconds": elapsed, "attempts": attempts, "memory_mb": mem_mb})
+                else:
+                    fail_status = "retryable_failure" if is_retryable else "permanent_failure"
+                    for aid in batch:
+                        self.save_paper_references(aid, None, status=fail_status, retryable=is_retryable, error_message=err_msg, attempt=attempts)
+                        self._log_metric_line({"run_id": run_id, "arxiv_id": aid, "status": fail_status, "retryable": is_retryable, "references_count": 0, "elapsed_seconds": elapsed, "attempts": attempts, "memory_mb": mem_mb})
 
-                        # Safeguard: preserve existing cached data if API transiently returns 0 references
-                        folder_name = self._get_folder_name(aid)
-                        output_file = self.corpus_dir / folder_name / "references.json"
-                        if not std_refs and output_file.exists():
-                            try:
-                                with open(output_file, "r", encoding="utf-8") as f:
-                                    existing_data = json.load(f)
-                                existing_refs = existing_data.get("references", []) if isinstance(existing_data, dict) else existing_data
-                                if existing_refs:
-                                    logger.warning(f"API returned 0 references for {aid}. Preserving existing cached data ({len(existing_refs)} refs).")
-                                    std_refs = existing_refs
-                            except Exception:
-                                pass
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = [executor.submit(process_single_batch, idx, batch) for idx, batch in enumerate(batches)]
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"Worker exception: {e}")
 
-                        self.save_paper_references(
-                            aid,
-                            std_refs,
-                            status="success",
-                            retryable=False,
-                            error_message=None,
-                            attempt=attempts
-                        )
+        except KeyboardInterrupt:
+            completion_status = "interrupted_by_user"
+            error_reason = "KeyboardInterrupt (Ctrl+C)"
+            raise
+        except Exception as exc:
+            completion_status = "failed_with_exception"
+            error_reason = str(exc)
+            raise
+        finally:
+            end_time = time.time()
+            total_time = end_time - start_time
 
-                        with self.metrics_lock:
-                            self.metrics["total_papers_processed"] += 1
-                            self.metrics["successful_crawls"] += 1
-                            self.metrics["total_references_fetched"] += len(std_refs)
-                            self.metrics["memory_samples"].append(mem_mb)
+            # Compute definitive metrics from corpus state on disk
+            success_count, not_found_count, failed_count = 0, 0, 0
+            failed_ids = []
+            total_refs = 0
+            refs_with_arxiv = 0
 
-                        logger.success(f"Crawl thành công {aid}: tìm thấy {len(std_refs)} references trong {elapsed:.2f}s")
-                        self._log_metric_line({
-                            "arxiv_id": aid,
-                            "status": "success",
-                            "retryable": False,
-                            "references_count": len(std_refs),
-                            "elapsed_seconds": elapsed,
-                            "attempts": attempts,
-                            "memory_mb": mem_mb
-                        })
-                    else:
-                        logger.warning(f"Paper {aid} not found or null in batch response.")
-                        self.save_paper_references(
-                            aid,
-                            [],
-                            status="success",
-                            retryable=False,
-                            error_message="Paper not found in batch response",
-                            attempt=attempts
-                        )
-                        with self.metrics_lock:
-                            self.metrics["total_papers_processed"] += 1
-                            self.metrics["successful_crawls"] += 1
-                            self.metrics["memory_samples"].append(mem_mb)
+            for aid in unique_arxiv_ids:
+                output_file = self.corpus_dir / self._get_folder_name(aid) / "references.json"
+                if output_file.exists():
+                    try:
+                        with open(output_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        st = data.get("status")
+                        if st == "success":
+                            success_count += 1
+                            refs = data.get("references", [])
+                            total_refs += len(refs)
+                            refs_with_arxiv += sum(1 for r in refs if isinstance(r, dict) and r.get("ref_arxiv_id"))
+                        elif st == "not_found":
+                            not_found_count += 1
+                        else:
+                            failed_count += 1
+                            failed_ids.append(aid)
+                    except Exception:
+                        failed_count += 1
+                        failed_ids.append(aid)
+                else:
+                    failed_count += 1
+                    failed_ids.append(aid)
 
-                        self._log_metric_line({
-                            "arxiv_id": aid,
-                            "status": "success",
-                            "retryable": False,
-                            "references_count": 0,
-                            "elapsed_seconds": elapsed,
-                            "attempts": attempts,
-                            "memory_mb": mem_mb
-                        })
-            else:
-                logger.fail(f"Batch {batch_idx + 1} failed: {err_msg}")
-                for aid in batch:
-                    self.save_paper_references(
-                        aid,
-                        references=None,
-                        status="failed",
-                        retryable=is_retryable,
-                        error_message=err_msg,
-                        attempt=attempts
-                    )
-                    with self.metrics_lock:
-                        self.metrics["total_papers_processed"] += 1
-                        self.metrics["failed_crawls"] += 1
-                        if aid not in self.metrics["failed_arxiv_ids"]:
-                            self.metrics["failed_arxiv_ids"].append(aid)
-                        self.metrics["memory_samples"].append(mem_mb)
+            num_papers = max(1, len(unique_arxiv_ids))
+            summary = {
+                "run_id": run_id,
+                "completion_status": completion_status,
+                "error_reason": error_reason,
+                "total_papers": num_papers,
+                "successful_crawls": success_count,
+                "not_found_count": not_found_count,
+                "failed_crawls": failed_count,
+                "failed_arxiv_ids": failed_ids,
+                "total_references_collected": total_refs,
+                "references_with_arxiv_id": refs_with_arxiv,
+                "total_wall_time_seconds": total_time,
+                "average_time_per_paper_seconds": total_time / num_papers,
+                "peak_memory_mb": max(memory_samples) if memory_samples else 0.0,
+                "average_memory_mb": sum(memory_samples) / len(memory_samples) if memory_samples else 0.0
+            }
 
-                    self._log_metric_line({
-                        "arxiv_id": aid,
-                        "status": "failed",
-                        "retryable": is_retryable,
-                        "references_count": 0,
-                        "elapsed_seconds": elapsed,
-                        "attempts": attempts,
-                        "memory_mb": mem_mb
-                    })
-
-        # Run batch requests concurrently using ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [executor.submit(process_single_batch, idx, batch) for idx, batch in enumerate(batches)]
-            concurrent.futures.wait(futures)
-
-        self.metrics["end_time"] = time.time()
-        total_time = self.metrics["end_time"] - self.metrics["start_time"]
-        num_papers = max(1, self.metrics["total_papers_processed"])
-
-        if self.metrics["memory_samples"]:
-            self.metrics["peak_memory_mb"] = max(self.metrics["memory_samples"])
-            self.metrics["avg_memory_mb"] = sum(self.metrics["memory_samples"]) / len(self.metrics["memory_samples"])
-
-        summary = {
-            "run_id": run_id,
-            "total_papers": num_papers,
-            "successful_crawls": self.metrics["successful_crawls"],
-            "failed_crawls": self.metrics["failed_crawls"],
-            "failed_arxiv_ids": self.metrics["failed_arxiv_ids"],
-            "total_references_collected": self.metrics["total_references_fetched"],
-            "references_with_arxiv_id": self.metrics["references_with_arxiv_id"],
-            "total_wall_time_seconds": total_time,
-            "average_time_per_paper_seconds": total_time / num_papers,
-            "peak_memory_mb": self.metrics["peak_memory_mb"],
-            "average_memory_mb": self.metrics["avg_memory_mb"]
-        }
-
-        logger.success(f"Multithreaded batch reference crawling completed successfully! [Run ID: {run_id}]")
-
-        # Save summary report to JSON file in log directory
-        summary_path = self.log_dir / "crawler_performance_summary.json"
-        existing_data = []
-        if summary_path.exists():
-            try:
-                with open(summary_path, "r", encoding="utf-8") as f:
-                    content = json.load(f)
-                    if isinstance(content, list):
-                        existing_data = content
-                    else:
-                        existing_data = [content]
-            except Exception:
-                existing_data = []
-
-        if existing_data:
-            existing_data.append("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-        existing_data.append(summary)
-
-        with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(existing_data, f, ensure_ascii=False, indent=2)
+            self._save_summary(summary)
+            logger.info(f"Crawl run finished. Status: {completion_status}. Summary saved. [Run ID: {run_id}]")
 
         return summary
