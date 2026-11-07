@@ -24,7 +24,11 @@ from pathlib import Path
 os.environ.setdefault("S2_API_KEY_1", "test_key_111")
 os.environ.setdefault("S2_API_KEY_2", "test_key_222")
 
-from reference_crawler import APIKeyPool, ReferenceCrawler, _normalize_arxiv_id
+from src.crawling.reference_crawler import (
+    APIKeyPool,
+    ReferenceCrawler,
+    _normalize_arxiv_id,
+)
 
 
 class TestAPIKeyPool(unittest.TestCase):

@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
-from src.logger import get_logger
+from src.crawling.logger import get_logger
 
 logger = get_logger(__name__)
 

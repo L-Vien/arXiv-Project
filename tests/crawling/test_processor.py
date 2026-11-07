@@ -7,7 +7,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from src.processor import (
+from src.crawling.processor import (
     STATUS_ERROR, STATUS_MISSING, STATUS_NO_TEX, STATUS_OK,
     detect_source_type, process_version,
 )

@@ -2,7 +2,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def get_path(env_name: str, default: Path) -> Path:
     """Đọc đường dẫn từ biến môi trường hoặc dùng giá trị mặc định."""
@@ -42,6 +42,7 @@ class Settings:
 
     # API pacing: khoảng chờ giữa các request
     arxiv_api_delay: float = 3.0
+    arxiv_rate_limit_cooldown: float = 20.0
     semantic_scholar_delay: float = 1.0
 
     # Nhận diện client khi gọi API

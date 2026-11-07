@@ -10,14 +10,16 @@ from pathlib import Path
 from unittest.mock import call, patch
 from urllib.error import HTTPError, URLError
 import pytest
-from src.downloader import (
+from src.crawling.downloader import (
     IncompleteDownloadError,
     InvalidSourceFormatError,
     RateLimiter,
     build_versioned_ids,
+    build_pdf_url,
     calculate_sha256,
     detect_source_format,
     download_many_versions,
+    download_pdf,
     download_version,
     download_with_retry,
     download_with_status,
@@ -26,6 +28,7 @@ from src.downloader import (
     validate_gzip,
     validate_tar,
     verify_integrity,
+    verify_pdf_integrity,
     write_integrity_marker,
     remove_cached_source
 )
@@ -209,7 +212,7 @@ def test_download_version_success(tmp_path):
     }
 # Act: Replace real urlopen with a fake response
     with patch(
-        "src.downloader.urlopen",
+        "src.crawling.downloader.urlopen",
         return_value=response
     ) as mock_urlopen:
         result = download_version(
@@ -248,7 +251,7 @@ def test_download_pdf_source(tmp_path):
         "Content-Length": str(len(payload))
     }
 
-    with patch("src.downloader.urlopen", return_value=response):
+    with patch("src.crawling.downloader.urlopen", return_value=response):
         path = download_version(
             versioned_id,
             tmp_path,
@@ -258,6 +261,38 @@ def test_download_pdf_source(tmp_path):
     assert path.read_bytes() == payload
     assert detect_source_format(path) == "pdf"
     assert (tmp_path / f"{versioned_id}.source.ok").exists()
+
+
+def test_download_pdf_fallback_uses_separate_file_and_integrity_marker(tmp_path):
+    versioned_id = "2607.28694v1"
+    payload = b"%PDF-1.7\nFallback PDF\n%%EOF\n"
+    response = BytesIO(payload)
+    response.headers = {"Content-Length": str(len(payload))}
+
+    with patch("src.crawling.downloader.urlopen", return_value=response) as mock_urlopen:
+        path = download_pdf(versioned_id, tmp_path, limiter=RateLimiter(0))
+
+    assert build_pdf_url(versioned_id).endswith(f"/pdf/{versioned_id}")
+    assert path == tmp_path / f"{versioned_id}.pdf"
+    assert path.read_bytes() == payload
+    assert verify_pdf_integrity(versioned_id, tmp_path) is True
+    assert not (tmp_path / f"{versioned_id}.source").exists()
+    assert mock_urlopen.call_args.args[0].full_url.endswith(
+        f"/pdf/{versioned_id}"
+    )
+
+
+def test_download_pdf_rejects_non_pdf_response(tmp_path):
+    versioned_id = "2607.28694v1"
+    response = BytesIO(b"not a pdf")
+    response.headers = {"Content-Length": "9"}
+
+    with patch("src.crawling.downloader.urlopen", return_value=response):
+        with pytest.raises(InvalidSourceFormatError):
+            download_pdf(versioned_id, tmp_path, limiter=RateLimiter(0))
+
+    assert not (tmp_path / f"{versioned_id}.pdf").exists()
+    assert not (tmp_path / f"{versioned_id}.pdf.ok").exists()
 
 
 def test_download_plain_tex(tmp_path):
@@ -276,7 +311,7 @@ def test_download_plain_tex(tmp_path):
     }
 
     with patch(
-        "src.downloader.urlopen",
+        "src.crawling.downloader.urlopen",
         return_value=response
     ) as mock_urlopen:
 
@@ -312,7 +347,7 @@ def test_download_invalid_format(tmp_path, payload):
         "Content-Length": str(len(payload))
     }
 
-    with patch("src.downloader.urlopen", return_value=response):
+    with patch("src.crawling.downloader.urlopen", return_value=response):
         with pytest.raises(InvalidSourceFormatError):
             download_version(
                 versioned_id,
@@ -345,7 +380,7 @@ def test_download_truncated_gzip_tar(tmp_path):
         "Content-Length": str(len(payload))
     }
 
-    with patch("src.downloader.urlopen", return_value=response):
+    with patch("src.crawling.downloader.urlopen", return_value=response):
         with pytest.raises(IncompleteDownloadError):
             download_version(
                 versioned_id,
@@ -366,7 +401,7 @@ def test_download_incomplete_content_length(tmp_path):
         "Content-Length": str(len(payload) + 10)
     }
 
-    with patch("src.downloader.urlopen", return_value=response):
+    with patch("src.crawling.downloader.urlopen", return_value=response):
         with pytest.raises(IncompleteDownloadError):
             download_version(
                 versioned_id,
@@ -391,7 +426,7 @@ def test_reject_gzip_html(tmp_path):
     }
 
     with patch(
-        "src.downloader.urlopen",
+        "src.crawling.downloader.urlopen",
         return_value=response
     ):
         with pytest.raises(InvalidSourceFormatError):
@@ -410,10 +445,10 @@ def test_rate_limiter_wait():
     limiter = RateLimiter(min_interval=3.0)
 
     with patch(
-        "src.downloader.time.monotonic",
+        "src.crawling.downloader.time.monotonic",
         side_effect=[100.0, 100.0, 101.0, 103.0]
     ):
-        with patch("src.downloader.time.sleep") as mock_sleep:
+        with patch("src.crawling.downloader.time.sleep") as mock_sleep:
             limiter.wait()
             limiter.wait()
 
@@ -437,7 +472,7 @@ def test_parse_retry_after_http_date():
         usegmt=True
     )
 
-    with patch("src.downloader.datetime") as mock_datetime:
+    with patch("src.crawling.downloader.datetime") as mock_datetime:
         mock_datetime.now.return_value = fake_now
 
         result = parse_retry_after(retry_after)
@@ -459,12 +494,12 @@ def test_retry_http_429(tmp_path):
     )
 
     with patch(
-        "src.downloader.download_version",
+        "src.crawling.downloader.download_version",
         side_effect=[error, expected_path]
     ) as mock_download:
 
         with patch(
-            "src.downloader.DEFAULT_RATE_LIMITER.cooldown"
+            "src.crawling.downloader.DEFAULT_RATE_LIMITER.cooldown"
         ) as mock_cooldown:
 
             result = download_with_retry(
@@ -476,8 +511,8 @@ def test_retry_http_429(tmp_path):
     assert result == expected_path
     assert mock_download.call_count == 2
 
-    # max(fallback=30s, Retry-After=8s)
-    mock_cooldown.assert_called_once_with(30.0)
+    # max(fallback=20s, Retry-After=8s)
+    mock_cooldown.assert_called_once_with(20.0)
 
 
 def test_retry_http_429_missing_headers(tmp_path):
@@ -493,12 +528,12 @@ def test_retry_http_429_missing_headers(tmp_path):
     )
 
     with patch(
-        "src.downloader.download_version",
+        "src.crawling.downloader.download_version",
         side_effect=[error, expected_path]
     ) as mock_download:
 
         with patch(
-            "src.downloader.DEFAULT_RATE_LIMITER.cooldown"
+            "src.crawling.downloader.DEFAULT_RATE_LIMITER.cooldown"
         ) as mock_cooldown:
 
             result = download_with_retry(
@@ -510,19 +545,19 @@ def test_retry_http_429_missing_headers(tmp_path):
     assert result == expected_path
     assert mock_download.call_count == 2
 
-    # No Retry-After → fallback cooldown = 30s
-    mock_cooldown.assert_called_once_with(30.0)
+    # No Retry-After → fallback cooldown = 20s
+    mock_cooldown.assert_called_once_with(20.0)
 
 
 def test_rate_limiter_respects_cooldown():
     limiter = RateLimiter(min_interval=3.0)
 
     with patch(
-        "src.downloader.time.monotonic",
+        "src.crawling.downloader.time.monotonic",
         side_effect=[100.0, 101.0, 131.0]
     ):
         with patch(
-            "src.downloader.time.sleep"
+            "src.crawling.downloader.time.sleep"
         ) as mock_sleep:
 
             limiter.cooldown(30)
@@ -548,11 +583,11 @@ def test_retry_http_429_long_retry_after(tmp_path):
     )
 
     with patch(
-        "src.downloader.download_version",
+        "src.crawling.downloader.download_version",
         side_effect=[error, expected_path]
     ) as mock_download:
         with patch(
-            "src.downloader.DEFAULT_RATE_LIMITER.cooldown"
+            "src.crawling.downloader.DEFAULT_RATE_LIMITER.cooldown"
         ) as mock_cooldown:
 
             result = download_with_retry(
@@ -582,11 +617,11 @@ def test_non_retryable_http_error(tmp_path, status_code):
     )
 
     with patch(
-        "src.downloader.download_version",
+        "src.crawling.downloader.download_version",
         side_effect=error
     ) as mock_download:
 
-        with patch("src.downloader.time.sleep") as mock_sleep:
+        with patch("src.crawling.downloader.time.sleep") as mock_sleep:
 
             with pytest.raises(HTTPError) as exc_info:
                 download_with_retry(
@@ -612,11 +647,11 @@ def test_http_503_max_attempts(tmp_path):
     )
 
     with patch(
-        "src.downloader.download_version",
+        "src.crawling.downloader.download_version",
         side_effect=error
     ) as mock_download:
 
-        with patch("src.downloader.time.sleep") as mock_sleep:
+        with patch("src.crawling.downloader.time.sleep") as mock_sleep:
 
             with pytest.raises(HTTPError):
                 download_with_retry(
@@ -638,11 +673,11 @@ def test_retry_timeout_then_success(tmp_path):
     expected_path = tmp_path / f"{versioned_id}.source"
 
     with patch(
-        "src.downloader.download_version",
+        "src.crawling.downloader.download_version",
         side_effect=[TimeoutError("Request timed out"), expected_path]
     ) as mock_download:
 
-        with patch("src.downloader.time.sleep") as mock_sleep:
+        with patch("src.crawling.downloader.time.sleep") as mock_sleep:
 
             result = download_with_retry(
                 versioned_id,
@@ -671,15 +706,15 @@ def test_retry_corrupted_gzip(tmp_path):
         responses.append(response)
 
     with patch(
-        "src.downloader.urlopen",
+        "src.crawling.downloader.urlopen",
         side_effect=responses
     ) as mock_urlopen:
 
         with patch(
-            "src.downloader.DEFAULT_RATE_LIMITER",
+            "src.crawling.downloader.DEFAULT_RATE_LIMITER",
             RateLimiter(0)
         ):
-            with patch("src.downloader.time.sleep") as mock_sleep:
+            with patch("src.crawling.downloader.time.sleep") as mock_sleep:
                 path = download_with_retry(
                     versioned_id,
                     tmp_path,
@@ -713,15 +748,15 @@ def test_retry_incomplete_read(tmp_path):
     }
 
     with patch(
-        "src.downloader.urlopen",
+        "src.crawling.downloader.urlopen",
         side_effect=[broken_response, valid_response]
     ) as mock_urlopen:
 
         with patch(
-            "src.downloader.DEFAULT_RATE_LIMITER",
+            "src.crawling.downloader.DEFAULT_RATE_LIMITER",
             RateLimiter(0)
         ):
-            with patch("src.downloader.time.sleep"):
+            with patch("src.crawling.downloader.time.sleep"):
                 path = download_with_retry(
                     versioned_id,
                     tmp_path,
@@ -749,8 +784,8 @@ def test_download_status_and_resume(tmp_path):
         "Content-Length": str(len(payload))
     }
 
-    with patch("src.downloader.urlopen", return_value=response) as mock_urlopen:
-        with patch("src.downloader.DEFAULT_RATE_LIMITER", RateLimiter(0)):
+    with patch("src.crawling.downloader.urlopen", return_value=response) as mock_urlopen:
+        with patch("src.crawling.downloader.DEFAULT_RATE_LIMITER", RateLimiter(0)):
 
             first = download_with_status(versioned_id, tmp_path)
             second = download_with_status(versioned_id, tmp_path)
@@ -771,11 +806,11 @@ def test_log_download_failed(tmp_path):
     error = URLError("Network unavailable")
 
     with patch(
-        "src.downloader.download_with_retry",
+        "src.crawling.downloader.download_with_retry",
         side_effect=error
     ):
         with patch(
-            "src.downloader.logger.error"
+            "src.crawling.downloader.logger.error"
         ) as mock_log:
 
             result = download_with_status(
@@ -804,7 +839,7 @@ def test_batch_continues_after_failure(tmp_path):
         return Path(output_dir) / f"{versioned_id}.source"
 
     with patch(
-        "src.downloader.download_with_retry",
+        "src.crawling.downloader.download_with_retry",
         side_effect=fake_download
     ):
         results = download_many_versions(versioned_ids, tmp_path)
@@ -845,7 +880,7 @@ def test_batch_writes_status_jsonl(tmp_path):
     ]
 
     with patch(
-        "src.downloader.download_with_status",
+        "src.crawling.downloader.download_with_status",
         side_effect=fake_results
     ):
         results = download_many_versions(
@@ -893,7 +928,7 @@ def test_batch_preserves_status_after_interrupt(tmp_path):
         }
 
     with patch(
-        "src.downloader.download_with_status",
+        "src.crawling.downloader.download_with_status",
         side_effect=fake_download
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -981,7 +1016,7 @@ def test_batch_dedup_success(tmp_path):
     }
     versioned_ids = [versioned_id, versioned_id, versioned_id]
     with patch(
-        "src.downloader.download_with_status",
+        "src.crawling.downloader.download_with_status",
         return_value=fake_result,
     ) as mock_download:
         results = download_many_versions(
@@ -1013,7 +1048,7 @@ def test_batch_dedup_retries_failed_id(tmp_path):
     }
     versioned_ids = [versioned_id, versioned_id, versioned_id]
     with patch(
-        "src.downloader.download_with_status",
+        "src.crawling.downloader.download_with_status",
         side_effect=[failed_result, success_result],
     ) as mock_download:
         results = download_many_versions(
@@ -1040,12 +1075,12 @@ def test_redownload_corrupted_source(tmp_path):
         return response
 
     with patch(
-        "src.downloader.urlopen",
+        "src.crawling.downloader.urlopen",
         side_effect=[make_response(), make_response()]
     ) as mock_urlopen:
 
         with patch(
-            "src.downloader.DEFAULT_RATE_LIMITER",
+            "src.crawling.downloader.DEFAULT_RATE_LIMITER",
             RateLimiter(0)
         ):
             # First download
@@ -1087,7 +1122,7 @@ def test_remove_stale_part_before_download(tmp_path):
     }
 
     with patch(
-        "src.downloader.urlopen",
+        "src.crawling.downloader.urlopen",
         return_value=response
     ):
         path = download_version(

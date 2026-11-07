@@ -2,12 +2,16 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
+.ini
 
 # Virtual environment
 .venv/
 venv/
+.env
+.env.*
 
 # Environment variables and secrets
 .env.env
@@ -21,6 +25,7 @@ logs/
 *.log
 samples/
 out/
+input/
 
 # OS files
 .DS_Store

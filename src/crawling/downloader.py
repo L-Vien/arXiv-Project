@@ -7,16 +7,19 @@ import re
 import json
 import tarfile
 import hashlib
+import threading
 from urllib.error import HTTPError, URLError
 from http.client import IncompleteRead
 from datetime import datetime, timezone 
 from email.utils import parsedate_to_datetime
-from src.config import settings
-from src.logger import get_logger
+from collections.abc import Callable
+from src.crawling.config import settings
+from src.crawling.logger import get_logger
 
 logger = get_logger(__name__)
 
 BASE_URL = "https://export.arxiv.org/src"
+PDF_BASE_URL = "https://export.arxiv.org/pdf"
 VERSIONED_ID_PATTERN = re.compile(r"\d{4}\.\d{4,5}v[1-9]\d*")
 
 class RateLimiter: 
@@ -27,29 +30,32 @@ class RateLimiter:
         self.min_interval = min_interval
         self.last_request_time = None
         self.cooldown_until = 0.0
+        self._lock = threading.Lock()
 
     def wait(self) -> None: 
-        now = time.monotonic()
-        next_allowed = self.cooldown_until
+        with self._lock:
+            now = time.monotonic()
+            next_allowed = self.cooldown_until
 
-        if self.last_request_time is not None:
-            next_allowed = max(
-                next_allowed,
-                self.last_request_time + self.min_interval
-            )
+            if self.last_request_time is not None:
+                next_allowed = max(
+                    next_allowed,
+                    self.last_request_time + self.min_interval
+                )
 
-        remaining = next_allowed - now
+            remaining = next_allowed - now
 
-        if remaining > 0:
-            time.sleep(remaining)
+            if remaining > 0:
+                time.sleep(remaining)
 
-        self.last_request_time = time.monotonic()
+            self.last_request_time = time.monotonic()
 
     def cooldown(self, seconds: float) -> None:
-        self.cooldown_until = max(
-            self.cooldown_until,
-            time.monotonic() + max(0.0, seconds)
-        )
+        with self._lock:
+            self.cooldown_until = max(
+                self.cooldown_until,
+                time.monotonic() + max(0.0, seconds)
+            )
 
 DEFAULT_RATE_LIMITER = RateLimiter(min_interval=settings.arxiv_api_delay)
 
@@ -93,6 +99,10 @@ def build_source_url(versioned_id: str) -> str:
     versioned_id = validate_versioned_id(versioned_id)
     return f"{BASE_URL}/{versioned_id}"
 
+def build_pdf_url(versioned_id: str) -> str:
+    versioned_id = validate_versioned_id(versioned_id)
+    return f"{PDF_BASE_URL}/{versioned_id}"
+
 def calculate_sha256(path: str | Path) -> str:
     """Calculate SHA-256 using fixed-size chunks."""
     hasher = hashlib.sha256()
@@ -128,25 +138,16 @@ def write_integrity_marker(source_path: str | Path) -> None:
     finally:
         temp_marker.unlink(missing_ok=True)
 
-def verify_integrity(
-    versioned_id: str,
-    output_dir: str | Path,
-) -> bool | None:
+def _verify_file_integrity(path: Path, marker: Path) -> bool | None:
     """
     True: checksum matches.
     False: file or marker is invalid, or checksum mismatches.
     None: legacy marker without checksum.
     """
-    validate_versioned_id(versioned_id)
-    output_dir = Path(output_dir)
-
-    source = output_dir / f"{versioned_id}.source"
-    marker = output_dir / f"{versioned_id}.source.ok"
-
     if (
-        not source.is_file()
+        not path.is_file()
         or not marker.is_file()
-        or source.stat().st_size == 0
+        or path.stat().st_size == 0
     ):
         return False
 
@@ -171,7 +172,7 @@ def verify_integrity(
         if type(expected_size) is not int or expected_size <= 0:
             return False
 
-        if expected_size != source.stat().st_size:
+        if expected_size != path.stat().st_size:
             return False
 
         if (
@@ -180,105 +181,138 @@ def verify_integrity(
         ):
             return False
 
-        return calculate_sha256(source) == expected_sha256
+        return calculate_sha256(path) == expected_sha256
 
     except (OSError, UnicodeError, ValueError, TypeError):
         return False
 
-def download_version(versioned_id: str, output_dir: str | Path, limiter: RateLimiter | None = None) -> Path: 
-    if limiter is None:
-            limiter = DEFAULT_RATE_LIMITER
-    
-    url = build_source_url(versioned_id)
 
+def verify_integrity(
+    versioned_id: str,
+    output_dir: str | Path,
+) -> bool | None:
+    validate_versioned_id(versioned_id)
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # file chính thức
-    output_path = output_dir / f"{versioned_id}.source"
-    # file tạm thời 
-    temp_path = output_dir / f"{versioned_id}.source.part"
-
-    
-    success_marker = output_dir / f"{versioned_id}.source.ok"
-
-    temp_path.unlink(missing_ok=True)
-
-    if is_download_complete(versioned_id, output_dir):
-        return output_path
-
-    # Invalidate stale completion marker before downloading
-    success_marker.unlink(missing_ok=True)
-
-    # create a request object with User-Agent
-    request = Request(
-        url,
-        headers={
-            "User-Agent": settings.user_agent
-        }
+    return _verify_file_integrity(
+        output_dir / f"{versioned_id}.source",
+        output_dir / f"{versioned_id}.source.ok",
     )
 
-    try: 
+
+def verify_pdf_integrity(
+    versioned_id: str,
+    output_dir: str | Path,
+) -> bool | None:
+    validate_versioned_id(versioned_id)
+    output_dir = Path(output_dir)
+    return _verify_file_integrity(
+        output_dir / f"{versioned_id}.pdf",
+        output_dir / f"{versioned_id}.pdf.ok",
+    )
+
+
+def _download_file(
+    versioned_id: str,
+    url: str,
+    output_path: Path,
+    validator: Callable[[str | Path, str], None],
+    limiter: RateLimiter,
+) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = Path(f"{output_path}.part")
+    Path(f"{output_path}.ok").unlink(missing_ok=True)
+    temp_path.unlink(missing_ok=True)
+
+    request = Request(url, headers={"User-Agent": settings.user_agent})
+    try:
         limiter.wait()
-        # open the url using urlopen()
         with urlopen(request, timeout=settings.request_timeout) as response:
             content_length = response.headers.get("Content-Length")
             expected_size = (
                 int(content_length)
                 if content_length is not None and content_length.isdecimal()
-                else None 
+                else None
             )
-            bytes_downloaded = 0 
-            # read binary data and write to temp_path
-            with temp_path.open("wb") as file: 
-                while True: 
-                    try: 
+            bytes_downloaded = 0
+            with temp_path.open("wb") as file:
+                while True:
+                    try:
                         chunk = response.read(64 * 1024)
-                    except (IncompleteRead, ConnectionError) as e:
-                        raise IncompleteDownloadError(f"Network interrupted while downloading {versioned_id}") from e
-    
-                    if not chunk: 
-                        break 
+                    except (IncompleteRead, ConnectionError) as exc:
+                        raise IncompleteDownloadError(
+                            f"Network interrupted while downloading {versioned_id}"
+                        ) from exc
+                    if not chunk:
+                        break
                     file.write(chunk)
                     bytes_downloaded += len(chunk)
-            
-        if bytes_downloaded == 0: 
-            raise IncompleteDownloadError("Empty download")
 
+        if bytes_downloaded == 0:
+            raise IncompleteDownloadError("Empty download")
         if expected_size is not None and bytes_downloaded != expected_size:
             raise IncompleteDownloadError(
                 f"Incomplete download: expected {expected_size} bytes, "
                 f"got {bytes_downloaded} bytes"
             )
 
-        # source validation
-        validate_source(temp_path, versioned_id)
+        validator(temp_path, versioned_id)
         temp_path.replace(output_path)
         write_integrity_marker(output_path)
         return output_path
-    except HTTPError as e: 
-        logger.warning(
-            "HTTP error | version=%s | code=%s",
-            versioned_id,
-            e.code
-        )
+    except HTTPError as exc:
+        logger.warning("HTTP error | version=%s | code=%s", versioned_id, exc.code)
         raise
-    except URLError as e: 
-        logger.warning(
-            "URL error | version=%s | reason=%s",
-            versioned_id,
-            e.reason
-        )
+    except URLError as exc:
+        logger.warning("URL error | version=%s | reason=%s", versioned_id, exc.reason)
         raise
-    except TimeoutError as e: 
-        logger.warning(
-            "Timeout | version=%s | error=%s",
-            versioned_id,
-            e
-        )
+    except TimeoutError as exc:
+        logger.warning("Timeout | version=%s | error=%s", versioned_id, exc)
         raise
-    finally: 
+    finally:
         temp_path.unlink(missing_ok=True)
+
+def download_version(versioned_id: str, output_dir: str | Path, limiter: RateLimiter | None = None) -> Path:
+    if limiter is None:
+            limiter = DEFAULT_RATE_LIMITER
+    output_dir = Path(output_dir)
+    output_path = output_dir / f"{versioned_id}.source"
+    if is_download_complete(versioned_id, output_dir):
+        return output_path
+    return _download_file(
+        versioned_id,
+        build_source_url(versioned_id),
+        output_path,
+        validate_source,
+        limiter,
+    )
+
+
+def _validate_pdf(path: str | Path, versioned_id: str) -> None:
+    with Path(path).open("rb") as file:
+        if not file.read(5).startswith(b"%PDF-"):
+            raise InvalidSourceFormatError(
+                f"Invalid PDF response for {versioned_id}"
+            )
+
+
+def download_pdf(
+    versioned_id: str,
+    output_dir: str | Path,
+    limiter: RateLimiter | None = None,
+) -> Path:
+    if limiter is None:
+        limiter = DEFAULT_RATE_LIMITER
+    output_dir = Path(output_dir)
+    output_path = output_dir / f"{versioned_id}.pdf"
+    if verify_pdf_integrity(versioned_id, output_dir) is True:
+        return output_path
+    return _download_file(
+        versioned_id,
+        build_pdf_url(versioned_id),
+        output_path,
+        _validate_pdf,
+        limiter,
+    )
 
 
 def validate_source(path: str | Path, versioned_id: str) -> None: 
@@ -394,7 +428,9 @@ def download_with_retry(versioned_id: str, output_dir: str | Path, max_attempts:
                 retry_after_seconds = parse_retry_after(retry_after_value)
 
                 # Conservative fallback when Retry-After is absent
-                fallback_delay = 30 * (2 ** (attempt - 1))
+                fallback_delay = settings.arxiv_rate_limit_cooldown * (
+                    2 ** (attempt - 1)
+                )
                 delay = max(fallback_delay, retry_after_seconds or 0.0)
 
                 # Apply cooldown to subsequent requests

@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from src.config import PROJECT_ROOT, settings
+from src.crawling.config import PROJECT_ROOT, settings
 
 class TestConfig(unittest.TestCase):
 
@@ -25,6 +25,9 @@ class TestConfig(unittest.TestCase):
 
     def test_arxiv_delay_is_non_negative(self):
         self.assertGreaterEqual(settings.arxiv_api_delay, 0)
+
+    def test_arxiv_rate_limit_cooldown_is_non_negative(self):
+        self.assertGreaterEqual(settings.arxiv_rate_limit_cooldown, 0)
 
     def test_log_level_is_valid(self):
         valid_levels = {

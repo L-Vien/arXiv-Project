@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.metadata import (
+from src.crawling.metadata import (
     base_arxiv_id, normalize_paper_metadata, paper_dir_name,
     parse_arxiv_id, save_metadata, validate_metadata, version_dir,
 )

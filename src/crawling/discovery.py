@@ -5,10 +5,10 @@ import argparse
 import time
 import random
 import calendar
-from typing import List, Dict, Any, Generator, Tuple, Optional
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 
 import arxiv
-from src.logger import get_logger, setup_logging
+from src.crawling.logger import get_logger, setup_logging
 
 logger = get_logger(__name__)
 
@@ -23,6 +23,10 @@ client = arxiv.Client(
     delay_seconds=3,
     num_retries=0
 )
+
+
+class DiscoveryCheckpointError(RuntimeError):
+    """Raised when discovery checkpoint files cannot be resumed safely."""
 
 
 def parse_input() -> argparse.Namespace:
@@ -177,6 +181,34 @@ def extract_versions(paper: arxiv.Result) -> List[str]:
     return [f"v{i}" for i in range(1, latest_version + 1)]
 
 
+def _ids_fingerprint(ids: Iterable[str]) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    for arxiv_id in ids:
+        digest.update(arxiv_id.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _read_jsonl_records(file_path: str) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    if not os.path.exists(file_path):
+        return records
+
+    with open(file_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+    return records
+
+
 # Helper persistence operations
 def append_jsonl(file_path: str, items: List[Dict[str, Any]]) -> None:
     if not items:
@@ -214,6 +246,16 @@ def init_checkpoint_files(output_dir: str, current_params: Optional[Dict[str, An
         "not_found": os.path.join(output_dir, "discovery_not_found.jsonl"),
         "state": os.path.join(output_dir, "discovery_state.json")
     }
+
+    data_files = (files["papers"], files["failed"], files["not_found"])
+    if not os.path.exists(files["state"]) and any(
+        os.path.isfile(path) and os.path.getsize(path) > 0
+        for path in data_files
+    ):
+        raise DiscoveryCheckpointError(
+            "Discovery state is missing while discovery JSONL data exists. "
+            "Use a new output directory or restore the state file."
+        )
 
     for ftype, filepath in files.items():
         if ftype == "state":
@@ -259,6 +301,9 @@ def load_checkpoint_state(state_file: str, current_params: Optional[Dict[str, An
             with open(state_file, "r", encoding="utf-8") as f:
                 state = json.load(f)
 
+            if not isinstance(state, dict):
+                raise ValueError("checkpoint must contain a JSON object")
+
             if current_params and "input_params" in state:
                 # So sánh tham số bỏ qua trường 'mode'
                 old_p = {k: v for k, v in state["input_params"].items() if k != "mode"}
@@ -270,7 +315,9 @@ def load_checkpoint_state(state_file: str, current_params: Optional[Dict[str, An
 
             return state, False
         except Exception as e:
-            logger.warning("Could not read state file: %s. Re-initializing.", e)
+            raise DiscoveryCheckpointError(
+                f"Could not read discovery checkpoint: {state_file}"
+            ) from e
             
     return default_state, False
 
@@ -279,6 +326,12 @@ def load_checkpoint_state(state_file: str, current_params: Optional[Dict[str, An
 def find_start_timestamp_month_1(year: int, month: int, start_id: int) -> str:
     """Dò bài báo hợp lệ từ start_id trở đi để lấy timestamp bắt đầu cho Month 1."""
     prefix = f"{year % 100:02d}{month:02d}"
+    started = time.perf_counter()
+    logger.info(
+        "Discovery timestamp probe started: prefix=%s start_id=%05d max_probes=30",
+        prefix,
+        start_id,
+    )
     for probe_offset in range(30):
         probe_id = f"{prefix}.{start_id + probe_offset:05d}"
         try:
@@ -287,14 +340,25 @@ def find_start_timestamp_month_1(year: int, month: int, start_id: int) -> str:
                 paper = papers[0]
                 t_start_str = paper.published.strftime("%Y%m%d%H%M%S")
                 logger.info(
-                    "Found reference paper for start timestamp: %s (Published: %s, Solr TS: %s)", 
-                    paper.get_short_id(), paper.published, t_start_str
+                    "Found reference paper for start timestamp: %s (Published: %s, Solr TS: %s, probe=%d, elapsed=%.2fs)",
+                    paper.get_short_id(),
+                    paper.published,
+                    t_start_str,
+                    probe_offset + 1,
+                    max(0.0, time.perf_counter() - started),
                 )
                 return t_start_str
         except Exception as e:
             logger.warning("Probe failed for %s: %s", probe_id, e)
             continue
             
+    elapsed = max(0.0, time.perf_counter() - started)
+    logger.error(
+        "Discovery timestamp probe failed: prefix=%s start_id=%05d probes=30 elapsed=%.2fs",
+        prefix,
+        start_id,
+        elapsed,
+    )
     raise RuntimeError(
         f"Could not find any valid paper starting from {prefix}.{start_id:05d} within 30 probes to extract timestamp."
     )
@@ -320,6 +384,56 @@ def fetch_date_range_batch(query: str, offset: int, batch_size: int = BATCH_SIZE
             time.sleep(delay)
 
     raise RuntimeError(f"Date query failed at offset {offset}")
+
+
+def fetch_date_stream_batch_once(
+    query: str,
+    offset: int,
+    batch_size: int,
+    target_yymm: str,
+    min_id: int,
+    max_found: int | None = None,
+    min_subbatch_size: int = MIN_SUBBATCH_SIZE,
+) -> Dict[str, Any]:
+    """Fetch one date-stream page and convert it to pipeline metadata.
+
+    The request itself is intentionally one-attempt; callers that own the
+    pipeline checkpoint and retry policy can wrap this function without
+    duplicating the legacy date-stream files.
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be greater than zero")
+    if min_subbatch_size <= 0:
+        raise ValueError("min_subbatch_size must be greater than zero")
+    search = arxiv.Search(
+        query=query,
+        max_results=offset + batch_size,
+        sort_by=arxiv.SortCriterion.SubmittedDate,
+        sort_order=arxiv.SortOrder.Ascending,
+    )
+    raw_papers = list(client.results(search, offset=offset))
+    filtered: Dict[str, arxiv.Result] = {}
+    for paper in raw_papers:
+        base_id = get_base_id(paper)
+        match = re.fullmatch(r"(\d{4})\.(\d{5})", base_id)
+        if match and match.group(1) == target_yymm and int(match.group(2)) >= min_id:
+            filtered[base_id] = paper
+
+    selected = list(filtered.items())
+    if max_found is not None:
+        selected = selected[: max(0, max_found)]
+    paper_map = dict(selected)
+    found_papers, failed_ids = process_paper_batch_with_revisions(
+        paper_map,
+        failed_initial_ids=[],
+        min_subbatch_size=min_subbatch_size,
+    )
+    return {
+        "offset": offset + len(raw_papers),
+        "raw_count": len(raw_papers),
+        "found_papers": found_papers,
+        "failed_ids": failed_ids,
+    }
 
 
 def process_paper_batch_with_revisions(
@@ -393,7 +507,7 @@ def process_paper_batch_with_revisions(
     return found_papers, list(dict.fromkeys(batch_failed_ids))
 
 
-def discover_ids_stream(
+def discover_two_month_range_stream(
     args_params: Dict[str, Any],
     batch_size: int = BATCH_SIZE,
     min_subbatch_size: int = MIN_SUBBATCH_SIZE,
@@ -401,7 +515,6 @@ def discover_ids_stream(
 ) -> Generator[Dict[str, Any], None, None]:
     files = None
     state = None
-    mode = args_params.get("mode", "all")
     is_two_months = args_params.get("is_two_months", False)
 
     if output_dir:
@@ -409,34 +522,10 @@ def discover_ids_stream(
         raw_state, params_changed = load_checkpoint_state(files["state"], current_params=args_params)
 
         if params_changed:
-            if mode == "test":
-                logger.info("Mode 'test': Argument changed. Clearing previous .jsonl files and resetting checkpoint.")
-                wipe_output_files(files)
-                state = {
-                    "input_params": args_params,
-                    "current_phase": "MONTH_1_DATE_STREAM" if is_two_months else "ID_BATCH",
-                    "month_1_t_start_str": None,
-                    "month_1_offset": 0,
-                    "id_batch_last_completed": 0,
-                    "id_batch_last_processed_id": None,
-                    "total_found": 0,
-                    "total_not_found": 0,
-                    "total_failed": 0
-                }
-            else:  # mode == "all"
-                logger.info("Mode 'all': Argument changed. Retaining previous .jsonl files and appending new data.")
-                state = {
-                    "input_params": args_params,
-                    "current_phase": "MONTH_1_DATE_STREAM" if is_two_months else "ID_BATCH",
-                    "month_1_t_start_str": None,
-                    "month_1_offset": 0,
-                    "id_batch_last_completed": 0,
-                    "id_batch_last_processed_id": None,
-                    "total_found": raw_state.get("total_found", 0),
-                    "total_not_found": raw_state.get("total_not_found", 0),
-                    "total_failed": raw_state.get("total_failed", 0)
-                }
-            update_state_atomic(files["state"], state)
+            raise ValueError(
+                "Discovery input does not match its checkpoint. "
+                "Use a new output directory for a different input."
+            )
         else:
             state = raw_state
             state["input_params"] = args_params
@@ -599,6 +688,165 @@ def discover_ids_stream(
         yield batch_result
 
 
+def discover_ids_stream(
+    arxiv_ids: Iterable[str],
+    *,
+    batch_size: int = BATCH_SIZE,
+    min_subbatch_size: int = MIN_SUBBATCH_SIZE,
+    output_dir: Optional[str] = None,
+    input_params: Optional[Dict[str, Any]] = None,
+) -> Generator[Dict[str, Any], None, None]:
+    """Discover metadata for an arbitrary ordered iterable of arXiv IDs.
+
+    The checkpoint identifies the complete input definition. A changed input
+    is rejected before any new JSONL record is appended, preventing unrelated
+    runs from being mixed in one discovery directory.
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be greater than zero")
+    if min_subbatch_size <= 0:
+        raise ValueError("min_subbatch_size must be greater than zero")
+
+    ids = list(dict.fromkeys(str(arxiv_id) for arxiv_id in arxiv_ids))
+    params = dict(input_params or {})
+    params.setdefault("candidate_count", len(ids))
+    params.setdefault("candidate_ids_sha256", _ids_fingerprint(ids))
+    params["batch_size"] = batch_size
+    params["min_subbatch_size"] = min_subbatch_size
+
+    files = None
+    state = {
+        "input_params": params,
+        "id_batch_last_completed": 0,
+        "id_batch_last_processed_id": None,
+        "total_found": 0,
+        "total_not_found": 0,
+        "total_failed": 0,
+    }
+
+    if output_dir:
+        files = init_checkpoint_files(output_dir, current_params=params)
+        state, params_changed = load_checkpoint_state(
+            files["state"],
+            current_params=params,
+        )
+        if params_changed:
+            raise ValueError(
+                "Discovery input does not match its checkpoint. "
+                "Use a new output directory for a different input."
+            )
+
+        state["input_params"] = params
+
+        persisted_papers = _read_jsonl_records(files["papers"])
+        persisted_failed = _read_jsonl_records(files["failed"])
+        persisted_not_found = _read_jsonl_records(files["not_found"])
+
+        paper_by_id = {
+            str(record["arxiv_id"]): record
+            for record in persisted_papers
+            if record.get("arxiv_id")
+        }
+        failed_ids = [
+            str(record["arxiv_id"])
+            for record in persisted_failed
+            if record.get("arxiv_id")
+            and str(record["arxiv_id"]) not in paper_by_id
+        ]
+        not_found_ids = [
+            str(record["arxiv_id"])
+            for record in persisted_not_found
+            if record.get("arxiv_id")
+            and str(record["arxiv_id"]) not in paper_by_id
+        ]
+
+        if paper_by_id or failed_ids or not_found_ids:
+            yield {
+                "phase": "RESUME",
+                "batch_index": 0,
+                "requested_ids": [],
+                "found_papers": list(paper_by_id.values()),
+                "found_ids": list(paper_by_id),
+                "failed_ids": list(dict.fromkeys(failed_ids)),
+                "not_found_ids": list(dict.fromkeys(not_found_ids)),
+            }
+
+        retry_ids = set(failed_ids)
+    else:
+        retry_ids = set()
+
+    completed_batch = int(state.get("id_batch_last_completed", 0))
+    total_batches = (len(ids) + batch_size - 1) // batch_size
+    if retry_ids and total_batches and completed_batch >= total_batches:
+        completed_batch = total_batches - 1
+    batches = batch_ids(ids, batch_size=batch_size)
+
+    for batch_index, batch in enumerate(batches, start=1):
+        if batch_index <= completed_batch:
+            continue
+
+        requested_ids = list(batch)
+        if retry_ids:
+            requested_ids = list(dict.fromkeys(
+                [arxiv_id for arxiv_id in requested_ids if arxiv_id in retry_ids]
+                + [arxiv_id for arxiv_id in ids if arxiv_id in retry_ids]
+            ))
+            retry_ids.difference_update(requested_ids)
+
+        if not requested_ids:
+            continue
+
+        papers, failed_initial_ids = fetch_batch_with_subdivision(
+            requested_ids,
+            min_batch_size=min_subbatch_size,
+        )
+        paper_map = {get_base_id(paper): paper for paper in papers}
+        returned_ids = set(paper_map)
+        batch_not_found = [
+            arxiv_id
+            for arxiv_id in requested_ids
+            if arxiv_id not in returned_ids
+            and arxiv_id not in failed_initial_ids
+        ]
+        found_papers, batch_failed_ids = process_paper_batch_with_revisions(
+            paper_map,
+            failed_initial_ids=failed_initial_ids,
+            min_subbatch_size=min_subbatch_size,
+        )
+
+        batch_result = {
+            "phase": "ID_BATCH",
+            "batch_index": batch_index,
+            "requested_ids": requested_ids,
+            "found_papers": found_papers,
+            "found_ids": [paper["arxiv_id"] for paper in found_papers],
+            "not_found_ids": batch_not_found,
+            "failed_ids": list(dict.fromkeys(batch_failed_ids)),
+        }
+
+        if files is not None:
+            append_jsonl(files["papers"], found_papers)
+            append_jsonl(
+                files["failed"],
+                [{"arxiv_id": arxiv_id} for arxiv_id in batch_result["failed_ids"]],
+            )
+            append_jsonl(
+                files["not_found"],
+                [{"arxiv_id": arxiv_id} for arxiv_id in batch_not_found],
+            )
+            state.update({
+                "input_params": params,
+                "id_batch_last_completed": batch_index,
+                "id_batch_last_processed_id": batch[-1],
+                "total_found": state.get("total_found", 0) + len(found_papers),
+                "total_not_found": state.get("total_not_found", 0) + len(batch_not_found),
+                "total_failed": state.get("total_failed", 0) + len(batch_result["failed_ids"]),
+            })
+            update_state_atomic(files["state"], state)
+
+        yield batch_result
+
+
 def main():
     setup_logging()
     args = parse_input()
@@ -620,7 +868,7 @@ def main():
 
     logger.info("Starting arXiv discovery pipeline in [%s] mode with output directory: %s", args.mode, args.output_dir)
 
-    batch_stream = discover_ids_stream(
+    batch_stream = discover_two_month_range_stream(
         args_params=current_input_params,
         batch_size=args.batch_size,
         min_subbatch_size=MIN_SUBBATCH_SIZE,

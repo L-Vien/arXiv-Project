@@ -8,9 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-import discovery
+from src.crawling import discovery
 
 
 def make_paper(short_id, title=None, published_date="2023-01-02", updated_date="2023-02-03"):
@@ -255,19 +253,15 @@ class TestDiscovery(unittest.TestCase):
         self.assertEqual(changed_state["total_found"], 7)
         self.assertTrue(params_changed)
 
-    def test_load_checkpoint_state_uses_defaults_for_corrupt_json(self):
+    def test_load_checkpoint_state_rejects_corrupt_json(self):
         params = make_params()
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "state.json"
             state_path.write_text("{invalid")
-            with patch.object(discovery, "logger"):
-                state, params_changed = discovery.load_checkpoint_state(
+            with self.assertRaises(discovery.DiscoveryCheckpointError):
+                discovery.load_checkpoint_state(
                     str(state_path), current_params=params
                 )
-
-        self.assertEqual(state["input_params"], params)
-        self.assertEqual(state["current_phase"], "ID_BATCH")
-        self.assertFalse(params_changed)
 
     def test_wipe_output_files_clears_jsonl_but_preserves_state(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -371,7 +365,7 @@ class TestDiscovery(unittest.TestCase):
                 return_value=([metadata], [ids[1]]),
             ),
         ):
-            batches = list(discovery.discover_ids_stream(make_params(), batch_size=3))
+            batches = list(discovery.discover_ids_stream(ids, batch_size=3))
 
         self.assertEqual(len(batches), 1)
         self.assertEqual(batches[0]["phase"], "ID_BATCH")
@@ -382,14 +376,21 @@ class TestDiscovery(unittest.TestCase):
         self.assertEqual(batches[0]["failed_ids"], [ids[1]])
 
     def test_discover_ids_stream_persists_batch_results_and_checkpoint(self):
-        params = make_params()
+        ids = ["2301.00001", "2301.00002", "2301.00003"]
+        params = {
+            "candidate_count": len(ids),
+            "candidate_ids_sha256": discovery._ids_fingerprint(ids),
+            "batch_size": 3,
+            "min_subbatch_size": discovery.MIN_SUBBATCH_SIZE,
+        }
         with tempfile.TemporaryDirectory() as temp_dir:
             with (
                 patch.object(discovery, "fetch_batch_with_subdivision", return_value=([], [])),
                 patch.object(discovery, "process_paper_batch_with_revisions", return_value=([], [])),
             ):
                 batches = list(discovery.discover_ids_stream(
-                    params, batch_size=3, output_dir=temp_dir
+                    ids, batch_size=3, output_dir=temp_dir,
+                    input_params=params,
                 ))
 
             state_path = Path(temp_dir) / "discovery_state.json"
@@ -406,7 +407,13 @@ class TestDiscovery(unittest.TestCase):
         self.assertEqual(not_found, [{"arxiv_id": "2301.00001"}, {"arxiv_id": "2301.00002"}, {"arxiv_id": "2301.00003"}])
 
     def test_discover_ids_stream_resumes_after_completed_batches(self):
-        params = make_params()
+        ids = ["2301.00001", "2301.00002", "2301.00003"]
+        params = {
+            "candidate_count": len(ids),
+            "candidate_ids_sha256": discovery._ids_fingerprint(ids),
+            "batch_size": 1,
+            "min_subbatch_size": discovery.MIN_SUBBATCH_SIZE,
+        }
         with tempfile.TemporaryDirectory() as temp_dir:
             files = discovery.init_checkpoint_files(temp_dir, current_params=params)
             state = json.loads(Path(files["state"]).read_text())
@@ -415,12 +422,74 @@ class TestDiscovery(unittest.TestCase):
 
             with patch.object(discovery, "fetch_batch_with_subdivision", return_value=([], [])) as fetch:
                 batches = list(discovery.discover_ids_stream(
-                    params, batch_size=1, output_dir=temp_dir
+                    ids, batch_size=1, output_dir=temp_dir,
+                    input_params=params,
                 ))
 
         self.assertEqual(len(batches), 1)
         self.assertEqual(batches[0]["requested_ids"], ["2301.00003"])
         fetch.assert_called_once()
+
+    def test_discover_ids_stream_rejects_missing_state_with_existing_jsonl(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            papers_path = Path(temp_dir) / "papers.jsonl"
+            papers_path.write_text(
+                json.dumps({"arxiv_id": "2301.00001"}) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(discovery.DiscoveryCheckpointError):
+                list(discovery.discover_ids_stream([], output_dir=temp_dir))
+
+            self.assertFalse((Path(temp_dir) / "discovery_state.json").exists())
+
+    def test_discover_ids_stream_rejects_corrupt_state_with_existing_jsonl(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "papers.jsonl").write_text(
+                json.dumps({"arxiv_id": "2301.00001"}) + "\n",
+                encoding="utf-8",
+            )
+            (root / "discovery_state.json").write_text(
+                "{invalid",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(discovery.DiscoveryCheckpointError):
+                list(discovery.discover_ids_stream([], output_dir=temp_dir))
+
+    def test_discover_ids_stream_rejects_changed_input_without_appending(self):
+        ids = ["2301.00001", "2301.00002"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                discovery,
+                "fetch_batch_with_subdivision",
+                return_value=([], []),
+            ):
+                list(
+                    discovery.discover_ids_stream(
+                        ids,
+                        batch_size=2,
+                        output_dir=temp_dir,
+                    )
+                )
+
+            papers_path = Path(temp_dir) / "papers.jsonl"
+            before = papers_path.read_text(encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                list(
+                    discovery.discover_ids_stream(
+                        [*ids, "2301.00003"],
+                        batch_size=2,
+                        output_dir=temp_dir,
+                    )
+                )
+
+            self.assertEqual(
+                papers_path.read_text(encoding="utf-8"),
+                before,
+            )
 
     def test_discover_two_month_stream_transitions_to_second_month(self):
         params = make_params(
@@ -438,7 +507,7 @@ class TestDiscovery(unittest.TestCase):
                 patch.object(discovery, "fetch_batch_with_subdivision", return_value=([], [])),
                 patch.object(discovery, "process_paper_batch_with_revisions", return_value=([], [])),
             ):
-                batches = list(discovery.discover_ids_stream(
+                batches = list(discovery.discover_two_month_range_stream(
                     params, batch_size=10, output_dir=temp_dir
                 ))
 
@@ -471,7 +540,7 @@ class TestDiscovery(unittest.TestCase):
         with (
             patch.object(discovery, "setup_logging") as setup_logging,
             patch.object(discovery, "parse_input", return_value=args),
-            patch.object(discovery, "discover_ids_stream", return_value=iter([{}])) as discover,
+            patch.object(discovery, "discover_two_month_range_stream", return_value=iter([{}])) as discover,
             patch.object(discovery.time, "perf_counter", side_effect=[1.0, 2.0]),
             patch.object(discovery, "logger"),
         ):
