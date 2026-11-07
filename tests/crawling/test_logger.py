@@ -1,8 +1,8 @@
 import logging
 import unittest
 
-from src.logger import get_logger, setup_logging
-from src.config import settings
+from src.crawling.logger import get_logger, setup_logging
+from src.crawling.config import settings
 
 
 class TestLogger(unittest.TestCase):
@@ -21,7 +21,7 @@ class TestLogger(unittest.TestCase):
         )
 
     def test_logger_names_use_project_namespace(self):
-        logger = get_logger("src.downloader")
+        logger = get_logger("src.crawling.downloader")
 
         self.assertEqual(
             logger.name,

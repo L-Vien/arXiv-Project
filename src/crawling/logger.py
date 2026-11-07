@@ -1,7 +1,7 @@
 import logging
 from logging.handlers import RotatingFileHandler
 
-from src.config import settings
+from src.crawling.config import settings
 
 # 1. CẤU HÌNH ĐỊNH DẠNG LOG
 # =========================================================
@@ -24,9 +24,9 @@ def setup_logging() -> None:
 
     Log được ghi ra:
     - Console
-    - File outputs/logs/arxiv.log
+    - File <settings.log_dir>/arxiv.log
 
-    Cấu hình được đọc từ src/config.py.
+    Cấu hình được đọc từ src/crawling/config.py.
     """
 
     # 2.1. Tạo thư mục log nếu chưa tồn tại.
@@ -96,9 +96,11 @@ def get_logger(name: str) -> logging.Logger:
         logger = get_logger(__name__)
     """
 
-    # Loại bỏ tiền tố src. để tên log ngắn gọn hơn.
-    if name.startswith("src."):
-        name = name[len("src."):]
+    # Loại bỏ tiền tố package để tên log không phụ thuộc cấu trúc thư mục.
+    for prefix in ("src.crawling.", "src."):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
 
     logger_name = (
         f"{APP_LOGGER_NAME}.{name}"
