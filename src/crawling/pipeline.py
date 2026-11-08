@@ -4374,7 +4374,7 @@ def run_pipeline(
     reference_batch_size: int | None = None,
     min_free_bytes: int = 1024**3,
     source_batch_size: int = 50,
-    download_workers: int = 4,
+    download_workers: int = 10,
     request_interval: float | None = None,
     source_prefetch_queue_size: int = 2,
     reference_queue_size: int = 2,
