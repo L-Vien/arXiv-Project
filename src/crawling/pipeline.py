@@ -128,10 +128,10 @@ class RetryPolicy:
     max_delay: float = 300.0
     jitter_ratio: float = 0.25
     circuit_breaker_threshold: int = 3
-    circuit_cooldown: float = 180.0
+    circuit_cooldown: float = 120.0
     pause_after_429: int = 6
-    rate_limit_cooldown: float = 20.0
-    rate_limit_window_seconds: float = 60.0
+    rate_limit_cooldown: float = 10.0
+    rate_limit_window_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if self.max_retries < 0:
