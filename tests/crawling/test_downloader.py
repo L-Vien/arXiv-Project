@@ -570,6 +570,33 @@ def test_rate_limiter_respects_cooldown():
     assert limiter.last_request_time == 131.0
 
 
+def test_rate_limiter_adapts_after_rate_limit_and_recovers_after_successes():
+    limiter = RateLimiter(
+        min_interval=2.0,
+        success_window=2,
+        recovery_factor=0.5,
+    )
+
+    limiter.cooldown(10)
+    assert limiter.current_interval == 4.0
+
+    limiter.record_success()
+    limiter.record_success()
+    assert limiter.current_interval == 2.0
+
+
+def test_fast_integrity_validation_uses_marker_metadata(tmp_path):
+    versioned_id = "2607.28694v1"
+    source = tmp_path / f"{versioned_id}.source"
+    source.write_bytes(b"Source content")
+    write_integrity_marker(source)
+
+    assert verify_integrity(versioned_id, tmp_path, fast=True) is True
+
+    source.write_bytes(b"Changed content")
+    assert verify_integrity(versioned_id, tmp_path, fast=True) is False
+
+
 def test_retry_http_429_long_retry_after(tmp_path):
     versioned_id = "2607.28694v1"
     expected_path = tmp_path / f"{versioned_id}.source"

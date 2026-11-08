@@ -22,17 +22,38 @@ BASE_URL = "https://export.arxiv.org/src"
 PDF_BASE_URL = "https://export.arxiv.org/pdf"
 VERSIONED_ID_PATTERN = re.compile(r"\d{4}\.\d{4,5}v[1-9]\d*")
 
-class RateLimiter: 
-    def __init__(self, min_interval: float = 3.0):
+class RateLimiter:
+    def __init__(
+        self,
+        min_interval: float = 3.0,
+        *,
+        max_interval: float | None = None,
+        success_window: int = 8,
+        recovery_factor: float = 0.9,
+    ):
         if min_interval < 0: 
             raise ValueError("min_interval must be non-negative")
+        if max_interval is not None and max_interval < min_interval:
+            raise ValueError("max_interval must not be smaller than min_interval")
+        if success_window < 1:
+            raise ValueError("success_window must be positive")
+        if not 0 < recovery_factor <= 1:
+            raise ValueError("recovery_factor must be in the range (0, 1]")
 
         self.min_interval = min_interval
+        self.max_interval = max(
+            min_interval,
+            max_interval if max_interval is not None else max(60.0, min_interval * 16),
+        )
+        self.current_interval = min_interval
+        self.success_window = success_window
+        self.recovery_factor = recovery_factor
+        self._success_streak = 0
         self.last_request_time = None
         self.cooldown_until = 0.0
         self._lock = threading.Lock()
 
-    def wait(self) -> None: 
+    def wait(self) -> float:
         with self._lock:
             now = time.monotonic()
             next_allowed = self.cooldown_until
@@ -40,7 +61,7 @@ class RateLimiter:
             if self.last_request_time is not None:
                 next_allowed = max(
                     next_allowed,
-                    self.last_request_time + self.min_interval
+                    self.last_request_time + self.current_interval
                 )
 
             remaining = next_allowed - now
@@ -49,6 +70,7 @@ class RateLimiter:
                 time.sleep(remaining)
 
             self.last_request_time = time.monotonic()
+            return max(0.0, self.last_request_time - now)
 
     def cooldown(self, seconds: float) -> None:
         with self._lock:
@@ -56,6 +78,23 @@ class RateLimiter:
                 self.cooldown_until,
                 time.monotonic() + max(0.0, seconds)
             )
+            self.current_interval = min(
+                self.max_interval,
+                max(self.min_interval, self.current_interval * 2),
+            )
+            self._success_streak = 0
+
+    def record_success(self) -> None:
+        """Recover the pacing floor slowly after a stable success streak."""
+        with self._lock:
+            self._success_streak += 1
+            if self._success_streak < self.success_window:
+                return
+            self.current_interval = max(
+                self.min_interval,
+                self.current_interval * self.recovery_factor,
+            )
+            self._success_streak = 0
 
 DEFAULT_RATE_LIMITER = RateLimiter(min_interval=settings.arxiv_api_delay)
 
@@ -123,6 +162,7 @@ def write_integrity_marker(source_path: str | Path) -> None:
     metadata = {
         "status": "downloaded",
         "size_bytes": source_path.stat().st_size,
+        "mtime_ns": source_path.stat().st_mtime_ns,
         "sha256": calculate_sha256(source_path),
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -138,7 +178,12 @@ def write_integrity_marker(source_path: str | Path) -> None:
     finally:
         temp_marker.unlink(missing_ok=True)
 
-def _verify_file_integrity(path: Path, marker: Path) -> bool | None:
+def _verify_file_integrity(
+    path: Path,
+    marker: Path,
+    *,
+    fast: bool = False,
+) -> bool | None:
     """
     True: checksum matches.
     False: file or marker is invalid, or checksum mismatches.
@@ -181,6 +226,14 @@ def _verify_file_integrity(path: Path, marker: Path) -> bool | None:
         ):
             return False
 
+        if fast:
+            expected_mtime = metadata.get("mtime_ns")
+            if (
+                type(expected_mtime) is int
+                and expected_mtime == path.stat().st_mtime_ns
+            ):
+                return True
+
         return calculate_sha256(path) == expected_sha256
 
     except (OSError, UnicodeError, ValueError, TypeError):
@@ -190,24 +243,30 @@ def _verify_file_integrity(path: Path, marker: Path) -> bool | None:
 def verify_integrity(
     versioned_id: str,
     output_dir: str | Path,
+    *,
+    fast: bool = False,
 ) -> bool | None:
     validate_versioned_id(versioned_id)
     output_dir = Path(output_dir)
     return _verify_file_integrity(
         output_dir / f"{versioned_id}.source",
         output_dir / f"{versioned_id}.source.ok",
+        fast=fast,
     )
 
 
 def verify_pdf_integrity(
     versioned_id: str,
     output_dir: str | Path,
+    *,
+    fast: bool = False,
 ) -> bool | None:
     validate_versioned_id(versioned_id)
     output_dir = Path(output_dir)
     return _verify_file_integrity(
         output_dir / f"{versioned_id}.pdf",
         output_dir / f"{versioned_id}.pdf.ok",
+        fast=fast,
     )
 
 
@@ -258,6 +317,7 @@ def _download_file(
         validator(temp_path, versioned_id)
         temp_path.replace(output_path)
         write_integrity_marker(output_path)
+        limiter.record_success()
         return output_path
     except HTTPError as exc:
         logger.warning("HTTP error | version=%s | code=%s", versioned_id, exc.code)
@@ -276,7 +336,7 @@ def download_version(versioned_id: str, output_dir: str | Path, limiter: RateLim
             limiter = DEFAULT_RATE_LIMITER
     output_dir = Path(output_dir)
     output_path = output_dir / f"{versioned_id}.source"
-    if is_download_complete(versioned_id, output_dir):
+    if is_download_complete(versioned_id, output_dir, fast=True):
         return output_path
     return _download_file(
         versioned_id,
@@ -304,7 +364,7 @@ def download_pdf(
         limiter = DEFAULT_RATE_LIMITER
     output_dir = Path(output_dir)
     output_path = output_dir / f"{versioned_id}.pdf"
-    if verify_pdf_integrity(versioned_id, output_dir) is True:
+    if verify_pdf_integrity(versioned_id, output_dir, fast=True) is True:
         return output_path
     return _download_file(
         versioned_id,
@@ -512,8 +572,10 @@ def download_with_retry(versioned_id: str, output_dir: str | Path, max_attempts:
 def is_download_complete(
     versioned_id: str,
     output_dir: str | Path,
+    *,
+    fast: bool = False,
 ) -> bool:
-    return verify_integrity(versioned_id, output_dir) is True
+    return verify_integrity(versioned_id, output_dir, fast=fast) is True
 
 def download_with_status(versioned_id: str, output_dir: str | Path) -> dict[str, str | None]:
     try: 

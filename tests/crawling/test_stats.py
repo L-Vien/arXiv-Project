@@ -6,6 +6,7 @@ Run:
 
 from __future__ import annotations
 
+import io
 import tempfile
 import time
 import unittest
@@ -316,6 +317,26 @@ class SummaryAccumulatorTests(unittest.TestCase):
             summary["average_paper_seconds"],
             4.0,
         )
+        self.assertEqual(
+            summary["duration_stats"]["source_id"]["count"],
+            2,
+        )
+        self.assertEqual(
+            summary["duration_stats"]["source_id"]["total_seconds"],
+            8.0,
+        )
+        self.assertEqual(
+            summary["duration_stats"]["source_id"]["max_seconds"],
+            5.0,
+        )
+        self.assertEqual(
+            summary["duration_stats"]["version_download"]["total_seconds"],
+            1.0,
+        )
+        self.assertEqual(
+            summary["duration_stats"]["version_processing"]["average_seconds"],
+            1.25,
+        )
 
         self.assertEqual(
             summary["candidate_id_count"],
@@ -528,6 +549,18 @@ class RunBenchmarkTests(unittest.TestCase):
             0.4,
         )
         self.assertEqual(
+            result["versions_per_hour"],
+            1440.0,
+        )
+        self.assertEqual(
+            result["discovery_wall_seconds"],
+            0.0,
+        )
+        self.assertEqual(
+            result["source_stage_wall_seconds"],
+            4.0,
+        )
+        self.assertEqual(
             result[
                 "end_to_end_average_seconds_per_required_paper"
             ],
@@ -694,6 +727,63 @@ class RunBenchmarkTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             stats.RunBenchmark(sample_interval=-1)
+
+
+class ProgressMonitorTests(unittest.TestCase):
+    def test_render_includes_stage_progress_and_worker_state(self):
+        output = io.StringIO()
+        monitor = stats.ProgressMonitor(
+            lambda: {
+                "elapsed_seconds": 12.5,
+                "discovery": {
+                    "status": "completed",
+                    "batch": 3,
+                    "found": 4,
+                    "total": 5,
+                    "http_429": 1,
+                },
+                "source": {
+                    "completed_papers": 2,
+                    "total_papers": 4,
+                    "versions_completed": 3,
+                    "total_versions": 7,
+                    "papers_success": 2,
+                    "papers_partial": 0,
+                    "papers_failed": 0,
+                    "http_429": 1,
+                    "worker_order": ["source-worker-0"],
+                    "worker_progress": {
+                        "source-worker-0": {
+                            "paper": "2401.12345",
+                            "versioned_id": "2401.12345v1",
+                            "current": 1,
+                            "total": 2,
+                            "status": "downloading",
+                            "message": "starting version download",
+                        }
+                    },
+                },
+                "reference": {
+                    "completed_papers": 1,
+                    "total_papers": 4,
+                    "references": 9,
+                    "queue_size": 1,
+                    "queue_maxsize": 2,
+                    "http_429": 0,
+                },
+            },
+            interval=1.0,
+            output=output,
+        )
+
+        monitor.render()
+        rendered = output.getvalue()
+
+        self.assertIn("Pipeline Snapshot", rendered)
+        self.assertIn("Discovery: completed", rendered)
+        self.assertIn("Source: 2/4 papers", rendered)
+        self.assertIn("Reference: 1/4 papers", rendered)
+        self.assertIn("2401.12345v1", rendered)
 
 
 if __name__ == "__main__":

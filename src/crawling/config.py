@@ -40,8 +40,12 @@ class Settings:
     request_timeout: float = 60.0
     max_retries: int = 3
 
-    # API pacing: khoảng chờ giữa các request
-    arxiv_api_delay: float = 3.0
+    # Source downloads run concurrently and are only throttled after arXiv
+    # returns HTTP 429. Override this with ARXIV_SOURCE_REQUEST_INTERVAL
+    # when a slower, proactive pacing policy is required.
+    arxiv_api_delay: float = float(
+        os.getenv("ARXIV_SOURCE_REQUEST_INTERVAL", "0")
+    )
     arxiv_rate_limit_cooldown: float = 20.0
     semantic_scholar_delay: float = 1.0
 
