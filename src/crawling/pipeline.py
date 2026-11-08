@@ -209,7 +209,7 @@ class PipelineConfig:
     discovery_batch_size: int = 100
     discovery_fallback_batch_size: int = 25
     source_batch_size: int = 50
-    download_workers: int = 10
+    download_workers: int = 1
     source_request_interval: float | None = None
     reference_workers: int | None = None
     reference_batch_size: int | None = None
@@ -4374,7 +4374,7 @@ def run_pipeline(
     reference_batch_size: int | None = None,
     min_free_bytes: int = 1024**3,
     source_batch_size: int = 50,
-    download_workers: int = 10,
+    download_workers: int = 4,
     request_interval: float | None = None,
     source_prefetch_queue_size: int = 2,
     reference_queue_size: int = 2,
