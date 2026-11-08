@@ -18,6 +18,14 @@ from urllib.error import HTTPError
 from src.crawling import pipeline
 
 
+class SourceDownloadDefaultsTests(unittest.TestCase):
+    def test_cli_defaults_to_attached_parallel_download_strategy(self) -> None:
+        args = pipeline.build_parser().parse_args(["--ids-file", "ids.txt"])
+
+        self.assertEqual(args.download_workers, 4)
+        self.assertIsNone(args.request_interval)
+
+
 class InputTests(unittest.TestCase):
     def test_ranges_csv_skips_header_and_reads_multiple_ranges(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1352,6 +1360,16 @@ class RuntimeAndRecoveryTests(unittest.TestCase):
             "peak_rss_mb",
             "average_rss_mb",
             "pdf_fallback_success_count",
+            "source_versions_per_hour",
+            "source_version_success_rate",
+            "downloader_limiter_wait_seconds",
+            "downloader_cache_hit_rate",
+            "discovery_wall_seconds",
+            "source_stage_wall_seconds",
+            "reference_crawler_work_seconds",
+            "source_id_duration_stats",
+            "version_download_duration_stats",
+            "version_processing_duration_stats",
         ):
             self.assertIn(name, summary)
         self.assertEqual(summary["total_versions"], 4)
@@ -1552,6 +1570,8 @@ class SourceAdapterTests(unittest.TestCase):
                 result = adapter.process(self._metadata())
 
         self.assertEqual(result["source"]["status"], "success")
+        self.assertIn("source_seconds", result["timings"])
+        self.assertIn("total_seconds", result["timings"])
         self.assertEqual(
             [event["event"] for event in events],
             ["paper_started", "version_started", "version_processed"],
@@ -1606,6 +1626,104 @@ class SourceAdapterTests(unittest.TestCase):
         self.assertIn(("downloader_http_429_count", 1), metrics)
         self.assertIn(("downloader_retry_count", 1), metrics)
         self.assertIn(("downloader_rate_limit_sleep_seconds", 20), metrics)
+
+    def test_source_rate_limit_window_survives_success_between_429s(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "cache"
+            cache.mkdir()
+            first_archive = cache / "2609.00001v1.source"
+            second_archive = cache / "2609.00002v1.source"
+            rate_limit = HTTPError(
+                "https://export.arxiv.org/src/2609.00001v1",
+                429,
+                "Too Many Requests",
+                {},
+                None,
+            )
+            sleeps: list[float] = []
+            adapter = pipeline.DefaultSourceProcessor(
+                root / "corpus",
+                cache,
+                pipeline.PipelineConfig(
+                    **{
+                        **self._config(root).__dict__,
+                        "retry_policy": pipeline.RetryPolicy(
+                            max_retries=1,
+                            base_delay=1,
+                            max_delay=10,
+                            jitter_ratio=0,
+                            circuit_breaker_threshold=2,
+                            circuit_cooldown=30,
+                            rate_limit_cooldown=5,
+                        ),
+                    }
+                ),
+                sleep=sleeps.append,
+            )
+            with (
+                patch(
+                    "src.crawling.downloader.is_download_complete",
+                    side_effect=[False, True, False, True],
+                ),
+                patch(
+                    "src.crawling.downloader.download_version",
+                    side_effect=[rate_limit, first_archive, rate_limit, second_archive],
+                ),
+            ):
+                first_result, _ = adapter._download("2609.00001v1")
+                second_result, _ = adapter._download("2609.00002v1")
+
+        self.assertEqual(first_result["status"], "success")
+        self.assertEqual(second_result["status"], "success")
+        self.assertEqual(sleeps, [5, 30])
+
+    def test_source_rate_limit_cooldown_adds_post_cooldown_jitter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "cache"
+            cache.mkdir()
+            archive = cache / "2609.00001v1.source"
+            error = HTTPError(
+                "https://export.arxiv.org/src/2609.00001v1",
+                429,
+                "Too Many Requests",
+                {},
+                None,
+            )
+            sleeps: list[float] = []
+            adapter = pipeline.DefaultSourceProcessor(
+                root / "corpus",
+                cache,
+                pipeline.PipelineConfig(
+                    **{
+                        **self._config(root).__dict__,
+                        "retry_policy": pipeline.RetryPolicy(
+                            max_retries=1,
+                            base_delay=1,
+                            max_delay=10,
+                            jitter_ratio=0.5,
+                            rate_limit_cooldown=10,
+                        ),
+                    }
+                ),
+                sleep=sleeps.append,
+                random_value=lambda: 0.5,
+            )
+            with (
+                patch(
+                    "src.crawling.downloader.is_download_complete",
+                    side_effect=[False, True],
+                ),
+                patch(
+                    "src.crawling.downloader.download_version",
+                    side_effect=[error, archive],
+                ),
+            ):
+                result, _ = adapter._download("2609.00001v1")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(sleeps, [12.5])
 
     def test_default_source_adapter_keeps_no_tex_distinct_from_network_failure(
         self,
@@ -1673,6 +1791,60 @@ class SourceAdapterTests(unittest.TestCase):
         self.assertEqual(version["processing"]["source_type"], "pdf")
         self.assertTrue(pdf_exists)
         self.assertIn(("pdf_fallback_success_count", 1), metrics)
+
+    def test_pdf_fallback_429_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "cache"
+            cache.mkdir()
+            pdf = cache / "pdf-fallback" / "2609.00001v1.pdf"
+            pdf.parent.mkdir()
+            source_error = HTTPError(
+                "https://export.arxiv.org/src/2609.00001v1",
+                404,
+                "Not Found",
+                {},
+                None,
+            )
+            pdf_rate_limit = HTTPError(
+                "https://export.arxiv.org/pdf/2609.00001v1",
+                429,
+                "Too Many Requests",
+                {"Retry-After": "7"},
+                None,
+            )
+            sleeps: list[float] = []
+            adapter = pipeline.DefaultSourceProcessor(
+                root / "corpus",
+                cache,
+                pipeline.PipelineConfig(
+                    **{
+                        **self._config(root).__dict__,
+                        "retry_policy": pipeline.RetryPolicy(
+                            max_retries=1,
+                            base_delay=1,
+                            max_delay=10,
+                            jitter_ratio=0,
+                            rate_limit_cooldown=5,
+                        ),
+                    }
+                ),
+                sleep=sleeps.append,
+            )
+            with (
+                patch("src.crawling.downloader.is_download_complete", return_value=False),
+                patch("src.crawling.downloader.download_version", side_effect=source_error),
+                patch(
+                    "src.crawling.downloader.download_pdf",
+                    side_effect=[pdf_rate_limit, pdf],
+                ) as fallback,
+            ):
+                result, path = adapter._download("2609.00001v1")
+
+        self.assertEqual(result["status"], "pdf_only")
+        self.assertEqual(path, pdf)
+        self.assertEqual(fallback.call_count, 2)
+        self.assertEqual(sleeps, [7.0])
 
 
 class ResumeAndDiscoveryTests(unittest.TestCase):

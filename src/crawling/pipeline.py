@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,6 +36,7 @@ from urllib.error import URLError
 
 from src.crawling import metadata, processor
 from src.crawling.logger import get_logger, setup_logging
+from src.crawling.stats import DurationStats, ProgressMonitor
 
 _NEW_ARXIV_ID = re.compile(r"^(\d{4}\.\d{4,5})(?:v\d+)?$", re.IGNORECASE)
 _OLD_ARXIV_ID = re.compile(
@@ -129,6 +131,7 @@ class RetryPolicy:
     circuit_cooldown: float = 180.0
     pause_after_429: int = 6
     rate_limit_cooldown: float = 20.0
+    rate_limit_window_seconds: float = 60.0
 
     def __post_init__(self) -> None:
         if self.max_retries < 0:
@@ -145,6 +148,8 @@ class RetryPolicy:
             raise ValueError("circuit_cooldown must be non-negative")
         if self.rate_limit_cooldown < 0:
             raise ValueError("rate_limit_cooldown must be non-negative")
+        if self.rate_limit_window_seconds <= 0:
+            raise ValueError("rate_limit_window_seconds must be positive")
 
 
 @dataclass(frozen=True)
@@ -191,6 +196,7 @@ class PrefetchedSource:
 
     metadata: Mapping[str, object]
     downloads: Mapping[str, tuple[Mapping[str, object], Path | None, float]]
+    started_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +210,7 @@ class PipelineConfig:
     discovery_fallback_batch_size: int = 25
     source_batch_size: int = 50
     download_workers: int = 1
+    source_request_interval: float | None = None
     reference_workers: int | None = None
     reference_batch_size: int | None = None
     reference_queue_size: int = 2
@@ -218,6 +225,8 @@ class PipelineConfig:
     retry_policy: RetryPolicy = RetryPolicy()
     benchmark_sample_interval: float = 1.0
     source_prefetch_queue_size: int = 2
+    progress_monitor: bool = True
+    progress_interval: float = 1.0
 
     def __post_init__(self) -> None:
         positive = {
@@ -235,6 +244,11 @@ class PipelineConfig:
                 raise ValueError(f"{name} must be greater than zero")
         if self.reference_workers is not None and self.reference_workers <= 0:
             raise ValueError("reference_workers must be greater than zero")
+        if (
+            self.source_request_interval is not None
+            and self.source_request_interval < 0
+        ):
+            raise ValueError("source_request_interval must be non-negative")
         if self.reference_batch_size is not None and self.reference_batch_size <= 0:
             raise ValueError("reference_batch_size must be greater than zero")
         if self.min_free_gb < 0:
@@ -243,6 +257,8 @@ class PipelineConfig:
             raise ValueError("max_runtime_hours must be greater than zero")
         if self.grace_period_seconds < 0:
             raise ValueError("grace_period_seconds must be non-negative")
+        if self.progress_interval <= 0:
+            raise ValueError("progress_interval must be greater than zero")
 
     @property
     def resolved_run_dir(self) -> Path:
@@ -1161,14 +1177,34 @@ class _LockedRateLimiter:
     def __init__(self, limiter: object) -> None:
         self._limiter = limiter
         self._lock = threading.Lock()
+        self._wait_seconds = 0.0
 
-    def wait(self) -> None:
+    def wait(self) -> float:
+        started = time.monotonic()
         with self._lock:
             self._limiter.wait()  # type: ignore[attr-defined]
+        elapsed = max(0.0, time.monotonic() - started)
+        with self._lock:
+            self._wait_seconds += elapsed
+        return elapsed
 
     def cooldown(self, seconds: float) -> None:
         with self._lock:
             self._limiter.cooldown(seconds)  # type: ignore[attr-defined]
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._limiter.record_success()  # type: ignore[attr-defined]
+
+    @property
+    def wait_seconds(self) -> float:
+        with self._lock:
+            return self._wait_seconds
+
+    @property
+    def current_interval(self) -> float:
+        with self._lock:
+            return float(getattr(self._limiter, "current_interval", 0.0))
 
 
 class DefaultSourceProcessor:
@@ -1198,11 +1234,33 @@ class DefaultSourceProcessor:
         self.random_value = random_value
         self.wall_time = wall_time
         self.progress_callback = progress_callback
+        request_interval = (
+            config.source_request_interval
+            if config.source_request_interval is not None
+            else settings.arxiv_api_delay
+        )
         self.limiter = _LockedRateLimiter(
-            downloader.RateLimiter(settings.arxiv_api_delay)
+            downloader.RateLimiter(request_interval)
         )
         self._circuit_lock = threading.Lock()
-        self._consecutive_429 = 0
+        self._rate_limit_events: deque[float] = deque()
+
+    @staticmethod
+    def _log_event(event: str, **fields: object) -> None:
+        """Write one compact, grep-friendly source lifecycle event."""
+        details = " ".join(
+            f"{key}={value}" for key, value in sorted(fields.items())
+        )
+        logger.info("event=%s%s", event, f" {details}" if details else "")
+
+    def _record_rate_limit(self, policy: RetryPolicy) -> int:
+        now = self.wall_time()
+        cutoff = now - policy.rate_limit_window_seconds
+        with self._circuit_lock:
+            while self._rate_limit_events and self._rate_limit_events[0] < cutoff:
+                self._rate_limit_events.popleft()
+            self._rate_limit_events.append(now)
+            return len(self._rate_limit_events)
 
     def _emit_progress(
         self,
@@ -1257,11 +1315,21 @@ class DefaultSourceProcessor:
         from src.crawling import downloader
 
         paper = dict(raw_metadata)
+        source_started = time.perf_counter()
+        self._log_event(
+            "source_id_start",
+            arxiv_id=paper.get("arxiv_id", ""),
+            mode="prefetch",
+        )
         try:
             versioned_ids = downloader.build_versioned_ids(paper)
         except (KeyError, TypeError, ValueError):
             # Let the consumer preserve the existing permanent_failed schema.
-            return PrefetchedSource(metadata=paper, downloads={})
+            return PrefetchedSource(
+                metadata=paper,
+                downloads={},
+                started_at=source_started,
+            )
         self._emit_progress(
             "paper_started",
             str(paper.get("arxiv_id", "")),
@@ -1308,22 +1376,35 @@ class DefaultSourceProcessor:
                 status=str(result.get("status", "failed")),
                 message="download completed" if archive_path is not None else "download failed",
             )
-        return PrefetchedSource(metadata=paper, downloads=downloads)
+        return PrefetchedSource(
+            metadata=paper,
+            downloads=downloads,
+            started_at=source_started,
+        )
 
     def process_prefetched(self, prefetched: PrefetchedSource) -> Mapping[str, object]:
         """Process a paper whose source downloads are already complete."""
-        return self._process(prefetched.metadata, prefetched.downloads)
+        return self._process(
+            prefetched.metadata,
+            prefetched.downloads,
+            started_at=prefetched.started_at,
+        )
 
     def _process(
         self,
         raw_metadata: Mapping[str, object],
         prefetched: Mapping[str, tuple[Mapping[str, object], Path | None, float]]
         | None,
+        *,
+        started_at: float | None = None,
     ) -> Mapping[str, object]:
         from src.crawling import downloader
 
         paper = dict(raw_metadata)
         arxiv_id = normalize_arxiv_id(paper.get("arxiv_id"))
+        source_started = started_at if started_at is not None else time.perf_counter()
+        if started_at is None:
+            self._log_event("source_id_start", arxiv_id=arxiv_id, mode="process")
         paper_root = metadata.paper_dir(self.corpus_dir, arxiv_id)
         metadata_started = time.perf_counter()
         try:
@@ -1343,6 +1424,16 @@ class DefaultSourceProcessor:
         try:
             versioned_ids = downloader.build_versioned_ids(paper)
         except (KeyError, TypeError, ValueError) as exc:
+            source_seconds = max(0.0, time.perf_counter() - source_started)
+            self._log_event(
+                "source_id_end",
+                arxiv_id=arxiv_id,
+                status="permanent_failed",
+                versions=0,
+                completed_versions=0,
+                failed_versions=0,
+                source_seconds=source_seconds,
+            )
             return {
                 "source": {
                     "status": "permanent_failed",
@@ -1352,7 +1443,11 @@ class DefaultSourceProcessor:
                 },
                 "processing": {"status": "not_started"},
                 "metadata": metadata_result,
-                "timings": {"metadata_seconds": metadata_seconds},
+                "timings": {
+                    "metadata_seconds": metadata_seconds,
+                    "source_seconds": source_seconds,
+                    "total_seconds": source_seconds,
+                },
             }
 
         self._emit_progress(
@@ -1366,6 +1461,11 @@ class DefaultSourceProcessor:
         for index, versioned_id in enumerate(versioned_ids, start=1):
             version = int(versioned_id.rsplit("v", 1)[1])
             output_dir = metadata.version_dir(self.corpus_dir, arxiv_id, version)
+            self._log_event(
+                "source_version_start",
+                arxiv_id=arxiv_id,
+                versioned_id=versioned_id,
+            )
             previous = self._complete_process_result(output_dir)
             if previous is not None:
                 self._emit_progress(
@@ -1385,6 +1485,15 @@ class DefaultSourceProcessor:
                         0.0,
                         0.0,
                     )
+                )
+                self._log_event(
+                    "source_version_end",
+                    arxiv_id=arxiv_id,
+                    versioned_id=versioned_id,
+                    status="skipped",
+                    download_seconds=0.0,
+                    processing_seconds=0.0,
+                    total_seconds=0.0,
                 )
                 continue
 
@@ -1424,6 +1533,15 @@ class DefaultSourceProcessor:
                         0.0,
                     )
                 )
+                self._log_event(
+                    "source_version_end",
+                    arxiv_id=arxiv_id,
+                    versioned_id=versioned_id,
+                    status=str(download_result.get("status", "failed")),
+                    download_seconds=download_seconds,
+                    processing_seconds=0.0,
+                    total_seconds=download_seconds,
+                )
                 continue
 
             processing_started = time.perf_counter()
@@ -1455,6 +1573,15 @@ class DefaultSourceProcessor:
                     download_seconds,
                     processing_seconds,
                 )
+            )
+            self._log_event(
+                "source_version_end",
+                arxiv_id=arxiv_id,
+                versioned_id=versioned_id,
+                status=str(processed.get("status", "unknown")),
+                download_seconds=download_seconds,
+                processing_seconds=processing_seconds,
+                total_seconds=download_seconds + processing_seconds,
             )
 
         process_statuses = [
@@ -1498,6 +1625,20 @@ class DefaultSourceProcessor:
         else:
             processing_status = "failed"
 
+        source_seconds = max(0.0, time.perf_counter() - source_started)
+        self._log_event(
+            "source_id_end",
+            arxiv_id=arxiv_id,
+            status=source_status,
+            versions=len(version_results),
+            completed_versions=sum(
+                status in usable for status in process_statuses
+            ),
+            failed_versions=sum(
+                status not in usable for status in process_statuses
+            ),
+            source_seconds=source_seconds,
+        )
         return {
             "source": {
                 "status": source_status,
@@ -1507,7 +1648,11 @@ class DefaultSourceProcessor:
             },
             "processing": {"status": processing_status},
             "metadata": metadata_result,
-            "timings": {"metadata_seconds": metadata_seconds},
+            "timings": {
+                "metadata_seconds": metadata_seconds,
+                "source_seconds": source_seconds,
+                "total_seconds": source_seconds,
+            },
         }
 
     def _version_dir(self, arxiv_id: str, version: int) -> Path:
@@ -1515,13 +1660,60 @@ class DefaultSourceProcessor:
 
         return metadata.version_dir(self.corpus_dir, arxiv_id, version)
 
+    def _retry_delay(
+        self,
+        attempt: int,
+        error: BaseException,
+        status_code: int | None,
+        rate_limit_count: int,
+    ) -> float:
+        policy = self.config.retry_policy
+        delay = _backoff_delay(attempt, policy, self.random_value)
+        retry_after = _retry_after(error, self.wall_time)
+        if retry_after is not None:
+            delay = max(delay, retry_after)
+        if status_code == 429:
+            if rate_limit_count >= policy.circuit_breaker_threshold:
+                delay = max(delay, policy.circuit_cooldown)
+            delay = max(delay, policy.rate_limit_cooldown)
+            # Add jitter after the shared cooldown has been selected.  Jitter
+            # inside the exponential backoff alone is ineffective once every
+            # worker is clamped to the same Retry-After/circuit duration.
+            delay += delay * policy.jitter_ratio * max(
+                0.0, self.random_value()
+            )
+        return delay
+
+    def _sleep_before_retry(
+        self,
+        delay: float,
+        status_code: int | None,
+    ) -> None:
+        if delay > 0 and status_code == 429:
+            self.limiter.cooldown(delay)
+        if delay > 0:
+            self.metric_callback("downloader_retry_sleep_seconds", delay)
+            if status_code == 429:
+                self.metric_callback(
+                    "downloader_rate_limit_sleep_seconds",
+                    delay,
+                )
+        self.metric_callback("downloader_retry_count", 1)
+        self.sleep(delay)
+
     def _download(self, versioned_id: str) -> tuple[dict[str, object], Path | None]:
         from src.crawling import downloader
 
-        if downloader.is_download_complete(versioned_id, self.cache_dir):
+        if downloader.is_download_complete(
+            versioned_id,
+            self.cache_dir,
+            fast=True,
+        ):
+            self.metric_callback("downloader_cache_hit_count", 1)
             path = self.cache_dir / f"{versioned_id}.source"
             return {"status": "skipped", "retryable": False, "attempts": 0}, path
 
+        self.metric_callback("downloader_cache_miss_count", 1)
         policy = self.config.retry_policy
         for attempt in range(1, policy.max_retries + 2):
             try:
@@ -1530,9 +1722,11 @@ class DefaultSourceProcessor:
                     self.cache_dir,
                     limiter=self.limiter,
                 )
-                with self._circuit_lock:
-                    self._consecutive_429 = 0
-                if not downloader.is_download_complete(versioned_id, self.cache_dir):
+                if not downloader.is_download_complete(
+                    versioned_id,
+                    self.cache_dir,
+                    fast=True,
+                ):
                     raise downloader.IncompleteDownloadError(
                         "integrity marker did not validate"
                     )
@@ -1548,18 +1742,27 @@ class DefaultSourceProcessor:
                 retryable, error_type, status_code = _classify_error(exc)
                 if status_code == 429:
                     self.metric_callback("downloader_http_429_count", 1)
-                    with self._circuit_lock:
-                        self._consecutive_429 += 1
-                        consecutive = self._consecutive_429
+                    rate_limit_count = self._record_rate_limit(policy)
+                    if rate_limit_count == policy.circuit_breaker_threshold:
+                        self.metric_callback(
+                            "downloader_rate_limit_circuit_breaker_count",
+                            1,
+                        )
                 else:
-                    with self._circuit_lock:
-                        self._consecutive_429 = 0
-                    consecutive = 0
-                if status_code == 429 and consecutive >= policy.pause_after_429:
+                    rate_limit_count = 0
+                if status_code == 429 and rate_limit_count >= policy.pause_after_429:
                     raise SourceRateLimitPaused(str(exc)) from exc
                 if status_code == 404:
                     return self._download_pdf_fallback(versioned_id, exc)
                 if not retryable or attempt > policy.max_retries:
+                    if status_code == 429:
+                        delay = self._retry_delay(
+                            attempt,
+                            exc,
+                            status_code,
+                            rate_limit_count,
+                        )
+                        self.limiter.cooldown(delay)
                     return {
                         "status": (
                             "retryable_failed" if retryable else "permanent_failed"
@@ -1569,26 +1772,13 @@ class DefaultSourceProcessor:
                         "attempts": attempt,
                         "error": str(exc),
                     }, None
-                delay = _backoff_delay(attempt, policy, self.random_value)
-                retry_after = _retry_after(exc, self.wall_time)
-                if retry_after is not None:
-                    delay = max(delay, retry_after)
-                if (
-                    status_code == 429
-                    and consecutive >= policy.circuit_breaker_threshold
-                ):
-                    delay = max(delay, policy.circuit_cooldown)
-                if status_code == 429:
-                    delay = max(delay, policy.rate_limit_cooldown)
-                if delay > 0:
-                    self.limiter.cooldown(delay)
-                    self.metric_callback("downloader_retry_sleep_seconds", delay)
-                    if status_code == 429:
-                        self.metric_callback(
-                            "downloader_rate_limit_sleep_seconds", delay
-                        )
-                self.metric_callback("downloader_retry_count", 1)
-                self.sleep(delay)
+                delay = self._retry_delay(
+                    attempt,
+                    exc,
+                    status_code,
+                    rate_limit_count,
+                )
+                self._sleep_before_retry(delay, status_code)
         raise AssertionError("unreachable downloader retry state")
 
     def _download_pdf_fallback(
@@ -1598,35 +1788,76 @@ class DefaultSourceProcessor:
     ) -> tuple[dict[str, object], Path | None]:
         from src.crawling import downloader
 
-        try:
-            path = downloader.download_pdf(
-                versioned_id,
-                self.pdf_fallback_dir,
-                limiter=self.limiter,
-            )
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as pdf_error:  # noqa: BLE001 - preserve both failures.
-            return {
-                "status": "permanent_failed",
-                "retryable": False,
-                "attempts": 1,
-                "error_type": "pdf_fallback_failed",
-                "error": str(source_error),
-                "pdf_fallback_error": str(pdf_error),
-            }, None
+        policy = self.config.retry_policy
+        last_error: BaseException | None = None
+        last_error_type = "pdf_fallback_failed"
+        last_retryable = False
+        last_status_code: int | None = None
+        last_rate_limit_count = 0
+        last_attempt = 0
+        for attempt in range(1, policy.max_retries + 2):
+            last_attempt = attempt
+            try:
+                path = downloader.download_pdf(
+                    versioned_id,
+                    self.pdf_fallback_dir,
+                    limiter=self.limiter,
+                )
+                self.metric_callback("pdf_fallback_success_count", 1)
+                return {
+                    "status": "pdf_only",
+                    "retryable": False,
+                    "attempts": attempt,
+                    "path": str(path),
+                    "pdf_path": str(path),
+                    "pdf_fallback": True,
+                    "source_error_type": "http_404",
+                    "source_error": str(source_error),
+                }, path
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as pdf_error:
+                last_error = pdf_error
+                last_retryable, last_error_type, last_status_code = _classify_error(
+                    pdf_error
+                )
+                if last_status_code == 429:
+                    self.metric_callback("downloader_http_429_count", 1)
+                    last_rate_limit_count = self._record_rate_limit(policy)
+                    if last_rate_limit_count == policy.circuit_breaker_threshold:
+                        self.metric_callback(
+                            "downloader_rate_limit_circuit_breaker_count",
+                            1,
+                        )
+                    if last_rate_limit_count >= policy.pause_after_429:
+                        raise SourceRateLimitPaused(str(pdf_error)) from pdf_error
+                if not last_retryable or attempt > policy.max_retries:
+                    if last_status_code == 429:
+                        delay = self._retry_delay(
+                            attempt,
+                            pdf_error,
+                            last_status_code,
+                            last_rate_limit_count,
+                        )
+                        self.limiter.cooldown(delay)
+                    break
+                delay = self._retry_delay(
+                    attempt,
+                    pdf_error,
+                    last_status_code,
+                    last_rate_limit_count,
+                )
+                self._sleep_before_retry(delay, last_status_code)
 
-        self.metric_callback("pdf_fallback_success_count", 1)
+        assert last_error is not None
         return {
-            "status": "pdf_only",
-            "retryable": False,
-            "attempts": 1,
-            "path": str(path),
-            "pdf_path": str(path),
-            "pdf_fallback": True,
-            "source_error_type": "http_404",
-            "source_error": str(source_error),
-        }, path
+            "status": "retryable_failed" if last_retryable else "permanent_failed",
+            "retryable": last_retryable,
+            "attempts": last_attempt,
+            "error_type": last_error_type,
+            "error": str(source_error),
+            "pdf_fallback_error": str(last_error),
+        }, None
 
     @staticmethod
     def _version_record(
@@ -1725,15 +1956,39 @@ class Pipeline:
         self._summary_lock = threading.RLock()
         self._metric_lock = threading.Lock()
         self._source_progress_lock = threading.Lock()
+        self._discovery_progress_lock = threading.Lock()
+        self._reference_progress_lock = threading.Lock()
+        self._discovery_progress: dict[str, object] = {
+            "found": 0,
+            "batch": 0,
+            "status": "pending",
+        }
         self._source_progress: dict[str, object] = {
+            "total_papers": 0,
+            "total_versions": 0,
             "completed_papers": 0,
             "papers_success": 0,
             "papers_partial": 0,
             "papers_failed": 0,
             "versions_completed": 0,
+            "versions_failed": 0,
             "worker_order": [],
             "worker_progress": {},
         }
+        self._reference_progress: dict[str, object] = {
+            "total_papers": 0,
+            "completed_papers": 0,
+            "references": 0,
+            "batches_completed": 0,
+            "current_batch": 0,
+            "current_batch_total": 0,
+            "queue_size": 0,
+            "queue_maxsize": config.reference_queue_size,
+        }
+        self._source_id_duration_stats = DurationStats()
+        self._version_download_duration_stats = DurationStats()
+        self._version_processing_duration_stats = DurationStats()
+        self.progress_monitor: ProgressMonitor | None = None
         self._pending_metrics: dict[str, float | int] = {}
         self._session_initial_rss_bytes: int | None = None
         self._session_initial_disk_used_bytes: int | None = None
@@ -1778,11 +2033,17 @@ class Pipeline:
             self._check_resources()
             if not bool(self.state.snapshot().get("discovery_complete")):
                 logger.info("Phase 1 Discovery started")
+                logger.info("event=discovery_start total_ids=%d", self.loaded_input.unique_count)
                 discovery_started = self.monotonic()
                 try:
                     discovery_complete = self._run_discovery()
                 finally:
                     self._record_stage_timing("discovery", discovery_started)
+                    logger.info(
+                        "event=discovery_end elapsed_seconds=%.4f complete=%s",
+                        max(0.0, self.monotonic() - discovery_started),
+                        discovery_complete if "discovery_complete" in locals() else False,
+                    )
                 if not discovery_complete:
                     logger.warning(
                         "Discovery paused before barrier completion: status=%s",
@@ -1947,6 +2208,9 @@ class Pipeline:
             "downloader_retry_count": 0,
             "downloader_retry_sleep_seconds": 0.0,
             "downloader_rate_limit_sleep_seconds": 0.0,
+            "downloader_rate_limit_circuit_breaker_count": 0,
+            "downloader_cache_hit_count": 0,
+            "downloader_cache_miss_count": 0,
             "pdf_fallback_success_count": 0,
             "reference_http_429_count": 0,
         }
@@ -1972,6 +2236,12 @@ class Pipeline:
             sample_interval=self.config.benchmark_sample_interval,
         )
         self.benchmark.start_sampling()
+        if self.config.progress_monitor:
+            self.progress_monitor = ProgressMonitor(
+                self._progress_snapshot,
+                interval=self.config.progress_interval,
+            )
+            self.progress_monitor.start()
 
     def _capture_session_baseline(self) -> None:
         try:
@@ -2073,7 +2343,7 @@ class Pipeline:
                     consecutive_429=0,
                     cooldown_until_epoch=cooldown_until,
                 )
-            except Exception as exc:  # noqa: BLE001 - classify and retry one page.
+            except Exception as exc:
                 api_seconds += max(0.0, self.monotonic() - started)
                 last_error = exc
                 status_code = _http_status(exc)
@@ -2143,6 +2413,7 @@ class Pipeline:
         state = self.state.snapshot()
         latest = _latest_discovery_statuses(self.discovery_path)
         found_count = sum(status == "found" for status in latest.values())
+        self._set_discovery_progress(found=found_count, status="running")
         found_limit = self.loaded_input.found_limit
         retry_state = state.get("discovery_retry")
         retry_ids = (
@@ -2157,6 +2428,7 @@ class Pipeline:
                 retry_outcome.records, found_count, found_limit
             )
             self.discovery_journal.append(retry_records)
+            self._set_discovery_progress(found=found_count, status="running")
             self._record_discovery_metrics(retry_outcome)
             unresolved = [
                 str(record["arxiv_id"])
@@ -2292,6 +2564,7 @@ class Pipeline:
                 for record in records:
                     latest[str(record["arxiv_id"])] = str(record["status"])
                 found_count += len(found_papers)
+                self._set_discovery_progress(found=found_count, status="running")
                 offset = int(page["offset"])
                 status_counts: dict[str, int] = {}
                 for record in records:
@@ -2397,6 +2670,7 @@ class Pipeline:
                         outcome.records, found_count, found_limit
                     )
                     self.discovery_journal.append(selected)
+                    self._set_discovery_progress(found=found_count, status="running")
                     self.state.update(
                         range_discovery_id_month=f"{year:04d}-{month:02d}",
                         range_discovery_id_batch=batch_index,
@@ -2472,6 +2746,7 @@ class Pipeline:
         latest = _latest_discovery_statuses(self.discovery_path)
         found_limit = self.loaded_input.found_limit
         found_count = sum(status == "found" for status in latest.values())
+        self._set_discovery_progress(found=found_count, status="running")
         if found_limit is not None and found_count >= found_limit:
             self.state.update(
                 phase="downstream",
@@ -2502,6 +2777,7 @@ class Pipeline:
                 outcome.records, found_count, found_limit
             )
             self.discovery_journal.append(records)
+            self._set_discovery_progress(found=found_count, batch=next_batch, status="running")
             for record in records:
                 latest[str(record["arxiv_id"])] = str(record["status"])
             self._record_discovery_metrics(outcome)
@@ -2546,6 +2822,7 @@ class Pipeline:
                 last_discovery_batch=next_batch,
                 discovery_retry={"pending_ids": []},
             )
+            self._set_discovery_progress(found=found_count, batch=next_batch, status="running")
             status_counts: dict[str, int] = {}
             for record in records:
                 status = str(record.get("status"))
@@ -2572,6 +2849,7 @@ class Pipeline:
         reached_limit = found_limit is not None and found_count >= found_limit
         completed = completed and (all_terminal or reached_limit)
         if completed:
+            self._set_discovery_progress(found=found_count, status="completed")
             self.state.update(
                 phase="downstream",
                 status="running",
@@ -2668,6 +2946,20 @@ class Pipeline:
 
         self.state.mutate(update)
 
+    def _set_discovery_progress(
+        self,
+        *,
+        found: int,
+        batch: int | None = None,
+        status: str | None = None,
+    ) -> None:
+        with self._discovery_progress_lock:
+            self._discovery_progress["found"] = max(0, int(found))
+            if batch is not None:
+                self._discovery_progress["batch"] = max(0, int(batch))
+            if status is not None:
+                self._discovery_progress["status"] = status
+
     def _add_timing(self, name: str, elapsed: float) -> None:
         assert self.state is not None
 
@@ -2701,6 +2993,17 @@ class Pipeline:
         phase_started = self.monotonic()
         source_timing_recorded = False
         manifest = _manifest_index(self.manifest_path)
+        discovery_statuses = _latest_discovery_statuses(self.discovery_path)
+        discovery_version_counts = _latest_discovery_version_counts(
+            self.discovery_path
+        )
+        found_papers = sum(status == "found" for status in discovery_statuses.values())
+        total_versions = sum(discovery_version_counts.values())
+        with self._source_progress_lock:
+            self._source_progress["total_papers"] = found_papers
+            self._source_progress["total_versions"] = total_versions
+        with self._reference_progress_lock:
+            self._reference_progress["total_papers"] = found_papers
         manifest_lock = threading.RLock()
         reference_queue: queue.Queue[object] | None = None
         reference_thread: threading.Thread | None = None
@@ -2793,6 +3096,7 @@ class Pipeline:
                     else self._source_results(pending)
                 )
                 for record in source_results:
+                    self._record_source_duration_stats(record)
                     if self.config.without_references:
                         record["reference"] = {
                             "status": "skipped",
@@ -2882,6 +3186,11 @@ class Pipeline:
 
             self._record_stage_timing("source", phase_started)
             source_timing_recorded = True
+            logger.info(
+                "event=source_stage_end elapsed_seconds=%.4f processed_papers=%d",
+                max(0.0, self.monotonic() - phase_started),
+                processed,
+            )
 
             if reference_queue is not None:
                 if reference_buffer:
@@ -2942,6 +3251,23 @@ class Pipeline:
             getattr(self.source_processor, "prefetch", None)
         ) and callable(getattr(self.source_processor, "process_prefetched", None))
 
+    @staticmethod
+    def _ensure_source_timing(
+        fragment: Mapping[str, object],
+        elapsed_seconds: float,
+    ) -> dict[str, object]:
+        """Add paper-level timing aliases for third-party source adapters."""
+        result = dict(fragment)
+        raw_timings = result.get("timings")
+        timings = dict(raw_timings) if isinstance(raw_timings, Mapping) else {}
+        source_seconds = timings.get("source_seconds", timings.get("total_seconds"))
+        if not isinstance(source_seconds, (int, float)):
+            source_seconds = elapsed_seconds
+        timings.setdefault("source_seconds", max(0.0, float(source_seconds)))
+        timings.setdefault("total_seconds", max(0.0, float(source_seconds)))
+        result["timings"] = timings
+        return result
+
     def _source_results_prefetched(
         self, metadata_batch: list[Mapping[str, object]]
     ) -> Iterator[dict[str, Any]]:
@@ -2980,7 +3306,7 @@ class Pipeline:
             try:
                 for metadata in metadata_batch:
                     self._check_resources()
-                    prefetch = getattr(self.source_processor, "prefetch")
+                    prefetch = self.source_processor.prefetch  # type: ignore[attr-defined]
                     prefetched = prefetch(metadata)
                     if not enqueue(prefetched):
                         return
@@ -3018,8 +3344,9 @@ class Pipeline:
         if not isinstance(prefetched, PrefetchedSource):
             raise TypeError("source prefetch adapter returned an invalid item")
         arxiv_id = normalize_arxiv_id(prefetched.metadata.get("arxiv_id"))
+        started = self.monotonic()
         try:
-            process_prefetched = getattr(self.source_processor, "process_prefetched")
+            process_prefetched = self.source_processor.process_prefetched  # type: ignore[attr-defined]
             fragment = dict(process_prefetched(prefetched))
         except SourceRateLimitPaused as exc:
             fragment = {
@@ -3045,6 +3372,10 @@ class Pipeline:
                 "processing": {"status": "not_started"},
                 "metadata": {"status": "failed"},
             }
+        fragment = self._ensure_source_timing(
+            fragment,
+            max(0.0, self.monotonic() - started),
+        )
         record: dict[str, Any] = {"arxiv_id": arxiv_id, **fragment}
         record.setdefault("source", {"status": "failed"})
         record.setdefault("processing", {"status": "not_started"})
@@ -3063,6 +3394,7 @@ class Pipeline:
                 "event": "paper_completed",
                 "arxiv_id": arxiv_id,
                 "status": source_status,
+                "source_seconds": record["timings"].get("source_seconds", 0.0),
                 "message": "paper source completed",
             }
         )
@@ -3082,6 +3414,7 @@ class Pipeline:
                 "message": "starting paper source",
             }
         )
+        started = self.monotonic()
         try:
             fragment = dict(self.source_processor.process(metadata))
         except SourceRateLimitPaused as exc:
@@ -3108,6 +3441,10 @@ class Pipeline:
                 "processing": {"status": "not_started"},
                 "metadata": {"status": "failed"},
             }
+        fragment = self._ensure_source_timing(
+            fragment,
+            max(0.0, self.monotonic() - started),
+        )
         record: dict[str, Any] = {"arxiv_id": arxiv_id, **fragment}
         record.setdefault("source", {"status": "failed"})
         record.setdefault("processing", {"status": "not_started"})
@@ -3126,6 +3463,7 @@ class Pipeline:
                 "event": "paper_completed",
                 "arxiv_id": arxiv_id,
                 "status": source_status,
+                "source_seconds": record["timings"].get("source_seconds", 0.0),
                 "message": "paper source completed",
             }
         )
@@ -3237,6 +3575,14 @@ class Pipeline:
                             queue_wait_seconds += wait_elapsed
                         break
                     arxiv_ids = list(item)  # type: ignore[arg-type]
+                    with self._reference_progress_lock:
+                        self._reference_progress.update(
+                            {
+                                "current_batch": 0,
+                                "current_batch_total": len(arxiv_ids),
+                                "queue_size": work_queue.qsize(),
+                            }
+                        )
                     if stage_started is None:
                         stage_started = self.monotonic()
                     else:
@@ -3291,8 +3637,21 @@ class Pipeline:
                             entry["reference"] = str(reference["status"])
                             entry["overall"] = str(update["overall_status"])
                         completed += 1
+                        with self._reference_progress_lock:
+                            self._reference_progress["completed_papers"] = completed
+                            self._reference_progress["references"] = (
+                                int(self._reference_progress.get("references", 0))
+                                + int(reference.get("references_count", 0) or 0)
+                            )
                     self.state.update(last_reference_checkpoint=completed)
                     self._checkpoint_summary("running")
+                    with self._reference_progress_lock:
+                        self._reference_progress["batches_completed"] = (
+                            int(self._reference_progress.get("batches_completed", 0)) + 1
+                        )
+                        self._reference_progress["current_batch"] = len(arxiv_ids)
+                        self._reference_progress["current_batch_total"] = len(arxiv_ids)
+                        self._reference_progress["queue_size"] = work_queue.qsize()
                     logger.info(
                         "Reference batch completed: processed=%d",
                         completed,
@@ -3338,6 +3697,13 @@ class Pipeline:
                 self._add_timing("reference_queue_wait_seconds", queue_wait_seconds)
                 if self.benchmark is not None:
                     self.benchmark.add_stage_wall_time("reference", stage_elapsed)
+                logger.info(
+                    "event=reference_stage_end wall_seconds=%.4f crawler_work_seconds=%.4f queue_wait_seconds=%.4f completed_papers=%d",
+                    stage_elapsed,
+                    crawler_seconds,
+                    queue_wait_seconds,
+                    completed,
+                )
 
     def _reference_results(
         self,
@@ -3540,11 +3906,28 @@ class Pipeline:
                 if key in event:
                     current[key] = event[key]
 
-            if event_name in {"version_processed", "version_skipped"}:
+            version_status = str(event.get("status", ""))
+            version_succeeded = version_status in {
+                "ok",
+                "no_tex",
+                "success",
+                "success_with_no_tex",
+                "skipped",
+            }
+            if event_name == "version_skipped" or (
+                event_name == "version_processed" and version_succeeded
+            ):
                 completed_versions = self._source_progress["versions_completed"]
                 self._source_progress["versions_completed"] = (
                     completed_versions + 1
                     if isinstance(completed_versions, int)
+                    else 1
+                )
+            elif event_name in {"version_failed", "version_processed"}:
+                failed_versions = self._source_progress["versions_failed"]
+                self._source_progress["versions_failed"] = (
+                    failed_versions + 1
+                    if isinstance(failed_versions, int)
                     else 1
                 )
             elif event_name == "paper_completed":
@@ -3567,11 +3950,35 @@ class Pipeline:
                 )
                 current.update({"status": "idle", "message": "paper completed"})
                 logger.info(
-                    "Source paper completed | paper=%s | status=%s | worker=%s",
+                    "event=source_id_complete paper=%s status=%s worker=%s source_seconds=%.4f",
                     arxiv_id,
                     status,
                     worker,
+                    float(event.get("source_seconds", 0.0) or 0.0),
                 )
+
+    def _record_source_duration_stats(self, record: Mapping[str, object]) -> None:
+        timings = record.get("timings")
+        if isinstance(timings, Mapping):
+            source_seconds = timings.get("source_seconds", timings.get("total_seconds"))
+            if isinstance(source_seconds, (int, float)):
+                self._source_id_duration_stats.update(source_seconds)
+        source = record.get("source")
+        versions = source.get("versions") if isinstance(source, Mapping) else None
+        if not isinstance(versions, list):
+            return
+        for version in versions:
+            if not isinstance(version, Mapping):
+                continue
+            version_timings = version.get("timings")
+            if not isinstance(version_timings, Mapping):
+                continue
+            download_seconds = version_timings.get("download_seconds")
+            processing_seconds = version_timings.get("processing_seconds")
+            if isinstance(download_seconds, (int, float)):
+                self._version_download_duration_stats.update(download_seconds)
+            if isinstance(processing_seconds, (int, float)):
+                self._version_processing_duration_stats.update(processing_seconds)
 
     def _source_progress_snapshot(self, total_papers: int) -> dict[str, object]:
         with self._source_progress_lock:
@@ -3586,6 +3993,39 @@ class Pipeline:
             order = snapshot.get("worker_order")
             snapshot["worker_order"] = list(order) if isinstance(order, list) else []
             return snapshot
+
+    def _progress_snapshot(self) -> dict[str, object]:
+        """Build the low-cost aggregate state consumed by ProgressMonitor."""
+        state = self.state.snapshot() if self.state is not None else {}
+        timings = state.get("timings") if isinstance(state, Mapping) else {}
+        metrics = state.get("metrics") if isinstance(state, Mapping) else {}
+        timings = timings if isinstance(timings, Mapping) else {}
+        metrics = metrics if isinstance(metrics, Mapping) else {}
+        with self._discovery_progress_lock:
+            discovery = dict(self._discovery_progress)
+        discovery_status = str(discovery.get("status", state.get("status", "pending")))
+        if bool(state.get("discovery_complete")):
+            discovery_status = "completed"
+        with self._source_progress_lock:
+            source = copy.deepcopy(self._source_progress)
+        with self._reference_progress_lock:
+            reference = dict(self._reference_progress)
+        source["http_429"] = metrics.get("downloader_http_429_count", 0)
+        reference["http_429"] = metrics.get("reference_http_429_count", 0)
+        elapsed = max(0.0, self.monotonic() - self._session_started)
+        return {
+            "elapsed_seconds": elapsed,
+            "discovery": {
+                "status": discovery_status,
+                "found": discovery.get("found", 0),
+                "total": self.loaded_input.unique_count,
+                "batch": discovery.get("batch", state.get("last_discovery_batch", 0)),
+                "http_429": metrics.get("discovery_http_429_count", 0),
+                "elapsed_seconds": timings.get("discovery_time_seconds", 0.0),
+            },
+            "source": source,
+            "reference": reference,
+        }
 
     def _flush_metrics(self) -> None:
         assert self.state is not None
@@ -3633,6 +4073,9 @@ class Pipeline:
         session_elapsed = max(0.0, self.monotonic() - self._session_started)
         self._add_timing("wall_time_seconds", session_elapsed)
         self._flush_metrics()
+        if self.progress_monitor is not None:
+            self.progress_monitor.stop()
+            self.progress_monitor = None
         if self.discovery_journal is not None:
             self.discovery_journal.sync()
         if self.manifest_journal is not None:
@@ -3684,6 +4127,32 @@ class Pipeline:
                 if isinstance(completed_source_papers, (int, float))
                 else 0
             )
+            completed_source_versions = source_progress.get("versions_completed", 0)
+            completed_source_versions = (
+                completed_source_versions
+                if isinstance(completed_source_versions, (int, float))
+                else 0
+            )
+            failed_source_versions = source_progress.get("versions_failed", 0)
+            failed_source_versions = (
+                failed_source_versions
+                if isinstance(failed_source_versions, (int, float))
+                else 0
+            )
+            cache_hits = metrics.get("downloader_cache_hit_count", 0)
+            cache_misses = metrics.get("downloader_cache_miss_count", 0)
+            cache_attempts = cache_hits + cache_misses
+            source_limiter = getattr(self.source_processor, "limiter", None)
+            limiter_wait_seconds = getattr(source_limiter, "wait_seconds", 0.0)
+            current_request_interval = getattr(
+                source_limiter,
+                "current_interval",
+                self.config.source_request_interval,
+            )
+            if current_request_interval is None:
+                from src.crawling.config import settings
+
+                current_request_interval = settings.arxiv_api_delay
             summary: dict[str, Any] = {
                 "run_id": state.get("run_id"),
                 "status": status,
@@ -3717,9 +4186,44 @@ class Pipeline:
                 "discovery_time_seconds": float(
                     timings.get("discovery_time_seconds", 0.0)
                 ),
+                "discovery_wall_seconds": float(
+                    timings.get("discovery_time_seconds", 0.0)
+                ),
                 "source_time_seconds": source_time_seconds,
+                "source_stage_wall_seconds": source_time_seconds,
                 "source_progress": source_progress,
                 "source_worker_count": self.config.download_workers,
+                "completed_papers": int(completed_source_papers),
+                "completed_versions": int(completed_source_versions),
+                "failed_versions": int(failed_source_versions),
+                "source_request_interval_seconds": (
+                    self.config.source_request_interval
+                    if self.config.source_request_interval is not None
+                    else current_request_interval
+                ),
+                "source_current_request_interval_seconds": current_request_interval,
+                "downloader_limiter_wait_seconds": limiter_wait_seconds,
+                "source_versions_per_hour": (
+                    completed_source_versions / source_time_seconds * 3600
+                    if source_time_seconds > 0
+                    else 0.0
+                ),
+                "versions_per_hour": (
+                    completed_source_versions / source_time_seconds * 3600
+                    if source_time_seconds > 0
+                    else 0.0
+                ),
+                "source_version_success_rate": (
+                    completed_source_versions
+                    / (completed_source_versions + failed_source_versions)
+                    if completed_source_versions + failed_source_versions > 0
+                    else 0.0
+                ),
+                "downloader_cache_hit_rate": (
+                    cache_hits / cache_attempts
+                    if cache_attempts > 0
+                    else 0.0
+                ),
                 "source_papers_per_second": (
                     completed_source_papers / source_time_seconds
                     if source_time_seconds > 0
@@ -3729,6 +4233,9 @@ class Pipeline:
                     timings.get("reference_time_seconds", 0.0)
                 ),
                 "reference_api_time_seconds": float(
+                    timings.get("reference_time_seconds", 0.0)
+                ),
+                "reference_crawler_work_seconds": float(
                     timings.get("reference_time_seconds", 0.0)
                 ),
                 "reference_stage_wall_seconds": float(
@@ -3741,6 +4248,15 @@ class Pipeline:
                 **metrics,
                 "failed_ids": _failed_ids_from_indexes(discovery_statuses, manifest),
                 "initial_rss_bytes": self.initial_rss_bytes,
+                "source_id_duration_stats": (
+                    self._source_id_duration_stats.snapshot()
+                ),
+                "version_download_duration_stats": (
+                    self._version_download_duration_stats.snapshot()
+                ),
+                "version_processing_duration_stats": (
+                    self._version_processing_duration_stats.snapshot()
+                ),
             }
             if self.benchmark is not None:
                 resource = self.benchmark.snapshot(
@@ -3858,12 +4374,16 @@ def run_pipeline(
     reference_batch_size: int | None = None,
     min_free_bytes: int = 1024**3,
     source_batch_size: int = 50,
+    download_workers: int = 4,
+    request_interval: float | None = None,
     source_prefetch_queue_size: int = 2,
     reference_queue_size: int = 2,
     max_runtime_hours: float | None = None,
     grace_period_seconds: float = 600,
     input_spec: Mapping[str, object] | None = None,
     input_snapshot_path: str | Path | None = None,
+    progress_monitor: bool = True,
+    progress_interval: float = 1.0,
 ) -> dict[str, Any]:
     """Backward-compatible programmatic entry point.
 
@@ -3883,6 +4403,8 @@ def run_pipeline(
         run_dir=run_dir,
         corpus_dir=settings.data_dir,
         source_batch_size=source_batch_size,
+        download_workers=download_workers,
+        source_request_interval=request_interval,
         source_prefetch_queue_size=source_prefetch_queue_size,
         reference_batch_size=reference_batch_size,
         reference_queue_size=reference_queue_size,
@@ -3893,6 +4415,8 @@ def run_pipeline(
         grace_period_seconds=grace_period_seconds,
         without_references=crawler is None,
         keep_downloads=keep_results,
+        progress_monitor=progress_monitor,
+        progress_interval=progress_interval,
     )
     resume = (run_dir / "run_state.json").is_file()
     return Pipeline(
@@ -3932,7 +4456,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-workers", type=int)
     parser.add_argument("--reference-batch-size", type=int)
     parser.add_argument("--source-batch-size", type=int, default=50)
-    parser.add_argument("--download-workers", type=int, default=8)
+    parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=4,
+        help="parallel source-download workers (default: 4)",
+    )
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=None,
+        help="minimum seconds between source requests; defaults to project settings",
+    )
     parser.add_argument("--source-prefetch-queue-size", type=int, default=2)
     parser.add_argument("--reference-queue-size", type=int, default=2)
     parser.add_argument("--discovery-batch-size", type=int, default=100)
@@ -3946,8 +4481,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-delay", type=float, default=10.0)
     parser.add_argument("--max-delay", type=float, default=300.0)
     parser.add_argument("--rate-limit-cooldown", type=float, default=20.0)
+    parser.add_argument("--rate-limit-window", type=float, default=60.0)
     parser.add_argument("--keep-results", action="store_true")
     parser.add_argument("--debug-reference-metrics", action="store_true")
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=1.0,
+        help="seconds between console progress snapshots (default: 1.0)",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="disable the live console progress monitor",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -4022,9 +4569,13 @@ def _print_terminal_summary(summary: Mapping[str, object], run_dir: Path) -> Non
     print(
         "source_throughput="
         f"{float(summary.get('source_papers_per_second', 0.0)):.3f} papers/s "
+        f"{float(summary.get('source_versions_per_hour', 0.0)):.2f} versions/h "
+        f"success_rate:{float(summary.get('source_version_success_rate', 0.0)):.3f} "
         f"workers:{summary.get('source_worker_count', 1)} "
         f"429:{summary.get('downloader_http_429_count', 0)} "
-        f"retry_sleep:{float(summary.get('downloader_retry_sleep_seconds', 0.0)):.2f}s"
+        f"retry_sleep:{float(summary.get('downloader_retry_sleep_seconds', 0.0)):.2f}s "
+        f"limiter_wait:{float(summary.get('downloader_limiter_wait_seconds', 0.0)):.2f}s "
+        f"cache_hit_rate:{float(summary.get('downloader_cache_hit_rate', 0.0)):.3f}"
     )
     print(
         "reference_queue_wait_seconds="
@@ -4055,6 +4606,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             discovery_fallback_batch_size=args.discovery_fallback_batch_size,
             source_batch_size=args.source_batch_size,
             download_workers=args.download_workers,
+            source_request_interval=args.request_interval,
             source_prefetch_queue_size=args.source_prefetch_queue_size,
             reference_workers=args.reference_workers,
             reference_batch_size=args.reference_batch_size,
@@ -4067,11 +4619,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             without_references=args.without_references,
             keep_downloads=args.keep_results,
             debug_reference_metrics=args.debug_reference_metrics,
+            progress_monitor=not args.no_progress,
+            progress_interval=args.progress_interval,
             retry_policy=RetryPolicy(
                 max_retries=args.max_retries,
                 base_delay=args.base_delay,
                 max_delay=args.max_delay,
                 rate_limit_cooldown=args.rate_limit_cooldown,
+                rate_limit_window_seconds=args.rate_limit_window,
             ),
         )
         summary = Pipeline(config, loaded).run(resume=args.resume)

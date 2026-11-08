@@ -23,10 +23,10 @@ import sys
 import threading
 import time
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 try:
     import psutil
@@ -68,7 +68,7 @@ def _non_negative_int(value: Any) -> int:
     return max(0, int(numeric))
 
 
-def _ratio(numerator: int | float, denominator: int | float) -> float:
+def _ratio(numerator: float, denominator: float) -> float:
     """Return numerator / denominator or 0.0 when denominator is zero."""
     denominator_value = _number(denominator)
 
@@ -78,7 +78,7 @@ def _ratio(numerator: int | float, denominator: int | float) -> float:
     return float(numerator) / denominator_value
 
 
-def _percent(numerator: int | float, denominator: int | float) -> float:
+def _percent(numerator: float, denominator: float) -> float:
     """Return a percentage in the range 0..100."""
     return round(_ratio(numerator, denominator) * 100.0, 4)
 
@@ -96,6 +96,169 @@ def _normalize_paths(
 # ---------------------------------------------------------------------------
 # Streaming result aggregation
 # ---------------------------------------------------------------------------
+
+class DurationStats:
+    """Bounded aggregate for repeated duration measurements."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.total_seconds = 0.0
+        self.min_seconds: float | None = None
+        self.max_seconds: float | None = None
+
+    def update(self, seconds: Any) -> None:
+        value = max(0.0, _number(seconds))
+        self.count += 1
+        self.total_seconds += value
+        self.min_seconds = (
+            value
+            if self.min_seconds is None
+            else min(self.min_seconds, value)
+        )
+        self.max_seconds = (
+            value
+            if self.max_seconds is None
+            else max(self.max_seconds, value)
+        )
+
+    def snapshot(self) -> dict[str, float | int | None]:
+        return {
+            "count": self.count,
+            "total_seconds": round(self.total_seconds, 4),
+            "average_seconds": round(
+                self.total_seconds / self.count,
+                4,
+            ) if self.count else 0.0,
+            "min_seconds": (
+                round(self.min_seconds, 4)
+                if self.min_seconds is not None
+                else None
+            ),
+            "max_seconds": (
+                round(self.max_seconds, 4)
+                if self.max_seconds is not None
+                else None
+            ),
+        }
+
+
+class ProgressMonitor:
+    """Render a low-overhead aggregate pipeline snapshot to a stream."""
+
+    def __init__(
+        self,
+        snapshot_callback: Callable[[], Mapping[str, Any]],
+        *,
+        interval: float = 1.0,
+        output: TextIO | None = None,
+    ) -> None:
+        if interval <= 0:
+            raise ValueError("interval must be greater than zero")
+        self.snapshot_callback = snapshot_callback
+        self.interval = float(interval)
+        self.output = output or sys.stdout
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @staticmethod
+    def _bar(current: object, total: object, width: int = 20) -> str:
+        current_value = max(0, int(_number(current)))
+        total_value = max(1, int(_number(total)))
+        percent = min(1.0, current_value / total_value)
+        filled = min(width, round(percent * width))
+        return f"[{('=' * filled) + ('.' * (width - filled))}] {percent * 100:3.0f}%"
+
+    @staticmethod
+    def _mapping(value: object) -> Mapping[str, Any]:
+        return value if isinstance(value, Mapping) else {}
+
+    def _render(self, snapshot: Mapping[str, Any]) -> str:
+        discovery = self._mapping(snapshot.get("discovery"))
+        source = self._mapping(snapshot.get("source"))
+        reference = self._mapping(snapshot.get("reference"))
+        elapsed = _number(snapshot.get("elapsed_seconds"))
+
+        lines = [
+            f"[+{elapsed:.1f}s] ====== Pipeline Snapshot ======",
+            (
+                "Discovery: "
+                f"{discovery.get('status', 'pending')} "
+                f"found={discovery.get('found', 0)}/{discovery.get('total', 0)} "
+                f"batch={discovery.get('batch', 0)} "
+                f"429={discovery.get('http_429', 0)}"
+            ),
+            (
+                "Source: "
+                f"{source.get('completed_papers', 0)}/{source.get('total_papers', 0)} papers "
+                f"| {source.get('versions_completed', 0)}/{source.get('total_versions', 0)} versions "
+                f"| success={source.get('papers_success', 0)} "
+                f"partial={source.get('papers_partial', 0)} "
+                f"failed={source.get('papers_failed', 0)} "
+                f"429={source.get('http_429', 0)}"
+            ),
+            (
+                "Reference: "
+                f"{reference.get('completed_papers', 0)}/{reference.get('total_papers', 0)} papers "
+                f"| references={reference.get('references', 0)} "
+                f"| queue={reference.get('queue_size', 0)}/{reference.get('queue_maxsize', 0)} "
+                f"429={reference.get('http_429', 0)}"
+            ),
+            "Workers:",
+        ]
+
+        worker_progress = self._mapping(source.get("worker_progress"))
+        worker_order = source.get("worker_order", [])
+        ordered_workers = (
+            [str(worker) for worker in worker_order]
+            if isinstance(worker_order, list)
+            else list(worker_progress)
+        )
+        if not ordered_workers:
+            lines.append("  (no workers active yet)")
+        else:
+            for worker in ordered_workers:
+                state = self._mapping(worker_progress.get(worker))
+                if not state:
+                    continue
+                lines.append(
+                    f"  {worker:>24s} "
+                    f"{state.get('versioned_id') or state.get('paper', '-')!s:>16s} "
+                    f"{self._bar(state.get('current', 0), state.get('total', 1))} "
+                    f"{state.get('message', state.get('status', 'idle'))}"
+                )
+        return "\n".join(lines)
+
+    def render(self) -> None:
+        try:
+            snapshot = self.snapshot_callback()
+            rendered = self._render(snapshot)
+        except Exception as exc:  # noqa: BLE001 - monitor must not stop pipeline.
+            rendered = f"Pipeline monitor unavailable: {type(exc).__name__}: {exc}"
+        self.output.write(rendered + "\n")
+        self.output.flush()
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self.render()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="pipeline-progress-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.interval):
+            self.render()
+
+    def stop(self, *, render_final: bool = True) -> None:
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=max(1.0, self.interval * 2))
+        if render_final:
+            self.render()
 
 class SummaryAccumulator:
     """Incrementally aggregate pipeline records.
@@ -135,6 +298,9 @@ class SummaryAccumulator:
         self.download_seconds = 0.0
         self.processing_seconds = 0.0
         self.references_seconds = 0.0
+        self.source_id_durations = DurationStats()
+        self.version_download_durations = DurationStats()
+        self.version_processing_durations = DurationStats()
 
         # Derived counters.
         self.fully_completed_papers = 0
@@ -182,6 +348,15 @@ class SummaryAccumulator:
             self.metadata_failed_papers += 1
 
         paper_timings = paper.get("timings") or {}
+
+        if "source_seconds" in paper_timings:
+            self.source_id_durations.update(
+                paper_timings.get("source_seconds")
+            )
+        elif "total_seconds" in paper_timings:
+            self.source_id_durations.update(
+                paper_timings.get("total_seconds")
+            )
 
         self.cumulative_paper_seconds += _number(
             paper_timings.get("total_seconds")
@@ -262,6 +437,15 @@ class SummaryAccumulator:
             )
 
             version_timings = version.get("timings") or {}
+
+            if "download_seconds" in version_timings:
+                self.version_download_durations.update(
+                    version_timings.get("download_seconds")
+                )
+            if "processing_seconds" in version_timings:
+                self.version_processing_durations.update(
+                    version_timings.get("processing_seconds")
+                )
 
             self.download_seconds += _number(
                 version_timings.get("download_seconds")
@@ -694,6 +878,11 @@ class SummaryAccumulator:
                 self.references_seconds,
                 4,
             ),
+            "duration_stats": {
+                "source_id": self.source_id_durations.snapshot(),
+                "version_download": self.version_download_durations.snapshot(),
+                "version_processing": self.version_processing_durations.snapshot(),
+            },
             "average_paper_processing_seconds": round(
                 _ratio(
                     self.cumulative_paper_seconds,
@@ -1157,6 +1346,9 @@ class RunBenchmark:
         total_versions = _non_negative_int(
             summary.get("total_versions")
         )
+        completed_versions = _non_negative_int(
+            summary.get("completed_versions", total_versions)
+        )
 
         if required_paper_count is None:
             context_required_count = summary.get(
@@ -1259,11 +1451,23 @@ class RunBenchmark:
                 "discovery",
                 0.0,
             ),
+            "discovery_wall_seconds": stage_wall_seconds.get(
+                "discovery",
+                0.0,
+            ),
             "source_time_seconds": stage_wall_seconds.get(
                 "source",
                 0.0,
             ),
+            "source_stage_wall_seconds": stage_wall_seconds.get(
+                "source",
+                0.0,
+            ),
             "reference_time_seconds": stage_wall_seconds.get(
+                "reference",
+                0.0,
+            ),
+            "reference_stage_wall_seconds": stage_wall_seconds.get(
                 "reference",
                 0.0,
             ),
@@ -1275,6 +1479,11 @@ class RunBenchmark:
 
             "versions_per_second": round(
                 total_versions / elapsed,
+                6,
+            ) if elapsed > 0 else 0.0,
+
+            "versions_per_hour": round(
+                completed_versions / elapsed * 3600.0,
                 6,
             ) if elapsed > 0 else 0.0,
 

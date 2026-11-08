@@ -133,6 +133,19 @@ Milestone 3 adds `predictions`. Together with the M1 tables `papers` and `refere
 | `ARXIV_OUTPUT_DIR` | `outputs/run-001` |
 | `ARXIV_LOG_DIR` | `logs` |
 | `ARXIV_USER_AGENT` | `ArxivProject/1.0` |
+| `ARXIV_SOURCE_REQUEST_INTERVAL` | `0` seconds (wait only after HTTP 429) |
+
+The CLI defaults to 4 concurrent source-download workers, matching the
+download strategy used by the reference implementation. Override the
+concurrency or opt into proactive pacing when needed:
+
+```bash
+python -m src.crawling.pipeline ... --download-workers 8 --request-interval 0
+```
+
+When arXiv responds with HTTP 429, the shared limiter pauses subsequent source
+requests and the retry policy handles the backoff. A positive
+`--request-interval` can be used for a more conservative run.
 
 ## Testing
 

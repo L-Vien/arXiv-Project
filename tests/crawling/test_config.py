@@ -26,6 +26,9 @@ class TestConfig(unittest.TestCase):
     def test_arxiv_delay_is_non_negative(self):
         self.assertGreaterEqual(settings.arxiv_api_delay, 0)
 
+    def test_source_download_delay_defaults_to_reactive_only(self):
+        self.assertEqual(settings.arxiv_api_delay, 0.0)
+
     def test_arxiv_rate_limit_cooldown_is_non_negative(self):
         self.assertGreaterEqual(settings.arxiv_rate_limit_cooldown, 0)
 

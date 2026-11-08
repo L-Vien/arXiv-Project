@@ -190,7 +190,9 @@ Important environment variables are:
 
 - Use the arXiv API for targeted discovery.
 - Download versioned sources through `export.arxiv.org/src/{versioned_id}`.
-- Use a descriptive User-Agent and respect API pacing.
+- Use a descriptive User-Agent. Source downloads start concurrently by default
+  and pause through the shared limiter only after HTTP 429; explicit pacing can
+  be enabled with `--request-interval`.
 - Apply bounded retries with exponential backoff to transient failures.
 - Respect `Retry-After` and pause after repeated rate-limit responses.
 - Verify downloaded files using their integrity markers and SHA-256 checksums.
