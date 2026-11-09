@@ -125,10 +125,10 @@ class RetryPolicy:
 
     max_retries: int = 5
     base_delay: float = 10.0
-    max_delay: float = 300.0
+    max_delay: float = 200.0
     jitter_ratio: float = 0.25
     circuit_breaker_threshold: int = 3
-    circuit_cooldown: float = 120.0
+    circuit_cooldown: float = 100.0
     pause_after_429: int = 6
     rate_limit_cooldown: float = 10.0
     rate_limit_window_seconds: float = 30.0
