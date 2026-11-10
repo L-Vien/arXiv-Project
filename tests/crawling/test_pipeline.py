@@ -660,48 +660,23 @@ class DownstreamQueueTests(unittest.TestCase):
                 )
             )
 
-            date_pages = iter(
-                [
-                    {
-                        "offset": 2,
-                        "raw_count": 2,
-                        "found_papers": [
-                            self._paper("2607.99998"),
-                            self._paper("2607.99999"),
-                        ],
-                        "failed_ids": [],
-                    },
-                    {
-                        "offset": 2,
-                        "raw_count": 0,
-                        "found_papers": [],
-                        "failed_ids": [],
-                    },
-                ]
-            )
-
-            def month_two_fetch(ids: list[str]) -> list[dict[str, object]]:
+            def discovery_fetch(ids: list[str]) -> list[dict[str, object]]:
+                if ids == ["2607.99998", "2607.99999"]:
+                    return [
+                        self._paper("2607.99998"),
+                        self._paper("2607.99999"),
+                    ]
                 if ids[0] == "2608.00001":
                     return [self._paper("2608.00001")]
                 return []
 
             config = self._config(root)
-            with (
-                patch(
-                    "src.crawling.discovery.find_start_timestamp_month_1",
-                    return_value="20260701000000",
-                ),
-                patch(
-                    "src.crawling.discovery.fetch_date_stream_batch_once",
-                    side_effect=lambda **_kwargs: next(date_pages),
-                ),
-            ):
-                result = pipeline.Pipeline(
-                    config,
-                    loaded,
-                    discovery_fetch=month_two_fetch,
-                    source_processor=_SourceFake(),
-                ).run()
+            result = pipeline.Pipeline(
+                config,
+                loaded,
+                discovery_fetch=discovery_fetch,
+                source_processor=_SourceFake(),
+            ).run()
             discovery_records = list(
                 pipeline.iter_jsonl(root / "run" / "discovery.jsonl")
             )
@@ -718,7 +693,7 @@ class DownstreamQueueTests(unittest.TestCase):
         self.assertEqual(result["found_count"], 3)
         self.assertEqual(result["not_found_count"], 1)
 
-    def test_cross_month_without_limit_uses_date_stream_for_month_one(self) -> None:
+    def test_cross_month_without_limit_uses_id_probe_for_month_one(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             loaded = pipeline.load_input(
@@ -729,24 +704,9 @@ class DownstreamQueueTests(unittest.TestCase):
                     end_id=1,
                 )
             )
-            date_pages = iter(
-                [
-                    {
-                        "offset": 2,
-                        "raw_count": 2,
-                        "found_papers": [self._paper("2607.99998")],
-                        "failed_ids": [],
-                    },
-                    {
-                        "offset": 2,
-                        "raw_count": 0,
-                        "found_papers": [],
-                        "failed_ids": [],
-                    },
-                ]
-            )
-
-            def month_two_fetch(ids: list[str]) -> list[dict[str, object]]:
+            def discovery_fetch(ids: list[str]) -> list[dict[str, object]]:
+                if ids == ["2607.99998", "2607.99999"]:
+                    return [self._paper("2607.99998")]
                 if ids == ["2608.00001"]:
                     return [self._paper("2608.00001")]
                 return []
@@ -758,20 +718,25 @@ class DownstreamQueueTests(unittest.TestCase):
                 ),
                 patch(
                     "src.crawling.discovery.fetch_date_stream_batch_once",
-                    side_effect=lambda **_kwargs: next(date_pages),
+                    return_value={
+                        "offset": 0,
+                        "raw_count": 0,
+                        "found_papers": [],
+                        "failed_ids": [],
+                    },
                 ) as date_fetch,
             ):
                 result = pipeline.Pipeline(
                     self._config(root),
                     loaded,
-                    discovery_fetch=month_two_fetch,
+                    discovery_fetch=discovery_fetch,
                     source_processor=_SourceFake(),
                 ).run()
             discovery_records = list(
                 pipeline.iter_jsonl(root / "run" / "discovery.jsonl")
             )
 
-        date_fetch.assert_called()
+        date_fetch.assert_not_called()
         statuses = {
             record["arxiv_id"]: record["status"]
             for record in discovery_records
@@ -783,8 +748,71 @@ class DownstreamQueueTests(unittest.TestCase):
                 "2608.00001": "found",
             },
         )
-        self.assertNotIn("2607.99999", statuses)
         self.assertEqual(result["status"], "completed")
+
+    def test_cross_month_probes_month_one_by_id_until_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loaded = pipeline.load_input(
+                pipeline.InputRequest(
+                    start_month="2026-06",
+                    start_id=100,
+                    end_month="2026-07",
+                    end_id=1,
+                )
+            )
+            calls: list[list[str]] = []
+
+            def discovery_fetch(ids: list[str]) -> list[dict[str, object]]:
+                calls.append(list(ids))
+                if ids[0] == "2606.00100":
+                    return [self._paper(arxiv_id) for arxiv_id in ids]
+                if ids == ["2607.00001"]:
+                    return [self._paper("2607.00001")]
+                return []
+
+            config = pipeline.PipelineConfig(
+                **{
+                    **self._config(root).__dict__,
+                    "discovery_batch_size": 10,
+                }
+            )
+
+            with (
+                patch(
+                    "src.crawling.discovery.find_start_timestamp_month_1",
+                    return_value="20260601000000",
+                ),
+                patch(
+                    "src.crawling.discovery.fetch_date_stream_batch_once",
+                    return_value={
+                        "offset": 0,
+                        "raw_count": 0,
+                        "found_papers": [],
+                        "failed_ids": [],
+                    },
+                ),
+            ):
+                result = pipeline.Pipeline(
+                    config,
+                    loaded,
+                    discovery_fetch=discovery_fetch,
+                    source_processor=_SourceFake(),
+                ).run()
+
+            records = list(pipeline.iter_jsonl(root / "run" / "discovery.jsonl"))
+
+        self.assertEqual(
+            [record["arxiv_id"] for record in records if record["status"] == "found"],
+            [f"2606.{number:05d}" for number in range(100, 110)]
+            + ["2607.00001"],
+        )
+        self.assertEqual(calls[0][0], "2606.00100")
+        self.assertEqual(calls[0][-1], "2606.00109")
+        self.assertEqual(calls[1][0], "2606.00110")
+        self.assertEqual(calls[1][-1], "2606.00119")
+        self.assertEqual(calls[2], ["2607.00001"])
+        self.assertEqual(result["found_count"], 11)
 
     def test_cross_month_cli_initializes_default_discovery_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
