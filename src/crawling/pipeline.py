@@ -8,7 +8,6 @@ source processing while a bounded queue feeds the Semantic Scholar crawler.
 from __future__ import annotations
 
 import argparse
-import calendar
 import concurrent.futures
 import copy
 import csv
@@ -124,14 +123,14 @@ class RetryPolicy:
     """Bounded exponential retry and rate-limit circuit configuration."""
 
     max_retries: int = 5
-    base_delay: float = 10.0
+    base_delay: float = 5.0
     max_delay: float = 200.0
     jitter_ratio: float = 0.25
     circuit_breaker_threshold: int = 3
     circuit_cooldown: float = 100.0
     pause_after_429: int = 6
-    rate_limit_cooldown: float = 10.0
-    rate_limit_window_seconds: float = 30.0
+    rate_limit_cooldown: float = 5.0
+    rate_limit_window_seconds: float = 20.0
 
     def __post_init__(self) -> None:
         if self.max_retries < 0:
@@ -183,6 +182,17 @@ class DiscoveryBatchOutcome:
     consecutive_429: int = 0
     paused_rate_limit: bool = False
     cooldown_until_epoch: float | None = None
+
+
+@dataclass(frozen=True)
+class _ProcessedDiscoveryBatch:
+    """Persisted result of one ID batch."""
+
+    outcome: DiscoveryBatchOutcome
+    records: tuple[dict[str, object], ...]
+    found_count: int
+    unresolved: tuple[str, ...]
+    boundary_reached: bool = False
 
 
 @dataclass(frozen=True)
@@ -2139,6 +2149,7 @@ class Pipeline:
                 "range_discovery_phase": None,
                 "range_discovery_date_offset": 0,
                 "range_discovery_date_start": None,
+                "range_discovery_id_cursor": None,
                 "range_discovery_id_month": None,
                 "range_discovery_id_batch": 0,
                 "last_source_checkpoint": 0,
@@ -2274,7 +2285,7 @@ class Pipeline:
                     f"runtime grace boundary reached with {remaining:.1f}s remaining"
                 )
 
-    def _uses_cross_month_date_stream(self) -> bool:
+    def _uses_cross_month_range(self) -> bool:
         range_spec = self.loaded_input.range_spec
         return (
             range_spec is not None
@@ -2298,6 +2309,101 @@ class Pipeline:
                 current += 1
             selected.append(dict(record))
         return selected, current
+
+    def _process_discovery_id_batch(
+        self,
+        batch: list[str],
+        *,
+        found_count: int,
+        found_limit: int | None,
+        label: str,
+        latest: dict[str, str] | None = None,
+        stop_on_empty: bool = False,
+        trim_not_found_after_last_found: bool = False,
+    ) -> _ProcessedDiscoveryBatch:
+        """Discover, persist and report one ID batch consistently.
+
+        ``stop_on_empty`` is used by the first-month probe, where a successful
+        empty batch marks the month boundary. Other discovery paths persist
+        ``not_found`` records and continue through their explicit end ID.
+        """
+        self._check_resources()
+        batch_started = self.monotonic()
+        logger.info(
+            "Discovery ID batch started: label=%s size=%d range=%s..%s",
+            label,
+            len(batch),
+            batch[0] if batch else None,
+            batch[-1] if batch else None,
+        )
+        outcome = self._discover_with_fallback(batch)
+        raw_records = list(outcome.records)
+        found_in_batch = any(
+            record.get("status") == "found" for record in raw_records
+        )
+        unresolved_in_batch = [
+            str(record["arxiv_id"])
+            for record in raw_records
+            if record.get("status") not in self._DISCOVERY_TERMINAL
+        ]
+        boundary_reached = (
+            stop_on_empty and not found_in_batch and not unresolved_in_batch
+        )
+
+        records_to_persist = [] if boundary_reached else raw_records
+        if trim_not_found_after_last_found and not boundary_reached:
+            found_suffixes = [
+                int(str(record["arxiv_id"]).split(".", 1)[1])
+                for record in records_to_persist
+                if record.get("status") == "found"
+            ]
+            if found_suffixes:
+                last_found_id = max(found_suffixes)
+                records_to_persist = [
+                    record
+                    for record in records_to_persist
+                    if record.get("status") != "not_found"
+                    or int(str(record["arxiv_id"]).split(".", 1)[1])
+                    <= last_found_id
+                ]
+
+        records, found_count = self._select_found_limit_records(
+            records_to_persist, found_count, found_limit
+        )
+        self.discovery_journal.append(records)
+        if latest is not None:
+            for record in records:
+                latest[str(record["arxiv_id"])] = str(record["status"])
+        self._set_discovery_progress(found=found_count, status="running")
+        self._record_discovery_metrics(outcome)
+
+        unresolved = tuple(
+            str(record["arxiv_id"])
+            for record in records
+            if record.get("status") not in self._DISCOVERY_TERMINAL
+        )
+        status_counts: dict[str, int] = {}
+        for record in records:
+            status = str(record.get("status"))
+            status_counts[status] = status_counts.get(status, 0) + 1
+        logger.info(
+            "Discovery ID batch completed: label=%s statuses=%s found_total=%d elapsed=%.2fs api=%.2fs retries=%d http_429=%d http_503=%d",
+            label,
+            status_counts,
+            found_count,
+            max(0.0, self.monotonic() - batch_started),
+            outcome.api_time_seconds,
+            outcome.retry_count,
+            outcome.http_429_count,
+            outcome.http_503_count,
+        )
+        return _ProcessedDiscoveryBatch(
+            outcome=outcome,
+            records=tuple(records),
+            found_count=found_count,
+            unresolved=unresolved,
+            boundary_reached=boundary_reached,
+        )
 
     def _fetch_date_stream_page(
         self,
@@ -2403,13 +2509,11 @@ class Pipeline:
                 sleep_seconds += delay
         raise RuntimeError(f"date-stream request failed: {last_error}")
 
-    def _run_cross_month_date_stream(self) -> bool:
-        """Discover the first month by date, then later months by ID."""
+    def _run_cross_month_id_batches(self) -> bool:
+        """Discover the first month by ID probe, then later months by ID."""
         assert self.state is not None and self.discovery_journal is not None
         range_spec = self.loaded_input.range_spec
         assert range_spec is not None
-        from src.crawling import discovery
-
         state = self.state.snapshot()
         latest = _latest_discovery_statuses(self.discovery_path)
         found_count = sum(status == "found" for status in latest.values())
@@ -2423,32 +2527,36 @@ class Pipeline:
             else []
         )
         if retry_ids:
-            retry_outcome = self._discover_with_fallback(retry_ids)
-            retry_records, found_count = self._select_found_limit_records(
-                retry_outcome.records, found_count, found_limit
+            processed = self._process_discovery_id_batch(
+                retry_ids,
+                found_count=found_count,
+                found_limit=found_limit,
+                label="retry pending",
+                latest=latest,
             )
-            self.discovery_journal.append(retry_records)
-            self._set_discovery_progress(found=found_count, status="running")
-            self._record_discovery_metrics(retry_outcome)
-            unresolved = [
-                str(record["arxiv_id"])
-                for record in retry_records
-                if record.get("status") not in self._DISCOVERY_TERMINAL
-            ]
-            if unresolved:
+            found_count = processed.found_count
+            if processed.unresolved:
+                status = (
+                    "paused_rate_limit"
+                    if processed.outcome.paused_rate_limit
+                    else "discovery_incomplete"
+                )
                 self.state.update(
                     phase="discovery",
-                    status="discovery_incomplete",
+                    status=status,
                     discovery_complete=False,
-                    discovery_retry={"pending_ids": unresolved},
+                    discovery_retry={
+                        "pending_ids": list(processed.unresolved),
+                        "cooldown_until_epoch": processed.outcome.cooldown_until_epoch,
+                    },
                 )
                 self._checkpoint_summary(
-                    "discovery_incomplete", force=True, phase="discovery"
+                    status, force=True, phase="discovery"
                 )
                 return False
             self.state.update(discovery_retry={"pending_ids": []})
             latest = _latest_discovery_statuses(self.discovery_path)
-        phase = state.get("range_discovery_phase") or "month_1_date_stream"
+        phase = state.get("range_discovery_phase") or "month_1_id_probe"
         logger.info(
             "Discovery resume state: phase=%s date_offset=%s id_month=%s id_batch=%s found=%d limit=%s",
             phase,
@@ -2469,137 +2577,90 @@ class Pipeline:
 
         start_year, start_month, _ = _normalize_month(range_spec.start_month)
         end_year, end_month, _ = _normalize_month(range_spec.end_month)
-        if phase == "month_1_date_stream":
-            date_start = state.get("range_discovery_date_start")
-            if not isinstance(date_start, str) or not date_start:
-                date_start = discovery.find_start_timestamp_month_1(
-                    start_year, start_month, range_spec.start_id
-                )
-                self.state.update(range_discovery_date_start=date_start)
-            last_day = calendar.monthrange(start_year, start_month)[1]
-            query = f"submittedDate:[{date_start} TO {start_year}{start_month:02d}{last_day:02d}235959]"
-            offset = int(state.get("range_discovery_date_offset", 0))
-            page_number = offset // self.config.discovery_batch_size + 1
+        if phase in {"month_1_date_stream", "month_1_id_probe"}:
+            prefix = f"{start_year % 100:02d}{start_month:02d}"
+            cursor = int(
+                state.get("range_discovery_id_cursor") or range_spec.start_id
+            )
+            probe_batch = 0
             logger.info(
-                "Discovery date-stream started: query=%s offset=%d batch_size=%d",
-                query,
-                offset,
+                "Discovery ID probe started: prefix=%s cursor=%05d batch_size=%d",
+                prefix,
+                cursor,
                 self.config.discovery_batch_size,
             )
             while True:
-                self._check_resources()
-                remaining = (
-                    max(0, found_limit - found_count)
-                    if found_limit is not None
-                    else None
+                last_id = min(
+                    99999, cursor + self.config.discovery_batch_size - 1
                 )
-                page_started = self.monotonic()
-                logger.debug(
-                    "Discovery date page started: page=%d offset=%d remaining=%s",
-                    page_number,
-                    offset,
-                    remaining,
+                batch = [
+                    f"{prefix}.{number:05d}"
+                    for number in range(cursor, last_id + 1)
+                ]
+                probe_batch += 1
+                processed = self._process_discovery_id_batch(
+                    batch,
+                    found_count=found_count,
+                    found_limit=found_limit,
+                    label=(
+                        f"month={start_year:04d}-{start_month:02d} "
+                        f"phase=probe batch={probe_batch}"
+                    ),
+                    latest=latest,
+                    stop_on_empty=True,
+                    trim_not_found_after_last_found=True,
                 )
-                page, outcome = self._fetch_date_stream_page(
-                    query=query,
-                    offset=offset,
-                    target_yymm=f"{start_year % 100:02d}{start_month:02d}",
-                    min_id=range_spec.start_id,
-                    max_found=remaining,
-                )
-                page_elapsed = max(0.0, self.monotonic() - page_started)
-                self._record_discovery_metrics(outcome)
-                if page is None:
-                    logger.warning(
-                        "Discovery date page paused: page=%d offset=%d elapsed=%.2fs api=%.2fs retries=%d http_429=%d http_503=%d cooldown_until=%s",
-                        page_number,
-                        offset,
-                        page_elapsed,
-                        outcome.api_time_seconds,
-                        outcome.retry_count,
-                        outcome.http_429_count,
-                        outcome.http_503_count,
-                        outcome.cooldown_until_epoch,
+                found_count = processed.found_count
+                if processed.boundary_reached:
+                    logger.info(
+                        "Discovery ID probe exhausted: prefix=%s empty_batch=%s..%s found_total=%d; switching to next month",
+                        prefix,
+                        cursor,
+                        last_id,
+                        found_count,
                     )
-                    status = "paused_rate_limit" if outcome.paused_rate_limit else "discovery_incomplete"
+                    phase = "month_2_id_batch"
+                    next_month_index = start_year * 12 + start_month
+                    next_year, next_month_zero = divmod(next_month_index, 12)
+                    self.state.update(
+                        range_discovery_phase=phase,
+                        range_discovery_id_month=(
+                            f"{next_year:04d}-{next_month_zero + 1:02d}"
+                        ),
+                        range_discovery_id_batch=0,
+                        range_discovery_id_cursor=None,
+                    )
+                    break
+
+                if processed.unresolved:
                     self.state.update(
                         phase="discovery",
-                        status=status,
+                        status=(
+                            "paused_rate_limit"
+                            if processed.outcome.paused_rate_limit
+                            else "discovery_incomplete"
+                        ),
                         discovery_complete=False,
-                        range_discovery_phase="month_1_date_stream",
-                        range_discovery_date_offset=offset,
+                        range_discovery_phase="month_1_id_probe",
+                        range_discovery_id_cursor=cursor,
                         discovery_retry={
-                            "pending_ids": [],
-                            "cooldown_until_epoch": outcome.cooldown_until_epoch,
+                            "pending_ids": list(processed.unresolved),
+                            "cooldown_until_epoch": processed.outcome.cooldown_until_epoch,
                         },
                     )
-                    self._checkpoint_summary(status, force=True, phase="discovery")
+                    self._checkpoint_summary(
+                        str(self.state.snapshot()["status"]),
+                        force=True,
+                        phase="discovery",
+                    )
                     return False
 
-                found_papers = page.get("found_papers", [])
-                failed_ids = [str(value) for value in page.get("failed_ids", [])]
-                records: list[dict[str, object]] = []
-                for paper in found_papers:
-                    records.append(
-                        {
-                            "arxiv_id": str(paper["arxiv_id"]),
-                            "status": "found",
-                            "retryable": False,
-                            "attempts": 1,
-                            "metadata": dict(paper),
-                        }
-                    )
-                for arxiv_id in failed_ids:
-                    records.append(
-                        {
-                            "arxiv_id": arxiv_id,
-                            "status": "retryable_failed",
-                            "retryable": True,
-                            "error_type": "missing_revision_metadata",
-                            "attempts": 1,
-                            "error": "missing revision metadata",
-                        }
-                    )
-                self.discovery_journal.append(records)
-                for record in records:
-                    latest[str(record["arxiv_id"])] = str(record["status"])
-                found_count += len(found_papers)
-                self._set_discovery_progress(found=found_count, status="running")
-                offset = int(page["offset"])
-                status_counts: dict[str, int] = {}
-                for record in records:
-                    status = str(record.get("status"))
-                    status_counts[status] = status_counts.get(status, 0) + 1
-                logger.info(
-                    "Discovery date page completed: page=%d next_offset=%d raw=%d records=%d statuses=%s found_total=%d elapsed=%.2fs api=%.2fs retries=%d http_429=%d http_503=%d",
-                    page_number,
-                    offset,
-                    int(page["raw_count"]),
-                    len(records),
-                    status_counts,
-                    found_count,
-                    page_elapsed,
-                    outcome.api_time_seconds,
-                    outcome.retry_count,
-                    outcome.http_429_count,
-                    outcome.http_503_count,
-                )
                 self.state.update(
-                    range_discovery_date_offset=offset,
-                    range_discovery_phase="month_1_date_stream",
+                    range_discovery_phase="month_1_id_probe",
+                    range_discovery_id_cursor=last_id + 1,
+                    range_discovery_id_month=f"{start_year:04d}-{start_month:02d}",
                 )
                 self._checkpoint_summary("running", phase="discovery")
-                if failed_ids:
-                    self.state.update(
-                        phase="discovery",
-                        status="discovery_incomplete",
-                        discovery_complete=False,
-                        discovery_retry={"pending_ids": failed_ids},
-                    )
-                    self._checkpoint_summary(
-                        "discovery_incomplete", force=True, phase="discovery"
-                    )
-                    return False
                 if found_limit is not None and found_count >= found_limit:
                     self.state.update(
                         phase="downstream",
@@ -2609,13 +2670,8 @@ class Pipeline:
                     )
                     self._checkpoint_summary("running", force=True, phase="discovery")
                     return True
-                if int(page["raw_count"]) < self.config.discovery_batch_size:
-                    logger.info(
-                        "Discovery date-stream exhausted: page=%d raw=%d; switching to ID batches",
-                        page_number,
-                        int(page["raw_count"]),
-                    )
-                    phase = "remaining_id_batch"
+                if last_id >= 99999:
+                    phase = "month_2_id_batch"
                     next_month_index = start_year * 12 + start_month
                     next_year, next_month_zero = divmod(next_month_index, 12)
                     self.state.update(
@@ -2624,9 +2680,10 @@ class Pipeline:
                             f"{next_year:04d}-{next_month_zero + 1:02d}"
                         ),
                         range_discovery_id_batch=0,
+                        range_discovery_id_cursor=None,
                     )
                     break
-                page_number += 1
+                cursor = last_id + 1
 
         if phase in {"month_2_id_batch", "remaining_id_batch"}:
             start_index = start_year * 12 + start_month - 1
@@ -2654,47 +2711,41 @@ class Pipeline:
                 ):
                     if batch_index <= completed_batch:
                         continue
-                    self._check_resources()
-                    batch_started = self.monotonic()
-                    logger.debug(
-                        "Discovery ID batch started: month=%04d-%02d batch=%d size=%d range=%s..%s",
-                        year,
-                        month,
-                        batch_index,
-                        len(batch),
-                        batch[0],
-                        batch[-1],
+                    processed = self._process_discovery_id_batch(
+                        batch,
+                        found_count=found_count,
+                        found_limit=found_limit,
+                        label=(
+                            f"month={year:04d}-{month:02d} "
+                            f"phase=bounded batch={batch_index}"
+                        ),
+                        latest=latest,
                     )
-                    outcome = self._discover_with_fallback(batch)
-                    selected, found_count = self._select_found_limit_records(
-                        outcome.records, found_count, found_limit
-                    )
-                    self.discovery_journal.append(selected)
-                    self._set_discovery_progress(found=found_count, status="running")
+                    found_count = processed.found_count
                     self.state.update(
                         range_discovery_id_month=f"{year:04d}-{month:02d}",
                         range_discovery_id_batch=batch_index,
                         range_discovery_phase="remaining_id_batch",
                     )
-                    self._record_discovery_metrics(outcome)
-                    batch_elapsed = max(0.0, self.monotonic() - batch_started)
-                    status_counts: dict[str, int] = {}
-                    for record in selected:
-                        status = str(record.get("status"))
-                        status_counts[status] = status_counts.get(status, 0) + 1
-                    logger.info(
-                        "Discovery ID batch completed: month=%04d-%02d batch=%d statuses=%s found_total=%d elapsed=%.2fs api=%.2fs retries=%d http_429=%d http_503=%d",
-                        year,
-                        month,
-                        batch_index,
-                        status_counts,
-                        found_count,
-                        batch_elapsed,
-                        outcome.api_time_seconds,
-                        outcome.retry_count,
-                        outcome.http_429_count,
-                        outcome.http_503_count,
-                    )
+                    if processed.unresolved:
+                        status = (
+                            "paused_rate_limit"
+                            if processed.outcome.paused_rate_limit
+                            else "discovery_incomplete"
+                        )
+                        self.state.update(
+                            phase="discovery",
+                            status=status,
+                            discovery_complete=False,
+                            discovery_retry={
+                                "pending_ids": list(processed.unresolved),
+                                "cooldown_until_epoch": (
+                                    processed.outcome.cooldown_until_epoch
+                                ),
+                            },
+                        )
+                        self._checkpoint_summary(status, force=True, phase="discovery")
+                        return False
                     self._checkpoint_summary("running", phase="discovery")
                     if found_limit is not None and found_count >= found_limit:
                         break
@@ -2731,8 +2782,8 @@ class Pipeline:
             state_snapshot.get("phase"),
             state_snapshot.get("last_discovery_batch"),
         )
-        if self._uses_cross_month_date_stream():
-            return self._run_cross_month_date_stream()
+        if self._uses_cross_month_range():
+            return self._run_cross_month_id_batches()
 
         state = self.state.snapshot()
         retry_state = state.get("discovery_retry")
@@ -2763,40 +2814,25 @@ class Pipeline:
         next_batch = int(state.get("last_discovery_batch", 0)) + 1
         completed = True
         for batch in _chunks(pending_ids, self.config.discovery_batch_size):
-            self._check_resources()
-            batch_started = self.monotonic()
-            logger.info(
-                "Discovery batch %d started: %d candidate IDs range=%s..%s",
-                next_batch,
-                len(batch),
-                batch[0] if batch else None,
-                batch[-1] if batch else None,
+            processed = self._process_discovery_id_batch(
+                batch,
+                found_count=found_count,
+                found_limit=found_limit,
+                label=f"range batch={next_batch}",
+                latest=latest,
             )
-            outcome = self._discover_with_fallback(batch)
-            records, found_count = self._select_found_limit_records(
-                outcome.records, found_count, found_limit
-            )
-            self.discovery_journal.append(records)
-            self._set_discovery_progress(found=found_count, batch=next_batch, status="running")
-            for record in records:
-                latest[str(record["arxiv_id"])] = str(record["status"])
-            self._record_discovery_metrics(outcome)
-            unresolved = [
-                str(record["arxiv_id"])
-                for record in records
-                if record.get("status") not in self._DISCOVERY_TERMINAL
-            ]
-            if unresolved:
+            found_count = processed.found_count
+            if processed.unresolved:
                 logger.warning(
                     "Discovery batch %d incomplete: unresolved=%d paused_rate_limit=%s",
                     next_batch,
-                    len(unresolved),
-                    outcome.paused_rate_limit,
+                    len(processed.unresolved),
+                    processed.outcome.paused_rate_limit,
                 )
                 completed = False
                 status = (
                     "paused_rate_limit"
-                    if outcome.paused_rate_limit
+                    if processed.outcome.paused_rate_limit
                     else "discovery_incomplete"
                 )
                 self.state.update(
@@ -2804,16 +2840,16 @@ class Pipeline:
                     status=status,
                     discovery_complete=False,
                     discovery_retry={
-                        "pending_ids": unresolved,
+                        "pending_ids": list(processed.unresolved),
                         "last_error_type": next(
                             (
                                 record.get("error_type")
-                                for record in outcome.records
-                                if record.get("arxiv_id") in unresolved
+                                for record in processed.records
+                                if record.get("arxiv_id") in processed.unresolved
                             ),
                             None,
                         ),
-                        "cooldown_until_epoch": outcome.cooldown_until_epoch,
+                        "cooldown_until_epoch": processed.outcome.cooldown_until_epoch,
                     },
                 )
                 self._checkpoint_summary(status, force=True, phase="discovery")
@@ -2823,20 +2859,6 @@ class Pipeline:
                 discovery_retry={"pending_ids": []},
             )
             self._set_discovery_progress(found=found_count, batch=next_batch, status="running")
-            status_counts: dict[str, int] = {}
-            for record in records:
-                status = str(record.get("status"))
-                status_counts[status] = status_counts.get(status, 0) + 1
-            logger.info(
-                "Discovery batch %d completed: statuses=%s elapsed=%.2fs api=%.2fs retries=%d http_429=%d http_503=%d",
-                next_batch,
-                status_counts,
-                max(0.0, self.monotonic() - batch_started),
-                outcome.api_time_seconds,
-                outcome.retry_count,
-                outcome.http_429_count,
-                outcome.http_503_count,
-            )
             next_batch += 1
             self._checkpoint_summary("running", phase="discovery")
             if found_limit is not None and found_count >= found_limit:

@@ -4,7 +4,6 @@ import re
 import argparse
 import time
 import random
-import calendar
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 
 import arxiv
@@ -530,84 +529,91 @@ def discover_two_month_range_stream(
             state = raw_state
             state["input_params"] = args_params
 
-    # TRƯỜNG HỢP 2: Khác tháng liền kề -> Giai đoạn 1 (Date stream cho Tháng 1)
+    # TRƯỜNG HỢP 2: Khác tháng liền kề -> Giai đoạn 1 (ID probe cho Tháng 1)
     if is_two_months and state and state.get("current_phase") == "MONTH_1_DATE_STREAM":
         start_year = args_params["start_year"]
         start_month = args_params["start_month_num"]
         start_id = args_params["start_id"]
-
-        if not state.get("month_1_t_start_str"):
-            logger.info("Probing start timestamp for Month 1 (%02d/%d from ID %d)...", start_month, start_year, start_id)
-            t_start_str = find_start_timestamp_month_1(start_year, start_month, start_id)
-            state["month_1_t_start_str"] = t_start_str
-            if output_dir and files:
-                update_state_atomic(files["state"], state)
-        else:
-            t_start_str = state["month_1_t_start_str"]
-
-        last_day = calendar.monthrange(start_year, start_month)[1]
-        t_end_str = f"{start_year}{start_month:02d}{last_day:02d}235959"
-        query = f"submittedDate:[{t_start_str} TO {t_end_str}]"
-        
         target_yymm = f"{start_year % 100:02d}{start_month:02d}"
-        offset = state.get("month_1_offset", 0)
-
-        logger.info("Starting Month 1 Date Query Stream | Query: %s | Resume Offset: %d", query, offset)
-
+        cursor = state.get("month_1_offset") or start_id
+        logger.info(
+            "Starting Month 1 ID Probe | Prefix: %s | Cursor: %05d | Batch size: %d",
+            target_yymm,
+            cursor,
+            batch_size,
+        )
         while True:
             batch_start = time.perf_counter()
-            logger.info("PROCESSING Month 1 Date Stream | Query Offset: %d", offset)
-            
-            raw_papers = fetch_date_range_batch(query, offset=offset, batch_size=batch_size)
-            if not raw_papers:
-                logger.info("Month 1 Date Stream completed. Transitioning to Month 2.")
+            last_id = min(99999, cursor + batch_size - 1)
+            batch = [
+                f"{target_yymm}.{number:05d}"
+                for number in range(cursor, last_id + 1)
+            ]
+            logger.info(
+                "PROCESSING Month 1 ID Probe | Range: %s - %s | Size: %d",
+                batch[0],
+                batch[-1],
+                len(batch),
+            )
+
+            papers, failed_initial_ids = fetch_batch_with_subdivision(
+                batch, min_batch_size=min_subbatch_size
+            )
+            paper_map = {get_base_id(paper): paper for paper in papers}
+            returned_ids = set(paper_map)
+            batch_not_found = [
+                arxiv_id
+                for arxiv_id in batch
+                if arxiv_id not in returned_ids
+                and arxiv_id not in failed_initial_ids
+            ]
+            found_papers, batch_failed_ids = process_paper_batch_with_revisions(
+                paper_map,
+                failed_initial_ids=failed_initial_ids,
+                min_subbatch_size=min_subbatch_size,
+            )
+            elapsed = time.perf_counter() - batch_start
+
+            if not returned_ids and not failed_initial_ids:
+                logger.info(
+                    "Month 1 ID Probe completed at empty range %s - %s. Transitioning to Month 2.",
+                    batch[0],
+                    batch[-1],
+                )
                 state["current_phase"] = "MONTH_2_ID_BATCH"
                 if output_dir and files:
                     update_state_atomic(files["state"], state)
                 break
 
-            filtered_map = {}
-            for p in raw_papers:
-                base_id = get_base_id(p)
-                match = re.match(r"^(\d{4})\.(\d{5})$", base_id)
-                if match:
-                    yymm, num_val = match.group(1), int(match.group(2))
-                    if yymm == target_yymm and num_val >= start_id:
-                        filtered_map[base_id] = p
-
-            found_papers, batch_failed_ids = process_paper_batch_with_revisions(
-                filtered_map, failed_initial_ids=[], min_subbatch_size=min_subbatch_size
-            )
-
-            offset += len(raw_papers)
-            elapsed = time.perf_counter() - batch_start
-
             batch_result = {
-                "phase": "MONTH_1_DATE_STREAM",
-                "offset": offset,
+                "phase": "MONTH_1_ID_PROBE",
+                "requested_ids": batch,
                 "found_papers": found_papers,
                 "found_ids": [p["arxiv_id"] for p in found_papers],
-                "not_found_ids": [],
+                "not_found_ids": batch_not_found,
                 "failed_ids": batch_failed_ids
             }
 
             if output_dir and files and state:
                 append_jsonl(files["papers"], batch_result["found_papers"])
                 append_jsonl(files["failed"], [{"arxiv_id": i} for i in batch_result["failed_ids"]])
-                state["month_1_offset"] = offset
+                append_jsonl(files["not_found"], [{"arxiv_id": i} for i in batch_result["not_found_ids"]])
+                state["month_1_offset"] = last_id + 1
                 state["total_found"] += len(found_papers)
+                state["total_not_found"] += len(batch_not_found)
                 state["total_failed"] += len(batch_failed_ids)
                 update_state_atomic(files["state"], state)
 
             logger.debug("Month 1 stream batch completed | found=%d | elapsed=%.2fs", len(found_papers), elapsed)
             yield batch_result
 
-            if len(raw_papers) < batch_size:
-                logger.info("Reached end of Month 1 date results. Transitioning to Month 2.")
+            if last_id >= 99999:
+                logger.info("Month 1 ID Probe reached 99999. Transitioning to Month 2.")
                 state["current_phase"] = "MONTH_2_ID_BATCH"
                 if output_dir and files:
                     update_state_atomic(files["state"], state)
                 break
+            cursor = last_id + 1
 
     # TRƯỜNG HỢP 1 (Cùng tháng) HOẶC TRƯỜNG HỢP 2 GIAI ĐOẠN 2 (Tháng 2 quét ID từ 00001 -> end_id)
     if is_two_months:

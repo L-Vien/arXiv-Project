@@ -513,11 +513,7 @@ class TestDiscovery(unittest.TestCase):
 
             state = json.loads((Path(temp_dir) / "discovery_state.json").read_text())
 
-        date_fetch.assert_called_once_with(
-            "submittedDate:[20230101000000 TO 20230131235959]",
-            offset=0,
-            batch_size=10,
-        )
+        date_fetch.assert_not_called()
         self.assertEqual(len(batches), 1)
         self.assertEqual(batches[0]["requested_ids"], ["2302.00001"])
         self.assertEqual(state["current_phase"], "MONTH_2_ID_BATCH")
