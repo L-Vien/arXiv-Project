@@ -30,6 +30,10 @@ def paths(bundle) -> list[str]:
     return [f.relative_path for f in bundle.files]
 
 
+def tex_paths(bundle) -> list[str]:
+    return [f.relative_path for f in bundle.files if f.relative_path.lower().endswith(".tex")]
+
+
 # TC01
 def test_single_file(tmp_path):
     make(tmp_path, {"main.tex": DOC % "Hello."})
@@ -128,7 +132,7 @@ def test_non_tex_and_dynamic_includes_do_not_cause_partial(tmp_path):
     })
     b = gather_version(tmp_path, "2501.01234", 1)
     assert b.status == ProcessingStatus.OK
-    assert paths(b) == ["main.tex"]
+    assert paths(b) == ["main.tex", "refs.bbl"]  # .bbl được giữ, .pdf_tex bị bỏ
     assert "NON_TEX_INCLUDE_SKIPPED" in codes(b)
     assert "INCLUDE_SKIPPED_DYNAMIC" in codes(b)
     assert "MISSING_INCLUDE" not in codes(b)
@@ -268,6 +272,8 @@ def test_macosx_resource_forks_and_uppercase_extension(tmp_path):
 
 
 def test_symlink_pointing_outside_source_dir_is_ignored(tmp_path):
+    if os.name == "nt":  # tạo symlink trên Windows cần quyền admin
+        return
     src = tmp_path / "src"
     make(tmp_path, {"outside.tex": DOC % "secret"})
     make(src, {"main.tex": DOC % "Hi"})
@@ -292,3 +298,278 @@ def test_all_bundles_satisfy_contract_and_validation(tmp_path):
         b = gather_version(d, "2501.01234", 1)
         assert isinstance(b, SourceBundle)
         assert validate_source_bundle(b) == (), name
+
+
+# ----------------------------- .bib / .bbl ---------------------------------- #
+
+def bib_paths(bundle) -> list[str]:
+    return [
+        f.relative_path
+        for f in bundle.files
+        if f.relative_path.lower().endswith((".bib", ".bbl"))
+    ]
+
+
+def assert_contiguous_order(bundle) -> None:
+    assert [f.order for f in bundle.files] == list(range(len(bundle.files)))
+
+
+def test_bibliography_bib_is_collected_but_not_in_files(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\bibliographystyle{plain}\n\\bibliography{refs}",
+        "refs.bib": "@article{a, title={T}}",
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert b.status == ProcessingStatus.OK
+    assert paths(b) == ["main.tex", "refs.bib"]
+    assert [f.order for f in b.files] == [0, 1]
+    assert "@article" in b.files[1].content
+
+
+def test_bibliography_comma_list_subdir_and_extension(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\bibliography{refs, bib/more,extra.bib}",
+        "refs.bib": "@a{x}", "bib/more.bib": "@a{y}", "extra.bib": "@a{z}",
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert paths(b) == ["main.tex", "refs.bib", "bib/more.bib", "extra.bib"]
+    assert_contiguous_order(b)
+
+
+def test_bibliography_in_included_tex_file(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\input{back}",
+        "back.tex": "\\bibliography{refs}",
+        "refs.bib": "@a{x}",
+    })
+    assert bib_paths(gather_version(tmp_path, "2501.01234", 1)) == ["refs.bib"]
+
+
+def test_root_bbl_collected_when_bibliography_used(tmp_path):
+    make(tmp_path, {
+        "paper.tex": DOC % "\\bibliography{refs}",
+        "paper.bbl": "\\begin{thebibliography}{1}\\bibitem{a} A.\\end{thebibliography}",
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert bib_paths(b) == ["paper.bbl"]
+    # Chỉ có .bbl, không có refs.bib -> chỉ INFO, không phải WARNING
+    missing = [d for d in b.diagnostics if d.code == "MISSING_BIB_FILE"]
+    assert len(missing) == 1 and missing[0].severity.value == "info"
+    assert b.status == ProcessingStatus.OK
+
+
+def test_bib_and_bbl_both_collected(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\bibliography{refs}",
+        "refs.bib": "@a{x}", "main.bbl": "bbl",
+    })
+    assert bib_paths(gather_version(tmp_path, "2501.01234", 1)) == ["refs.bib", "main.bbl"]
+
+
+def test_stray_bbl_ignored_when_no_bibliography_command(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\begin{thebibliography}{1}\\bibitem{a} A.\\end{thebibliography}",
+        "main.bbl": "stale",
+        "unused.bib": "@a{x}",
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert bib_paths(b) == []
+
+
+def test_unreferenced_bib_is_ignored(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\bibliography{refs}",
+        "refs.bib": "@a{x}", "other.bib": "@a{y}",
+    })
+    assert bib_paths(gather_version(tmp_path, "2501.01234", 1)) == ["refs.bib"]
+
+
+def test_input_bbl_goes_to_bib_files(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\input{refs.bbl}",
+        "refs.bbl": "bbl",
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert paths(b) == ["main.tex", "refs.bbl"]
+    assert "NON_TEX_INCLUDE_SKIPPED" not in codes(b)
+
+
+def test_addbibresource_biblatex(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\addbibresource[location=local]{refs.bib}\n\\addbibresource{http://x.org/r.bib}\n\\printbibliography",
+        "refs.bib": "@a{x}",
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert bib_paths(b) == ["refs.bib"]
+    assert "BIB_RESOURCE_SKIPPED" in codes(b)
+
+
+def test_missing_bib_without_any_bbl_is_warning_but_status_ok(tmp_path):
+    make(tmp_path, {"main.tex": DOC % "\\bibliography{refs}"})
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert bib_paths(b) == []
+    d = [x for x in b.diagnostics if x.code == "MISSING_BIB_FILE"]
+    assert len(d) == 1 and d[0].severity.value == "warning" and d[0].line == 3
+    assert d[0].file_path == "main.tex"
+    # Thiếu bibliography và không còn nguồn tham khảo nào -> partial_parse
+    assert b.status == ProcessingStatus.PARTIAL_PARSE
+
+
+def test_bibliography_in_comment_or_verbatim_ignored(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "% \\bibliography{refs}\n\\begin{verbatim}\\bibliography{refs}\\end{verbatim}",
+        "refs.bib": "@a{x}",
+    })
+    assert bib_paths(gather_version(tmp_path, "2501.01234", 1)) == []
+
+
+def test_bib_case_insensitive_and_jobname(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\bibliography{Refs,\\jobname}",
+        "refs.bib": "@a{x}", "main.bib": "@a{y}",
+    })
+    assert bib_paths(gather_version(tmp_path, "2501.01234", 1)) == ["refs.bib", "main.bib"]
+
+
+def test_bib_latin1_decoded(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\bibliography{refs}",
+        "refs.bib": "@article{a, author={Ren\xe9}}".encode("latin-1"),
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert "René" in b.files[1].content
+    assert "ENCODING_FALLBACK" in codes(b)
+
+
+def test_bib_path_traversal(tmp_path):
+    src = tmp_path / "src"
+    make(tmp_path, {"outside.bib": "@a{x}"})
+    make(src, {"main.tex": DOC % "\\bibliography{../outside}"})
+    b = gather_version(src, "2501.01234", 1)
+    assert bib_paths(b) == []
+    assert "BIB_PATH_TRAVERSAL" in codes(b)
+    assert b.status == ProcessingStatus.PARTIAL_PARSE
+
+
+def test_bib_files_empty_for_versions_without_root(tmp_path):
+    make(tmp_path, {"refs.bib": "@a{x}"})
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert b.status == ProcessingStatus.EMPTY_NO_TEX and b.files == ()
+
+
+def test_bib_bundles_pass_validation_and_are_deterministic(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\bibliography{b,a}",
+        "a.bib": "@a{x}", "b.bib": "@a{y}", "main.bbl": "bbl",
+    })
+    b1 = gather_version(tmp_path, "2501.01234", 1)
+    assert validate_source_bundle(b1) == ()
+    assert b1 == gather_version(tmp_path, "2501.01234", 1)
+    assert paths(b1) == ["main.tex", "b.bib", "a.bib", "main.bbl"]
+    assert_contiguous_order(b1)
+
+
+def test_addbibresource_in_subdirectory(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\addbibresource{bib/refs.bib}",
+        "bib/refs.bib": "@a{x}",
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert paths(b) == ["main.tex", "bib/refs.bib"]
+    assert b.status == ProcessingStatus.OK
+
+
+def test_duplicate_bib_reference_added_once(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\input{a}\n\\bibliography{refs}",
+        "a.tex": "\\bibliography{refs}\n\\input{refs.bib}",
+        "refs.bib": "@a{x}",
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert bib_paths(b) == ["refs.bib"]
+    assert_contiguous_order(b)
+
+
+def test_tex_files_always_precede_bib_files(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\bibliography{refs}\n\\input{late}",
+        "late.tex": "Late.",
+        "refs.bib": "@a{x}",
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert paths(b) == ["main.tex", "late.tex", "refs.bib"]
+    assert_contiguous_order(b)
+
+
+# ------------------- canonical path (filesystem không phân biệt hoa/thường) ----
+
+def _make_case_insensitive(monkeypatch_target=None):
+    """Mô phỏng macOS/Windows: Path.is_file() khớp tên file không phân biệt hoa/thường."""
+    from pathlib import Path
+
+    original = Path.is_file
+
+    def fake_is_file(self):
+        if original(self):
+            return True
+        parent = self.parent
+        if not parent.is_dir():
+            return False
+        return any(c.name.lower() == self.name.lower() and original(c) for c in parent.iterdir())
+
+    return original, fake_is_file
+
+
+def test_canonical_path_restores_real_case(tmp_path):
+    from src.parsing.compilation_path import _canonical_path
+
+    make(tmp_path, {"Sections/intro.tex": "x"})
+    got = _canonical_path(tmp_path / "sections" / "Intro.tex", tmp_path)
+    assert got.relative_to(tmp_path.resolve()).as_posix() == "Sections/intro.tex"
+
+
+def test_include_returns_canonical_name_on_case_insensitive_fs(tmp_path):
+    from pathlib import Path
+
+    make(tmp_path, {
+        "main.tex": DOC % "\\input{Intro}\n\\input{SECTIONS/method}",
+        "intro.tex": "Intro.",
+        "sections/method.tex": "Method.",
+    })
+    original, fake = _make_case_insensitive()
+    Path.is_file = fake
+    try:
+        b = gather_version(tmp_path, "2501.01234", 1)
+    finally:
+        Path.is_file = original
+    assert paths(b) == ["main.tex", "intro.tex", "sections/method.tex"]
+    assert b.status == ProcessingStatus.OK
+
+
+def test_bib_returns_canonical_name_on_case_insensitive_fs(tmp_path):
+    from pathlib import Path
+
+    make(tmp_path, {"main.tex": DOC % "\\bibliography{REFS}", "refs.bib": "@a{x}"})
+    original, fake = _make_case_insensitive()
+    Path.is_file = fake
+    try:
+        b = gather_version(tmp_path, "2501.01234", 1)
+    finally:
+        Path.is_file = original
+    assert paths(b) == ["main.tex", "refs.bib"]
+
+
+def test_case_variants_of_same_file_are_not_duplicated(tmp_path):
+    from pathlib import Path
+
+    make(tmp_path, {
+        "main.tex": DOC % "\\input{intro}\n\\input{Intro}",
+        "intro.tex": "Intro.",
+    })
+    original, fake = _make_case_insensitive()
+    Path.is_file = fake
+    try:
+        b = gather_version(tmp_path, "2501.01234", 1)
+    finally:
+        Path.is_file = original
+    assert paths(b) == ["main.tex", "intro.tex"]

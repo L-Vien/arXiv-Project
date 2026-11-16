@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
@@ -33,6 +34,17 @@ MASKED_ENV_PATTERN = re.compile(
     re.DOTALL,
 )
 
+BIB_EXTS = frozenset({".bib", ".bbl"})
+
+# \bibliography{a,b}  (BibTeX)  -- không khớp \bibliographystyle
+BIBLIOGRAPHY_PATTERN = re.compile(r"\\bibliography\s*\{([^{}]*)\}")
+# \addbibresource[opts]{a.bib}  (biblatex)
+ADDBIB_PATTERN = re.compile(
+    r"\\(?:addbibresource|addglobalbib|addsectionbib)\s*(?:\[[^\]]*\])?\s*\{([^{}]+)\}"
+)
+# \printbibliography / \bibliography -> LaTeX sẽ đọc file .bbl
+PRINTBIB_PATTERN = re.compile(r"\\printbibliography\b")
+
 # Include các file này không phải TeX source -> bỏ qua, không báo MISSING_INCLUDE.
 NON_TEX_EXTS = {
     ".bbl", ".bib", ".sty", ".cls", ".def", ".cfg",
@@ -41,10 +53,34 @@ NON_TEX_EXTS = {
 }
 
 # Chỉ những diagnostic này mới làm mất nội dung -> status = partial_parse.
-DEGRADING_CODES = frozenset({"MISSING_INCLUDE", "FILE_READ_ERROR", "PATH_TRAVERSAL"})
+DEGRADING_CODES = frozenset(
+    {
+        "MISSING_INCLUDE",
+        "FILE_READ_ERROR",
+        "PATH_TRAVERSAL",
+        "BIB_FILE_READ_ERROR",
+        "BIB_PATH_TRAVERSAL",
+    }
+)
+
+
+def _is_degrading(diagnostic: Diagnostic) -> bool:
+    """Diagnostic này có làm mất dữ liệu (=> status partial_parse) không?
+
+    MISSING_BIB_FILE chỉ tính là mất dữ liệu khi mức WARNING, tức là không còn nguồn
+    tham khảo nào khác (.bib/.bbl) cho version đó.
+    """
+    if diagnostic.code in DEGRADING_CODES:
+        return True
+    return (
+        diagnostic.code == "MISSING_BIB_FILE"
+        and diagnostic.severity is DiagnosticSeverity.WARNING
+    )
+
 
 __all__ = [
     "BEGIN_DOCUMENT_PATTERN",
+    "BIB_EXTS",
     "DEGRADING_CODES",
     "DOCUMENTCLASS_PATTERN",
     "INCLUDE_PATTERN",
@@ -55,12 +91,16 @@ __all__ = [
     "SourceBundle",
     "SourceFile",
     "_classify_target",
+    "_canonical_path",
+    "_collect_bibliography",
     "_collect_files",
     "_find_root_file",
+    "_iter_files",
     "_iter_tex_files",
     "_read_text",
     "_remove_comments",
     "_resolve_include",
+    "_resolve_resource",
     "gather_version",
 ]
 
@@ -138,12 +178,16 @@ def _read_text(path: Path) -> tuple[str, str]:
     return data.decode("latin-1"), "latin-1"
 
 
-def _iter_tex_files(base_dir: Path) -> list[Path]:
-    """Liệt kê mọi file .tex (không phân biệt hoa/thường), bỏ rác của macOS."""
+def _iter_files(base_dir: Path, suffixes: frozenset[str] | set[str]) -> list[Path]:
+    """Liệt kê file có đuôi thuộc `suffixes` (không phân biệt hoa/thường), bỏ rác macOS.
+
+    Bỏ qua symlink trỏ ra ngoài base_dir (relative_path sẽ thành đường dẫn tuyệt đối,
+    vi phạm SourceFile contract).
+    """
     found: list[Path] = []
     resolved_base = base_dir.resolve(strict=False)
     for p in base_dir.rglob("*"):
-        if p.suffix.lower() != ".tex":
+        if p.suffix.lower() not in suffixes:
             continue
         if p.name.startswith("._"):
             continue
@@ -155,12 +199,45 @@ def _iter_tex_files(base_dir: Path) -> list[Path]:
             continue
         if not p.is_file():
             continue
-        # Symlink trỏ ra ngoài thư mục nguồn -> relative_path sẽ là đường dẫn tuyệt đối,
-        # vi phạm SourceFile contract. Bỏ qua.
         if not p.resolve(strict=False).is_relative_to(resolved_base):
             continue
         found.append(p)
     return found
+
+
+def _iter_tex_files(base_dir: Path) -> list[Path]:
+    """Liệt kê mọi file .tex."""
+    return _iter_files(base_dir, {".tex"})
+
+
+def _canonical_path(path: Path, root: Path) -> Path:
+    """Trả về đường dẫn với chữ hoa/thường đúng như tên thật trên đĩa.
+
+    Trên filesystem không phân biệt hoa/thường (macOS, Windows), `\\input{Intro}` mở được
+    `intro.tex` nên `Path.resolve()` giữ nguyên tên "Intro.tex" -> relative_path sai.
+    Hàm này đi từng thành phần dưới `root` và thay bằng tên thật.
+    """
+    root = root.resolve(strict=False)
+    try:
+        rel = path.resolve(strict=False).relative_to(root)
+    except ValueError:
+        return path
+
+    current = root
+    for part in rel.parts:
+        try:
+            names = [entry.name for entry in os.scandir(current)]
+        except OSError:
+            return path
+        if part in names:
+            actual = part
+        else:
+            matches = sorted(n for n in names if n.lower() == part.lower())
+            if not matches:
+                return path
+            actual = matches[0]
+        current = current / actual
+    return current
 
 
 def _classify_target(target: str) -> str:
@@ -236,6 +313,8 @@ def _resolve_include(
             if resolved_root is not None and not attempt.is_relative_to(resolved_root):
                 continue
             if attempt.is_file():
+                if resolved_root is not None:
+                    return _canonical_path(attempt, resolved_root)
                 return attempt
 
     # Fallback: sai hoa/thường (\input{Intro} nhưng file là intro.tex).
@@ -250,6 +329,38 @@ def _resolve_include(
                 if resolved_root is None or resolved.is_relative_to(resolved_root):
                     return resolved
 
+    return None
+
+
+def _resolve_resource(
+    current_file: Path,
+    target: str,
+    default_suffix: str,
+    source_dir: Path,
+    root_dir: Path | None = None,
+) -> Path | None:
+    """Resolve file tài nguyên (.bib/.bbl); thêm default_suffix nếu thiếu đuôi."""
+    t = target.strip().strip('"')
+    if not t or Path(t).is_absolute():
+        return None
+
+    resolved_root = source_dir.resolve(strict=False)
+    bases = _candidate_bases(current_file, source_dir, root_dir)
+    names = [t] if t.lower().endswith(tuple(BIB_EXTS)) else [t + default_suffix, t]
+
+    for base in bases:
+        for name in names:
+            candidate = (base / name).resolve(strict=False)
+            if candidate.is_relative_to(resolved_root) and candidate.is_file():
+                return _canonical_path(candidate, resolved_root)
+
+    wants = {posixpath.normpath(n.replace("\\", "/")).lower() for n in names}
+    for base in bases:
+        if not base.is_dir():
+            continue
+        for p in sorted(_iter_files(base, BIB_EXTS)):
+            if p.relative_to(base).as_posix().lower() in wants:
+                return p.resolve(strict=False)
     return None
 
 
@@ -453,6 +564,11 @@ def _collect_files(
                 continue
 
             kind = _classify_target(include_target)
+            if (
+                kind == "non_tex"
+                and PurePosixPath(include_target).suffix.lower() in BIB_EXTS
+            ):
+                continue  # .bib/.bbl được xử lý bởi _collect_bibliography
             if kind != "tex":
                 diagnostics.append(
                     Diagnostic(
@@ -508,6 +624,159 @@ def _collect_files(
 
     visit(root_resolved)
     return order, diagnostics, root_read_failed
+
+
+# --------------------------------------------------------------------------- #
+# Bibliography collection (.bib / .bbl)
+# --------------------------------------------------------------------------- #
+
+def _collect_bibliography(
+    root_file: Path,
+    source_dir: Path,
+    tex_files: list[SourceFile],
+    start_order: int = 0,
+) -> tuple[list[SourceFile], list[Diagnostic]]:
+    r"""Thu thập .bib/.bbl mà compilation path thực sự tham chiếu.
+
+    `start_order` là `order` của file đầu tiên (nối tiếp sau các file .tex để
+    `SourceBundle.files` có order liên tục 0..n-1).
+
+    Nguồn tham chiếu (đã bỏ comment/verbatim):
+    - \bibliography{a,b}              -> a.bib, b.bib   (\jobname = tên file root)
+    - \addbibresource[..]{a.bib}      -> a.bib          (biblatex)
+    - \input{x.bbl} / \input{x.bib}  -> chính file đó
+    - <root>.bbl nếu có \bibliography hoặc \printbibliography (file BibTeX sinh ra,
+      LaTeX tự đọc nó)
+    .bib/.bbl không được tham chiếu thì bị bỏ qua, giống file .tex dư thừa.
+    """
+    diagnostics: list[Diagnostic] = []
+    bib_files: list[SourceFile] = []
+    added: set[Path] = set()
+
+    resolved_source = source_dir.resolve(strict=False)
+    root_resolved = root_file.resolve(strict=False)
+    root_dir = root_resolved.parent
+    stem = root_resolved.stem
+
+    # (target, default_suffix, tex SourceFile, line)
+    requests: list[tuple[str, str, SourceFile, int]] = []
+    uses_bibtex = False
+
+    for sf in tex_files:
+        stripped = _strip_for_scan(sf.content)
+        found: list[tuple[int, str, str]] = []
+
+        for m in BIBLIOGRAPHY_PATTERN.finditer(stripped):
+            uses_bibtex = True
+            for name in m.group(1).split(","):
+                if name.strip():
+                    found.append((m.start(), name.strip(), ".bib"))
+        for m in ADDBIB_PATTERN.finditer(stripped):
+            uses_bibtex = True
+            found.append((m.start(), m.group(1).strip(), ".bib"))
+        if PRINTBIB_PATTERN.search(stripped):
+            uses_bibtex = True
+        inputs = [(m.start(), m.group(1)) for m in INCLUDE_PATTERN.finditer(stripped)]
+        inputs += [(m.start(), m.group(1)) for m in BARE_INPUT_PATTERN.finditer(stripped)]
+        for start, raw in inputs:
+            t = raw.strip().strip('"')
+            suffix = PurePosixPath(t).suffix.lower()
+            if suffix in BIB_EXTS:
+                found.append((start, t, suffix))
+
+        found.sort(key=lambda item: item[0])
+        for start, target, suffix in found:
+            requests.append((target, suffix, sf, stripped[:start].count("\n") + 1))
+
+    missing: list[tuple[str, SourceFile, int]] = []
+
+    def add(path: Path) -> None:
+        if path in added:
+            return
+        rel = _to_relative_posix(path, resolved_source)
+        try:
+            text, encoding = _read_text(path)
+        except OSError as exc:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    code="BIB_FILE_READ_ERROR",
+                    message=f"Could not read bibliography file: {exc}",
+                    file_path=rel,
+                )
+            )
+            added.add(path)
+            return
+        added.add(path)
+        if encoding != "utf-8":
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.INFO,
+                    code="ENCODING_FALLBACK",
+                    message=f"File is not valid UTF-8; decoded as {encoding}",
+                    file_path=rel,
+                )
+            )
+        bib_files.append(
+            SourceFile(relative_path=rel, content=text, order=start_order + len(bib_files))
+        )
+
+    for target, suffix, sf, line in requests:
+        target = target.replace("\\jobname", stem)
+        if "://" in target or any(ch in target for ch in "#\\$"):
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.INFO,
+                    code="BIB_RESOURCE_SKIPPED",
+                    message=f"Skipped dynamic or remote bibliography target: {target}",
+                    file_path=sf.relative_path,
+                    line=line,
+                )
+            )
+            continue
+
+        current = resolved_source / sf.relative_path
+        if _is_escaping_source_dir(current, target, resolved_source, root_dir):
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    code="BIB_PATH_TRAVERSAL",
+                    message=f"Bibliography target escapes source directory: {target}",
+                    file_path=sf.relative_path,
+                    line=line,
+                )
+            )
+            continue
+
+        path = _resolve_resource(current, target, suffix, resolved_source, root_dir)
+        if path is None:
+            missing.append((target, sf, line))
+        else:
+            add(path)
+
+    # File .bbl do BibTeX sinh ra: LaTeX chỉ đọc nó khi có \bibliography/\printbibliography.
+    if uses_bibtex:
+        bbl = _resolve_resource(
+            root_resolved, f"{stem}.bbl", ".bbl", resolved_source, root_dir
+        )
+        if bbl is not None:
+            add(bbl)
+
+    for target, sf, line in missing:
+        diagnostics.append(
+            Diagnostic(
+                # Còn dữ liệu tham khảo từ file khác -> chỉ là thông tin.
+                severity=(
+                    DiagnosticSeverity.INFO if bib_files else DiagnosticSeverity.WARNING
+                ),
+                code="MISSING_BIB_FILE",
+                message=f"Bibliography file was not found: {target}",
+                file_path=sf.relative_path,
+                line=line,
+            )
+        )
+
+    return bib_files, diagnostics
 
 
 # --------------------------------------------------------------------------- #
@@ -619,9 +888,15 @@ def gather_version(
             diagnostics=all_diagnostics,
         )
 
+    # .bib/.bbl được tham chiếu nằm chung trong `files`, đứng sau các file .tex.
+    bib_files, bib_diagnostics = _collect_bibliography(
+        root_file, source_dir, files, start_order=len(files)
+    )
+    all_diagnostics = (*all_diagnostics, *bib_diagnostics)
+
     status = (
         ProcessingStatus.PARTIAL_PARSE
-        if any(d.code in DEGRADING_CODES for d in all_diagnostics)
+        if any(_is_degrading(d) for d in all_diagnostics)
         else ProcessingStatus.OK
     )
     return SourceBundle(
@@ -629,6 +904,6 @@ def gather_version(
         version=version,
         status=status,
         root_file=rel_root,
-        files=tuple(files),
+        files=(*files, *bib_files),
         diagnostics=all_diagnostics,
     )
