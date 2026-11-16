@@ -13,6 +13,7 @@ from typing import Mapping, Sequence, Tuple, List, Dict, Set, Optional, Any
 from src.parsing.contracts import (
     BibEntry,
     Diagnostic,
+    DiagnosticSeverity,
     ProcessingStatus,
     ReferenceBundle,
     SourceBundle,
@@ -24,12 +25,37 @@ def _normalize_text(text: str) -> str:
     if not text:
         return ""
     text = text.lower()
+    text = re.sub(r"[^\w\s]", "", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
+def _clean_latex_accents(text: str) -> str:
+    """Clean LaTeX accent commands and braces into clean unicode characters."""
+    if not text:
+        return ""
+    # Unpack braces in commands like {\'n} -> \'n or {\'e} -> \'e
+    text = re.sub(r"\\([\\`^~\"vvcstudb])\{([a-zA-Z])\}", r"\\\1\2", text)
+
+    accent_map = {
+        "\\'a": "á", "\\`a": "à", "\\'e": "é", "\\`e": "è", "\\'i": "í", "\\`i": "ì",
+        "\\'o": "ó", "\\`o": "ò", "\\'u": "ú", "\\`u": "ù", "\\'n": "ń", "\\'y": "ý",
+        '\\"a': "ä", '\\"e': "ë", '\\"i': "ï", '\\"o': "ö", '\\"u': "ü", '\\"y': "ÿ",
+        '\\^a': "â", '\\^e': "ê", '\\^i': "î", '\\^o': "ô", '\\^u': "û",
+        '\\~a': "ã", '\\~n': "ñ", '\\~o': "õ",
+    }
+    for pat, rep in accent_map.items():
+        text = text.replace(pat, rep)
+
+    text = re.sub(r"\\v\{([a-zA-Z])\}", lambda m: {"c": "č", "s": "š", "z": "ž", "C": "Č", "S": "Š", "Z": "Ž"}.get(m.group(1), m.group(1)), text)
+    text = re.sub(r"\\c\{([a-zA-Z])\}", lambda m: {"c": "ç", "C": "Ç"}.get(m.group(1), m.group(1)), text)
+    text = re.sub(r"\\[a-zA-Z]+\{([a-zA-Z])\}", lambda m: m.group(1), text)
+    text = re.sub(r"[{}]", "", text)
+    return text
+
+
 def _clean_field_value(val: str) -> str:
-    """Clean field value: remove comments, unwrap braces/quotes, normalize whitespace."""
+    """Clean field value: remove comments, unwrap braces/quotes, normalize whitespace, clean accents."""
     if not val:
         return ""
     val = val.strip()
@@ -40,8 +66,17 @@ def _clean_field_value(val: str) -> str:
     for line in val.splitlines():
         p = -1
         i = 0
+        in_quote = False
+        escape = False
         while i < len(line):
-            if line[i] == '%' and (i == 0 or line[i-1] != '\\'):
+            c = line[i]
+            if escape:
+                escape = False
+            elif c == '\\':
+                escape = True
+            elif c == '"':
+                in_quote = not in_quote
+            elif c == '%' and not in_quote and (i == 0 or line[i-1] != '\\'):
                 p = i
                 break
             i += 1
@@ -55,7 +90,9 @@ def _clean_field_value(val: str) -> str:
                 line = before
         cleaned_lines.append(line)
     val = "\n".join(cleaned_lines)
-    val = re.sub(r"[{}]", "", val)
+    if (val.startswith("{") and val.endswith("}")) or (val.startswith('"') and val.endswith('"')):
+        val = val[1:-1].strip()
+    val = _clean_latex_accents(val)
     val = re.sub(r"\s+", " ", val).strip()
     return val
 
@@ -64,26 +101,77 @@ def _parse_authors(author_str: str) -> Tuple[str, ...]:
     """Parse author string separated by 'and', '\\and', ';', or commas into a tuple of author names."""
     if not author_str:
         return ()
-    author_str = _clean_field_value(author_str)
-    author_str = re.sub(r"\\and\b", "and", author_str, flags=re.IGNORECASE)
-    parts = re.split(r"\s+and\s+|;", author_str, flags=re.IGNORECASE)
+    cleaned = _clean_field_value(author_str)
+    cleaned = re.sub(r"\\and\b", "and", cleaned, flags=re.IGNORECASE)
+
+    parts = []
+    current = []
+    brace_depth = 0
+    in_quote = False
+    escape = False
+    i = 0
+    n = len(cleaned)
+    while i < n:
+        c = cleaned[i]
+        if escape:
+            current.append(c)
+            escape = False
+        elif c == '\\':
+            escape = True
+            current.append(c)
+        elif c == '"' and not escape:
+            in_quote = not in_quote
+            current.append(c)
+        elif c == '{' and not in_quote:
+            brace_depth += 1
+            current.append(c)
+        elif c == '}' and not in_quote:
+            if brace_depth > 0:
+                brace_depth -= 1
+            current.append(c)
+        elif c == ';' and brace_depth == 0 and not in_quote:
+            parts.append("".join(current))
+            current = []
+        elif brace_depth == 0 and not in_quote and cleaned[i:i+3].lower() == 'and':
+            is_start = (i == 0 or not cleaned[i-1].isalnum())
+            is_end = (i + 3 >= n or not cleaned[i+3].isalnum())
+            if is_start and is_end:
+                parts.append("".join(current))
+                current = []
+                i += 2
+            else:
+                current.append(c)
+        else:
+            current.append(c)
+        i += 1
+    if current:
+        parts.append("".join(current))
 
     authors = []
     for p in parts:
         p = p.strip()
-        p = re.sub(r"[\{\}\"']", "", p)
+        if (p.startswith("{") and p.endswith("}")) or (p.startswith('"') and p.endswith('"')):
+            p = p[1:-1].strip()
+        p = _clean_latex_accents(p)
         p = re.sub(r"\s+", " ", p).strip()
-        if p:
+        if p and p.lower() != "others":
             authors.append(p)
     return tuple(authors)
 
 
 def _extract_url(field_dict: Dict[str, str]) -> str:
-    """Extract URL from url field, howpublished, note, or eprint."""
+    """Extract URL from url field, howpublished, note, eprint, archiveprefix, \\url{}, \\href{}."""
     url = field_dict.get("url", "")
     if not url:
-        for key in ("howpublished", "note", "eprint", "archiveprefix"):
+        for key in ("howpublished", "note", "eprint", "archiveprefix", "doi"):
             text = field_dict.get(key, "")
+            if key == "doi" and text and not text.startswith("http"):
+                url = f"https://doi.org/{text}"
+                break
+            href_match = re.search(r"\\href\{([^}]+)\}\{([^}]+)\}", text)
+            if href_match:
+                url = href_match.group(1)
+                break
             url_match = re.search(r"\\url\{([^}]+)\}", text)
             if url_match:
                 url = url_match.group(1)
@@ -95,7 +183,56 @@ def _extract_url(field_dict: Dict[str, str]) -> str:
     return _clean_field_value(url)
 
 
-def _parse_bib_content(content: str) -> List[BibEntry]:
+def _parse_bib_fields(fields_text: str) -> Dict[str, str]:
+    """Parse field_name = value pairs from fields text by splitting at comma level 0."""
+    fields = {}
+    parts = []
+    current = []
+    brace_depth = 0
+    in_quote = False
+    escape = False
+    i = 0
+    n = len(fields_text)
+    while i < n:
+        c = fields_text[i]
+        if escape:
+            current.append(c)
+            escape = False
+        elif c == '\\':
+            escape = True
+            current.append(c)
+        elif c == '"' and not escape:
+            in_quote = not in_quote
+            current.append(c)
+        elif c == '{' and not in_quote:
+            brace_depth += 1
+            current.append(c)
+        elif c == '}' and not in_quote:
+            if brace_depth > 0:
+                brace_depth -= 1
+            current.append(c)
+        elif c == ',' and brace_depth == 0 and not in_quote:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(c)
+        i += 1
+    if current:
+        parts.append("".join(current))
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        eq_idx = part.find('=')
+        if eq_idx != -1:
+            f_name = part[:eq_idx].strip().lower()
+            f_val = part[eq_idx+1:].strip()
+            fields[f_name] = f_val
+    return fields
+
+
+def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnostic]) -> List[BibEntry]:
     """Parse BibTeX format content into BibEntry objects robustly."""
     entries: List[BibEntry] = []
 
@@ -161,11 +298,21 @@ def _parse_bib_content(content: str) -> List[BibEntry]:
                 journal = _clean_field_value(field_dict.get("journal", "") or field_dict.get("booktitle", "") or field_dict.get("journaltitle", ""))
                 url = _extract_url(field_dict)
 
+                if not citation_key or (not title and not authors and not doi):
+                    diagnostics.append(
+                        Diagnostic(
+                            severity=DiagnosticSeverity.WARNING,
+                            code="BIBTEX_PARTIAL",
+                            message="Could not fully parse bibliography entry",
+                            file_path=file_path,
+                        )
+                    )
+
                 if citation_key:
                     entries.append(
                         BibEntry(
                             citation_key=citation_key,
-                            entry_type=entry_type,
+                            entry_type=entry_type or "misc",
                             title=title,
                             authors=authors,
                             year=year,
@@ -181,44 +328,7 @@ def _parse_bib_content(content: str) -> List[BibEntry]:
     return entries
 
 
-def _parse_bib_fields(fields_text: str) -> Dict[str, str]:
-    """Parse field_name = value pairs from fields text by splitting at comma level 0."""
-    fields = {}
-    parts = []
-    current_part = []
-    brace_depth = 0
-    i = 0
-    n = len(fields_text)
-    while i < n:
-        c = fields_text[i]
-        if c == '{' and (i == 0 or fields_text[i-1] != '\\'):
-            brace_depth += 1
-            current_part.append(c)
-        elif c == '}' and (i == 0 or fields_text[i-1] != '\\'):
-            brace_depth -= 1
-            current_part.append(c)
-        elif c == ',' and brace_depth == 0:
-            parts.append("".join(current_part))
-            current_part = []
-        else:
-            current_part.append(c)
-        i += 1
-    if current_part:
-        parts.append("".join(current_part))
-
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        eq_idx = part.find('=')
-        if eq_idx != -1:
-            f_name = part[:eq_idx].strip().lower()
-            f_val = part[eq_idx+1:].strip()
-            fields[f_name] = f_val
-    return fields
-
-
-def _parse_bibitem_content(content: str) -> List[BibEntry]:
+def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagnostic]) -> List[BibEntry]:
     """Parse \\bibitem entries from TeX or BBL files."""
     entries: List[BibEntry] = []
     bibitem_pattern = re.compile(
@@ -230,17 +340,34 @@ def _parse_bibitem_content(content: str) -> List[BibEntry]:
         citation_key = match.group(1).strip()
         item_text = match.group(2).strip()
 
-        cleaned_text = re.sub(r"\\[a-zA-Z]+(?:\[.*?\])?(?:\{.*?\})?", " ", item_text)
-        cleaned_text = re.sub(r"[{}]", "", cleaned_text)
-        cleaned_text = re.sub(r"\s+", " ", cleaned_text)
-
+        year_match = re.search(r"\b(19\d{2}|20\d{2})\b", item_text)
         year: Optional[int] = None
-        year_match = re.search(r"\b(19\d{2}|20\d{2})\b", cleaned_text)
         if year_match:
             try:
                 year = int(year_match.group(1))
             except ValueError:
                 pass
+            before_year = item_text[:year_match.start()]
+        else:
+            before_year = item_text
+
+        authors: Tuple[str, ...] = ()
+        if before_year:
+            cleaned_before = re.sub(r"\\[a-zA-Z]+(?:\[.*?\])?(?:\{.*?\})?", " ", before_year)
+            cleaned_before = _clean_latex_accents(cleaned_before)
+            parts = re.split(r"\.\s+|\,\s+|\bby\b|\band\b", cleaned_before, flags=re.IGNORECASE)
+            if parts and len(parts) > 1:
+                potential_authors = []
+                for p in parts[:2]:
+                    p = p.strip()
+                    if p and len(p.split()) < 6 and any(char.isupper() for char in p):
+                        potential_authors.append(p)
+                if potential_authors:
+                    authors = tuple(potential_authors)
+
+        cleaned_text = re.sub(r"\\[a-zA-Z]+(?:\[.*?\])?(?:\{.*?\})?", " ", item_text)
+        cleaned_text = _clean_latex_accents(cleaned_text)
+        cleaned_text = re.sub(r"\s+", " ", cleaned_text)
 
         doi_match = re.search(r"(?:doi[:\s]*)(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", cleaned_text, re.IGNORECASE)
         doi = doi_match.group(1) if doi_match else ""
@@ -250,12 +377,22 @@ def _parse_bibitem_content(content: str) -> List[BibEntry]:
 
         title = cleaned_text[:100].strip()
 
+        if not citation_key or not title:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    code="BIBTEX_PARTIAL",
+                    message="Could not fully parse bibliography entry",
+                    file_path=file_path,
+                )
+            )
+
         entries.append(
             BibEntry(
                 citation_key=citation_key,
                 entry_type="misc",
                 title=title,
-                authors=(),
+                authors=authors,
                 year=year,
                 doi=doi,
                 journal="",
@@ -282,23 +419,29 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
         v_entries: List[BibEntry] = []
         for file_obj in source.files:
             path_lower = file_obj.relative_path.lower()
-            if path_lower.endswith(".bib") or path_lower.endswith(".bbl"):
-                v_entries.extend(_parse_bib_content(file_obj.content))
+            if path_lower.endswith(".bib"):
+                v_entries.extend(_parse_bib_content(file_obj.content, file_obj.relative_path, diagnostics))
+            elif path_lower.endswith(".bbl"):
+                v_entries.extend(_parse_bibitem_content(file_obj.content, file_obj.relative_path, diagnostics))
             elif path_lower.endswith(".tex"):
-                v_entries.extend(_parse_bibitem_content(file_obj.content))
+                v_entries.extend(_parse_bibitem_content(file_obj.content, file_obj.relative_path, diagnostics))
         version_raw_entries[source.version] = v_entries
 
     group_map: Dict[str, List[Tuple[int, BibEntry]]] = {}
+    ungrouped_counter = 0
 
     for v_num, entries in version_raw_entries.items():
         for entry in entries:
             g_key = ""
             if entry.doi:
-                g_key = f"doi:{entry.doi.lower()}"
-            elif entry.title and entry.year:
-                g_key = f"t_y:{_normalize_text(entry.title)[:50]}_{entry.year}"
+                g_key = f"doi:{entry.doi.lower().strip()}"
+            elif entry.title and entry.authors and entry.year:
+                norm_title = _normalize_text(entry.title)
+                norm_authors = "_".join(sorted(_normalize_text(a) for a in entry.authors))
+                g_key = f"t_a_y:{norm_title}|{norm_authors}|{entry.year}"
             else:
-                g_key = f"key:{entry.citation_key.lower()}"
+                ungrouped_counter += 1
+                g_key = f"unique:{v_num}_{entry.citation_key}_{ungrouped_counter}"
 
             group_map.setdefault(g_key, []).append((v_num, entry))
 
@@ -328,8 +471,18 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
         for _, entry in items_sorted:
             if entry.entry_type and entry.entry_type != "misc":
                 entry_type = entry.entry_type
-            if entry.title and not title:
-                title = entry.title
+            if entry.title:
+                if not title:
+                    title = entry.title
+                else:
+                    is_current_blob = bool(re.search(r"(doi:|http|et al|\d{4})", title, re.IGNORECASE))
+                    is_entry_blob = bool(re.search(r"(doi:|http|et al|\d{4})", entry.title, re.IGNORECASE))
+                    if is_current_blob and not is_entry_blob:
+                        title = entry.title
+                    elif not is_current_blob and is_entry_blob:
+                        pass
+                    elif len(entry.title) < len(title):
+                        title = entry.title
             if entry.authors:
                 if not authors or len(entry.authors) > len(authors):
                     authors = entry.authors
@@ -356,6 +509,10 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
 
         for v_num, entry in items:
             citation_maps.setdefault(v_num, {})[entry.citation_key] = canonical_key
+
+    for source in sources:
+        if source.version not in citation_maps:
+            citation_maps[source.version] = {}
 
     for source in sources:
         if source.version not in citation_maps:

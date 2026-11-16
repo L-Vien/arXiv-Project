@@ -6,6 +6,7 @@ import pytest
 
 from src.parsing.contracts import (
     BibEntry,
+    DiagnosticSeverity,
     ProcessingStatus,
     SourceBundle,
     SourceFile,
@@ -94,3 +95,70 @@ def test_citation_rewrite():
 
     rewritten = rewrite_citations(content, citation_map)
     assert rewritten == "As shown in \\cite{vaswani2017,devlin2018}, models achieve high accuracy."
+
+
+def test_advanced_bib_features():
+    source = SourceBundle(
+        arxiv_id="2501.99999",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="references.bib",
+                content="""
+                @misc{org2023,
+                  author = {{National Research and Development Agency} and Smith, John},
+                  title = "Quoted Title with, comma",
+                  year = {2023},
+                  howpublished = {\\url{https://example.org/report}},
+                  note = {See also \\href{https://doi.org/10.1234/test}{DOI link}}
+                }
+                """,
+                order=0,
+            ),
+        ),
+    )
+    bundle = process_references([source])
+    assert len(bundle.entries) == 1
+    e = bundle.entries[0]
+    assert e.citation_key == "org2023"
+    assert e.authors == ("National Research and Development Agency", "Smith, John")
+    assert e.title == "Quoted Title with, comma"
+    assert e.year == 2023
+    assert e.url == "https://example.org/report"
+
+
+def test_bbl_file_and_empty_version_citation_map():
+    source_v1 = SourceBundle(
+        arxiv_id="2501.88888",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="refs.bbl",
+                content="\\begin{thebibliography}{1}\n\\bibitem{ref1} Author A. Paper Title. 2021.\n\\end{thebibliography}",
+                order=0,
+            ),
+        ),
+    )
+    # Version 2 has no references/files
+    source_v2 = SourceBundle(
+        arxiv_id="2501.88888",
+        version=2,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="main.tex",
+                content="\\documentclass{article}\\begin{document}Hello\\end{document}",
+                order=0,
+            ),
+        ),
+    )
+
+    bundle = process_references([source_v1, source_v2])
+    assert 1 in bundle.citation_maps
+    assert 2 in bundle.citation_maps
+    assert bundle.citation_maps[2] == {}
