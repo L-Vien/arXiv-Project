@@ -30,7 +30,18 @@ def _normalize_text(text: str) -> str:
     return text.strip()
 
 
-def _clean_latex_accents(text: str) -> str:
+def _authors_are_variants(left: str, right: str) -> bool:
+    left_tokens = _normalize_text(left).split()
+    right_tokens = _normalize_text(right).split()
+    if left_tokens == right_tokens:
+        return True
+    left_full_tokens = {token for token in left_tokens if len(token) > 1}
+    right_full_tokens = {token for token in right_tokens if len(token) > 1}
+    has_initial = any(len(token) == 1 for token in left_tokens + right_tokens)
+    return has_initial and bool(left_full_tokens & right_full_tokens)
+
+
+def _clean_latex_accents(text: str, strip_braces: bool = True) -> str:
     """Clean LaTeX accent commands and braces into clean unicode characters."""
     if not text:
         return ""
@@ -50,7 +61,8 @@ def _clean_latex_accents(text: str) -> str:
     text = re.sub(r"\\v\{([a-zA-Z])\}", lambda m: {"c": "č", "s": "š", "z": "ž", "C": "Č", "S": "Š", "Z": "Ž"}.get(m.group(1), m.group(1)), text)
     text = re.sub(r"\\c\{([a-zA-Z])\}", lambda m: {"c": "ç", "C": "Ç"}.get(m.group(1), m.group(1)), text)
     text = re.sub(r"\\[a-zA-Z]+\{([a-zA-Z])\}", lambda m: m.group(1), text)
-    text = re.sub(r"[{}]", "", text)
+    if strip_braces:
+        text = re.sub(r"[{}]", "", text)
     return text
 
 
@@ -98,10 +110,28 @@ def _clean_field_value(val: str) -> str:
 
 
 def _parse_authors(author_str: str) -> Tuple[str, ...]:
-    """Parse author string separated by 'and', '\\and', ';', or commas into a tuple of author names."""
+    """Parse author string separated by 'and', '\\and', ';', or commas into a tuple of author names,
+    keeping braces and avoiding splitting 'and' inside {...}.
+    """
     if not author_str:
         return ()
-    cleaned = _clean_field_value(author_str)
+    cleaned = author_str.strip()
+
+    # Strip outermost enclosing braces of the entire field value if they wrap everything
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        depth = 0
+        matches = True
+        for idx, char in enumerate(cleaned[:-1]):
+            if char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+            if depth == 0:
+                matches = False
+                break
+        if matches:
+            cleaned = cleaned[1:-1].strip()
+
     cleaned = re.sub(r"\\and\b", "and", cleaned, flags=re.IGNORECASE)
 
     parts = []
@@ -150,9 +180,8 @@ def _parse_authors(author_str: str) -> Tuple[str, ...]:
     authors = []
     for p in parts:
         p = p.strip()
-        if (p.startswith("{") and p.endswith("}")) or (p.startswith('"') and p.endswith('"')):
-            p = p[1:-1].strip()
-        p = _clean_latex_accents(p)
+        # Requirement 1: giữ nguyên brace khi phân tách author (keep braces in p)
+        p = _clean_latex_accents(p, strip_braces=False)
         p = re.sub(r"\s+", " ", p).strip()
         if p and p.lower() != "others":
             authors.append(p)
@@ -165,6 +194,14 @@ def _extract_url(field_dict: Dict[str, str]) -> str:
     if not url:
         for key in ("howpublished", "note", "eprint", "archiveprefix", "doi"):
             text = field_dict.get(key, "")
+            arxiv_match = re.search(
+                r"(?:arxiv\s*:\s*)?(\d{4}\.\d{4,5}(?:v\d+)?)",
+                text,
+                re.IGNORECASE,
+            ) if key == "eprint" else None
+            if arxiv_match:
+                url = f"https://arxiv.org/abs/{arxiv_match.group(1)}"
+                break
             if key == "doi" and text and not text.startswith("http"):
                 url = f"https://doi.org/{text}"
                 break
@@ -298,7 +335,7 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
                 journal = _clean_field_value(field_dict.get("journal", "") or field_dict.get("booktitle", "") or field_dict.get("journaltitle", ""))
                 url = _extract_url(field_dict)
 
-                if not citation_key or (not title and not authors and not doi):
+                if not citation_key or not title or not authors:
                     diagnostics.append(
                         Diagnostic(
                             severity=DiagnosticSeverity.WARNING,
@@ -329,7 +366,7 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
 
 
 def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagnostic]) -> List[BibEntry]:
-    """Parse \\bibitem entries from TeX or BBL files."""
+    """Parse references, using generated ``\\newblock`` structure when available."""
     entries: List[BibEntry] = []
     bibitem_pattern = re.compile(
         r"\\bibitem(?:\[.*?\])?\{([^}]+)\}(.*?)(?=\\bibitem|\\end\{thebibliography\}|\Z)",
@@ -340,44 +377,127 @@ def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagn
         citation_key = match.group(1).strip()
         item_text = match.group(2).strip()
 
+        href_match = re.search(r"\\href\{([^{}]+)\}", item_text)
+        url_match = re.search(r"\\url\{([^{}]+)\}", item_text)
+        http_match = re.search(r"https?://[^\s{}]+", item_text)
+        url = (
+            href_match.group(1) if href_match else
+            url_match.group(1) if url_match else
+            http_match.group(0) if http_match else
+            ""
+        )
+
+        doi_match = re.search(
+            r"(?:doi[:\s]*)(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)",
+            item_text,
+            re.IGNORECASE,
+        )
+        doi = doi_match.group(1).rstrip(".,;") if doi_match else ""
+
+        arxiv_match = re.search(
+            r"arxiv\s*:\s*((?:\d{4}\.\d{4,5})(?:v\d+)?|[a-z-]+(?:\.[A-Z]{2})?/\d{7})",
+            item_text,
+            re.IGNORECASE,
+        )
+        if not url and arxiv_match:
+            url = f"https://arxiv.org/abs/{arxiv_match.group(1)}"
+
+        raw_blocks = re.split(r"\\newblock\b", item_text, flags=re.IGNORECASE)
+
+        def clean_block(block: str) -> str:
+            block = re.sub(r"\\href\{[^{}]*\}\{([^{}]*)\}", r"\1", block)
+            block = re.sub(r"\\url\{([^{}]*)\}", r"\1", block)
+            for _ in range(5):
+                block = re.sub(
+                    r"\\(?:em|emph|textbf|textit|textsc|textrm|textsf|texttt)\s*\{([^{}]*)\}",
+                    r"\1",
+                    block,
+                )
+            block = re.sub(r"\\(?:protect|newblock|em|bf|it)\b", " ", block)
+            block = _clean_latex_accents(block)
+            block = re.sub(r"(?<!\\)~", " ", block)
+            return re.sub(r"\s+", " ", block).strip()
+
+        cleaned_blocks = [clean_block(block) for block in raw_blocks]
         year_match = re.search(r"\b(19\d{2}|20\d{2})\b", item_text)
         year: Optional[int] = None
         if year_match:
-            try:
-                year = int(year_match.group(1))
-            except ValueError:
-                pass
-            before_year = item_text[:year_match.start()]
-        else:
-            before_year = item_text
+            year = int(year_match.group(1))
 
         authors: Tuple[str, ...] = ()
-        if before_year:
-            cleaned_before = re.sub(r"\\[a-zA-Z]+(?:\[.*?\])?(?:\{.*?\})?", " ", before_year)
-            cleaned_before = _clean_latex_accents(cleaned_before)
-            parts = re.split(r"\.\s+|\,\s+|\bby\b|\band\b", cleaned_before, flags=re.IGNORECASE)
-            if parts and len(parts) > 1:
-                potential_authors = []
-                for p in parts[:2]:
-                    p = p.strip()
-                    if p and len(p.split()) < 6 and any(char.isupper() for char in p):
-                        potential_authors.append(p)
-                if potential_authors:
-                    authors = tuple(potential_authors)
+        title = ""
+        journal = ""
+        if len(cleaned_blocks) > 1:
+            author_text = cleaned_blocks[0].strip(" \t\r\n.,;")
+            if author_text:
+                parsed_authors = _parse_authors("{" + author_text + "}")
+                expanded_authors: List[str] = []
+                for author in parsed_authors:
+                    if author.count(",") > 1:
+                        expanded_authors.extend(
+                            part.strip()
+                            for part in author.split(",")
+                            if part.strip()
+                        )
+                    else:
+                        expanded_authors.append(author)
+                authors = tuple(expanded_authors)
+            title = cleaned_blocks[1].strip(" \t\r\n")
+            title = re.sub(r"[.,;:\s]+$", "", title)
+            if year is not None:
+                title = re.sub(
+                    r",\s*[A-Z][a-z]+\s+" + str(year) + r"$",
+                    "",
+                    title,
+                ).strip()
+                title = re.sub(rf"[,.;]?\s*{year}\s*\.?$", "", title).strip()
+            for block_index, block in enumerate(cleaned_blocks[2:], start=2):
+                if (
+                    block
+                    and not re.search(r"\barxiv\s*:", block, re.IGNORECASE)
+                    and not re.search(r"\bdoi\s*:", block, re.IGNORECASE)
+                    and not re.search(r"https?://", block, re.IGNORECASE)
+                    and not re.search(r"conference name\s*:", block, re.IGNORECASE)
+                ):
+                    emphasis_match = re.search(
+                        r"\\(?:em|emph)\s*(?:\{([^{}]+)\}|([^{}]+))",
+                        raw_blocks[block_index],
+                    )
+                    emphasized_text = (
+                        emphasis_match.group(1) or emphasis_match.group(2)
+                        if emphasis_match
+                        else ""
+                    )
+                    journal = (
+                        clean_block(emphasized_text).strip(" \t\r\n.,;")
+                        if emphasized_text
+                        else block.strip(" \t\r\n.,;")
+                    )
+                    break
+        else:
+            cleaned_item = clean_block(item_text)
+            quote_match = re.search(r"[\"“](.+?)[\"”]", cleaned_item)
+            if quote_match:
+                title = quote_match.group(1).strip()
+                author_text = cleaned_item[:quote_match.start()].strip(" \t\r\n.,;")
+                if author_text:
+                    authors = _parse_authors("{" + author_text + "}")
+            elif et_al_match := re.search(r"\bet\s+al\.?", cleaned_item, re.IGNORECASE):
+                author_text = cleaned_item[:et_al_match.start()].strip(" \t\r\n.,;")
+                if author_text:
+                    authors = _parse_authors("{" + author_text + "}")
+                title = cleaned_item[et_al_match.end():].strip(" \t\r\n.,;")
+            else:
+                parts = [part.strip() for part in re.split(r"\.\s+", cleaned_item) if part.strip()]
+                if parts:
+                    authors = _parse_authors("{" + parts[0].strip(".,;") + "}")
+                    if len(parts) > 1:
+                        title = ". ".join(parts[1:])
+            title = re.sub(r"[,.;]?\s*doi\s*:.*$", "", title, flags=re.IGNORECASE)
+            title = re.sub(r"\s+arxiv\s*:.*$", "", title, flags=re.IGNORECASE)
+            title = re.sub(r"[.,;:\s]+$", "", title)
 
-        cleaned_text = re.sub(r"\\[a-zA-Z]+(?:\[.*?\])?(?:\{.*?\})?", " ", item_text)
-        cleaned_text = _clean_latex_accents(cleaned_text)
-        cleaned_text = re.sub(r"\s+", " ", cleaned_text)
-
-        doi_match = re.search(r"(?:doi[:\s]*)(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", cleaned_text, re.IGNORECASE)
-        doi = doi_match.group(1) if doi_match else ""
-
-        url_match = re.search(r"(https?://[^\s]+)", cleaned_text)
-        url = url_match.group(1) if url_match else ""
-
-        title = cleaned_text[:100].strip()
-
-        if not citation_key or not title:
+        if not citation_key or not title or not authors:
             diagnostics.append(
                 Diagnostic(
                     severity=DiagnosticSeverity.WARNING,
@@ -395,7 +515,7 @@ def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagn
                 authors=authors,
                 year=year,
                 doi=doi,
-                journal="",
+                journal=journal,
                 url=url,
             )
         )
@@ -428,28 +548,45 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
         version_raw_entries[source.version] = v_entries
 
     group_map: Dict[str, List[Tuple[int, BibEntry]]] = {}
+    group_first_seen: Dict[str, Tuple[int, int]] = {}
     ungrouped_counter = 0
 
-    for v_num, entries in version_raw_entries.items():
-        for entry in entries:
+    for v_num, entries in sorted(version_raw_entries.items()):
+        for entry_index, entry in enumerate(entries):
             g_key = ""
             if entry.doi:
                 g_key = f"doi:{entry.doi.lower().strip()}"
-            elif entry.title and entry.authors and entry.year:
+            elif entry.url:
+                arxiv_match = re.search(
+                    r"arxiv\.org/(?:abs|pdf)/([^?#]+)",
+                    entry.url,
+                    re.IGNORECASE,
+                )
+                if arxiv_match:
+                    cited_arxiv_id = re.sub(
+                        r"\.pdf$",
+                        "",
+                        arxiv_match.group(1),
+                        flags=re.IGNORECASE,
+                    )
+                    g_key = f"arxiv:{cited_arxiv_id.lower()}"
+            if not g_key and entry.title and entry.authors and entry.year:
                 norm_title = _normalize_text(entry.title)
                 norm_authors = "_".join(sorted(_normalize_text(a) for a in entry.authors))
                 g_key = f"t_a_y:{norm_title}|{norm_authors}|{entry.year}"
-            else:
+            elif not g_key:
                 ungrouped_counter += 1
                 g_key = f"unique:{v_num}_{entry.citation_key}_{ungrouped_counter}"
 
             group_map.setdefault(g_key, []).append((v_num, entry))
+            group_first_seen.setdefault(g_key, (v_num, entry_index))
 
     merged_entries: List[BibEntry] = []
     citation_maps: Dict[int, Dict[str, str]] = {}
     used_canonical_keys: Set[str] = set()
 
-    for g_key, items in group_map.items():
+    for g_key in sorted(group_map, key=group_first_seen.__getitem__):
+        items = group_map[g_key]
         items_sorted = sorted(items, key=lambda x: (x[0], x[1].citation_key))
         base_canonical_key = items_sorted[0][1].citation_key
 
@@ -484,8 +621,14 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
                     elif len(entry.title) < len(title):
                         title = entry.title
             if entry.authors:
-                if not authors or len(entry.authors) > len(authors):
-                    authors = entry.authors
+                merged_authors = list(authors)
+                for author in entry.authors:
+                    if author and not any(
+                        _authors_are_variants(author, existing)
+                        for existing in merged_authors
+                    ):
+                        merged_authors.append(author)
+                authors = tuple(merged_authors)
             if entry.year is not None and year is None:
                 year = entry.year
             if entry.doi and not doi:
@@ -509,10 +652,6 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
 
         for v_num, entry in items:
             citation_maps.setdefault(v_num, {})[entry.citation_key] = canonical_key
-
-    for source in sources:
-        if source.version not in citation_maps:
-            citation_maps[source.version] = {}
 
     for source in sources:
         if source.version not in citation_maps:

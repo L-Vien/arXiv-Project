@@ -15,8 +15,10 @@ def rewrite_citations(content: str, citation_map: Mapping[str, str]) -> str:
     if not citation_map:
         return content
 
-    # Match citation commands like \cite{key1,key2}, \citep{key1}, etc.
-    cite_pattern = re.compile(r"(\\(?:cite|citep|citet|citep\*|citet\*|citealt|citepauthor)\s*\{)([^}]+)(\})")
+    cite_pattern = re.compile(
+        r"(\\(?:cite|citep|citet|citealt|citepauthor)\*?"
+        r"(?:\s*\[[^\]]*\]){0,2}\s*\{)([^}]+)(\})"
+    )
 
     def _replace_keys(match: re.Match) -> str:
         prefix = match.group(1)

@@ -97,6 +97,15 @@ def test_citation_rewrite():
     assert rewritten == "As shown in \\cite{vaswani2017,devlin2018}, models achieve high accuracy."
 
 
+def test_citation_rewrite_with_optional_arguments():
+    content = r"\citep[see][p. 10]{old_key} and \citet*{old_key}"
+    citation_map = {"old_key": "canonical"}
+
+    assert rewrite_citations(content, citation_map) == (
+        r"\citep[see][p. 10]{canonical} and \citet*{canonical}"
+    )
+
+
 def test_advanced_bib_features():
     source = SourceBundle(
         arxiv_id="2501.99999",
@@ -123,7 +132,7 @@ def test_advanced_bib_features():
     assert len(bundle.entries) == 1
     e = bundle.entries[0]
     assert e.citation_key == "org2023"
-    assert e.authors == ("National Research and Development Agency", "Smith, John")
+    assert e.authors == ("{National Research and Development Agency}", "Smith, John")
     assert e.title == "Quoted Title with, comma"
     assert e.year == 2023
     assert e.url == "https://example.org/report"
@@ -162,3 +171,197 @@ def test_bbl_file_and_empty_version_citation_map():
     assert 1 in bundle.citation_maps
     assert 2 in bundle.citation_maps
     assert bundle.citation_maps[2] == {}
+
+
+def test_bbl_multiple_authors():
+    source = SourceBundle(
+        arxiv_id="2501.77777",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="refs.bbl",
+                content="""
+                \\begin{thebibliography}{3}
+                \\bibitem{ref_multi} Alice Smith and Bob Jones and Charlie Brown. "Advanced Machine Learning Methods". 2024. doi:10.1000/xyz
+                \\end{thebibliography}
+                """,
+                order=0,
+            ),
+        ),
+    )
+    bundle = process_references([source])
+    assert len(bundle.entries) == 1
+    e = bundle.entries[0]
+    assert e.citation_key == "ref_multi"
+    assert len(e.authors) >= 2
+    assert "Alice Smith" in e.authors[0] or "Alice Smith" in str(e.authors)
+    assert e.year == 2024
+    assert e.doi == "10.1000/xyz"
+    assert "Advanced Machine Learning Methods" in e.title
+
+
+def test_generated_bbl_preserves_authors_title_and_arxiv_url():
+    source = SourceBundle(
+        arxiv_id="2609-27801",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="main.bbl",
+                content=r"""
+                \begin{thebibliography}{HVWZ25b}
+                \bibitem[BDET24]{breuckmann_cups_2024}
+                Nikolas~P. Breuckmann, Margarita Davydova, Jens~N. Eberhardt, and Nathanan
+                  Tantivasadakarn.
+                \newblock Cups and {Gates} {I}: {Cohomology} invariants and logical quantum
+                  operations, October 2024.
+                \newblock arXiv:2410.16250.
+                \bibitem{journal_ref}
+                Alice Smith and Bob Jones.
+                \newblock A Journal Paper.
+                \newblock {\em Journal of Test Results}, 12(3):45--60, March 2024.
+                \end{thebibliography}
+                """,
+                order=0,
+            ),
+        ),
+    )
+
+    bundle = process_references([source])
+
+    assert len(bundle.entries) == 2
+    entry = next(
+        entry
+        for entry in bundle.entries
+        if entry.citation_key == "breuckmann_cups_2024"
+    )
+    assert entry.authors == (
+        "Nikolas P. Breuckmann",
+        "Margarita Davydova",
+        "Jens N. Eberhardt",
+        "Nathanan Tantivasadakarn",
+    )
+    assert entry.title == (
+        "Cups and Gates I: Cohomology invariants and logical quantum operations"
+    )
+    assert entry.year == 2024
+    assert entry.url == "https://arxiv.org/abs/2410.16250"
+    assert not bundle.diagnostics
+
+    journal_entry = next(
+        entry for entry in bundle.entries if entry.citation_key == "journal_ref"
+    )
+    assert journal_entry.journal == "Journal of Test Results"
+
+
+def test_duplicate_doi_merges_distinct_authors():
+    sources = []
+    for version, key, author in (
+        (1, "first", "Alice Smith"),
+        (2, "second", "Bob Jones"),
+    ):
+        bib = (
+            f"@article{{{key}, author={{{author}}}, title={{Same Paper}}, "
+            "year={2024}, doi={10.1234/same}}"
+        )
+        sources.append(
+            SourceBundle(
+                arxiv_id="2501.12345",
+                version=version,
+                status=ProcessingStatus.OK,
+                root_file="main.tex",
+                files=(SourceFile("refs.bib", bib, 0),),
+            )
+        )
+
+    bundle = process_references(sources)
+
+    assert len(bundle.entries) == 1
+    assert bundle.entries[0].authors == ("Alice Smith", "Bob Jones")
+
+
+def test_arxiv_identifier_deduplicates_between_bbl_and_bib():
+    source_v1 = SourceBundle(
+        arxiv_id="2501.54321",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="refs.bbl",
+                content=r"""
+                \bibitem{old_key}
+                Alice Smith.
+                \newblock A Paper Title.
+                \newblock arXiv:2410.16250.
+                """,
+                order=0,
+            ),
+        ),
+    )
+    source_v2 = SourceBundle(
+        arxiv_id="2501.54321",
+        version=2,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="refs.bib",
+                content="""
+                @article{new_key,
+                  author = {Alice Smith},
+                  title = {Updated title},
+                  year = {2024},
+                  eprint = {2410.16250},
+                  archiveprefix = {arXiv}
+                }
+                """,
+                order=0,
+            ),
+        ),
+    )
+
+    bundle = process_references([source_v1, source_v2])
+
+    assert bundle.arxiv_id == "2501.54321"
+    assert len(bundle.entries) == 1
+    assert bundle.entries[0].citation_key == "old_key"
+    assert bundle.citation_maps[1]["old_key"] == "old_key"
+    assert bundle.citation_maps[2]["new_key"] == "old_key"
+
+
+def test_reference_entry_order_follows_first_version_source_order():
+    source = SourceBundle(
+        arxiv_id="2501.98765",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="refs.bib",
+                content="""
+                @article{z_first,
+                  author = {Zed Author},
+                  title = {Zebra Paper},
+                  year = {2024}
+                }
+                @article{a_second,
+                  author = {Amy Author},
+                  title = {Alpha Paper},
+                  year = {2024}
+                }
+                """,
+                order=0,
+            ),
+        ),
+    )
+
+    bundle = process_references([source])
+
+    assert [entry.citation_key for entry in bundle.entries] == [
+        "z_first",
+        "a_second",
+    ]
