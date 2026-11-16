@@ -33,9 +33,10 @@ def test_process_references_bib_and_bibitem():
                 content="""
                 @article{vaswani2017,
                   author = {Vaswani, Ashish and Shazeer, Noam},
-                  title = {Attention Is All You Need},
+                  title = {Attention Is All You Need % important paper},
                   year = {2017},
-                  doi = {10.5555/3295222.3295349}
+                  doi = {10.5555/3295222.3295349},
+                  url = {https://arxiv.org/abs/1706.03762}
                 }
                 """,
                 order=1,
@@ -71,6 +72,9 @@ def test_process_references_bib_and_bibitem():
     assert entry.citation_key == "vaswani2017"
     assert entry.year == 2017
     assert entry.doi == "10.5555/3295222.3295349"
+    assert entry.authors == ("Vaswani, Ashish", "Shazeer, Noam")
+    assert entry.title == "Attention Is All You Need"
+    assert entry.url == "https://arxiv.org/abs/1706.03762"
 
     # Check citation maps
     assert bundle.citation_maps[1]["vaswani2017"] == "vaswani2017"
