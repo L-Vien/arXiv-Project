@@ -6,6 +6,7 @@ This module validates relationships between records, versions, and tables.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -20,6 +21,58 @@ from src.parsing.contracts import (
     ReferenceBundle,
     SourceBundle,
 )
+
+
+_STATUS_PRIORITY = {
+    ProcessingStatus.EMPTY_NO_TEX: 0,
+    ProcessingStatus.OK: 1,
+    ProcessingStatus.MISSING_INCLUDE: 2,
+    ProcessingStatus.PARTIAL_PARSE: 2,
+    ProcessingStatus.BIBTEX_PARTIAL: 2,
+    ProcessingStatus.ROOT_NOT_FOUND: 3,
+    ProcessingStatus.PARSE_ERROR: 3,
+    ProcessingStatus.ERROR: 3,
+}
+
+_CITATION_RE = re.compile(
+    r"\\(?P<command>[A-Za-z]*[Cc]ite[A-Za-z]*)"
+    r"\*?(?:\s*\[[^\]]*\]){0,2}\s*\{(?P<keys>[^{}]+)\}"
+)
+
+_PARTIAL_DIAGNOSTIC_STATUSES = {
+    "BIBTEX_PARTIAL": ProcessingStatus.BIBTEX_PARTIAL,
+    "UNRESOLVED_CITATION": ProcessingStatus.BIBTEX_PARTIAL,
+    "EMPTY_PARSED_DOCUMENT": ProcessingStatus.PARTIAL_PARSE,
+    "ROOT_SELECTION_LOW_CONFIDENCE": ProcessingStatus.PARTIAL_PARSE,
+}
+
+
+def effective_status(*statuses: ProcessingStatus) -> ProcessingStatus:
+    """Return the worst status observed across the M2 processing stages.
+
+    TV2, TV3, and TV4 each report the status of their own stage.  The final
+    version status must not hide a later parse/normalization failure behind an
+    earlier ``ok`` gathering status.
+    """
+
+    if not statuses:
+        raise ValueError("at least one processing status is required")
+    return max(statuses, key=lambda status: _STATUS_PRIORITY[status])
+
+
+def validation_status_for_version(
+    validation: "ValidationReport",
+    version: int,
+) -> ProcessingStatus | None:
+    """Return a partial status implied by version-scoped validation warnings."""
+
+    statuses = [
+        _PARTIAL_DIAGNOSTIC_STATUSES[diagnostic.code]
+        for diagnostic in validation.diagnostics
+        if diagnostic.version == version
+        and diagnostic.code in _PARTIAL_DIAGNOSTIC_STATUSES
+    ]
+    return effective_status(*statuses) if statuses else None
 
 
 @dataclass(frozen=True)
@@ -81,6 +134,10 @@ def _diagnostic_to_dict(diagnostic: Diagnostic) -> dict[str, object]:
         result["file_path"] = diagnostic.file_path
     if diagnostic.line is not None:
         result["line"] = diagnostic.line
+    if diagnostic.arxiv_id is not None:
+        result["arxiv_id"] = diagnostic.arxiv_id
+    if diagnostic.version is not None:
+        result["version"] = diagnostic.version
     return result
 
 
@@ -106,12 +163,25 @@ def validate_source_bundle(source: SourceBundle) -> tuple[Diagnostic, ...]:
                     "empty_no_tex source must have no root file or files",
                 )
             )
-    elif source.status is ProcessingStatus.OK:
+    elif source.status is ProcessingStatus.ROOT_NOT_FOUND:
+        if source.root_file is not None or source.files:
+            diagnostics.append(
+                _diagnostic(
+                    "INVALID_ROOT_NOT_FOUND_SOURCE",
+                    "root_not_found source must have no root file or files",
+                )
+            )
+    elif source.status in {
+        ProcessingStatus.OK,
+        ProcessingStatus.MISSING_INCLUDE,
+        ProcessingStatus.PARTIAL_PARSE,
+        ProcessingStatus.BIBTEX_PARTIAL,
+    }:
         if source.root_file is None:
             diagnostics.append(
                 _diagnostic(
                     "MISSING_ROOT_FILE",
-                    "ok source must declare a root file",
+                    f"{source.status.value} source must declare a root file",
                 )
             )
         elif source.root_file not in file_paths:
@@ -199,6 +269,47 @@ def validate_reference_bundle(
     return tuple(diagnostics)
 
 
+def validate_citation_coverage(
+    references: ReferenceBundle,
+    versions: Sequence[NormalizedVersion],
+) -> tuple[Diagnostic, ...]:
+    """Report canonical citation keys missing from the unified bibliography."""
+
+    known_keys = {entry.citation_key for entry in references.entries}
+    diagnostics: list[Diagnostic] = []
+    for version in versions:
+        unresolved: set[str] = set()
+        for node in version.nodes:
+            for match in _CITATION_RE.finditer(node.content):
+                unresolved.update(
+                    key.strip()
+                    for key in match.group("keys").split(",")
+                    if (
+                        key.strip()
+                        and not (
+                            match.group("command").casefold() == "nocite"
+                            and key.strip() == "*"
+                        )
+                        and key.strip() not in known_keys
+                    )
+                )
+        if unresolved:
+            sample = ", ".join(sorted(unresolved)[:5])
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    code="UNRESOLVED_CITATION",
+                    message=(
+                        f"{len(unresolved)} citation key(s) have no canonical "
+                        f"BibTeX entry: {sample}"
+                    ),
+                    arxiv_id=version.arxiv_id,
+                    version=version.version,
+                )
+            )
+    return tuple(diagnostics)
+
+
 def validate_normalized_version(
     version: NormalizedVersion,
 ) -> tuple[Diagnostic, ...]:
@@ -227,19 +338,22 @@ def validate_normalized_version(
                 )
             )
 
-    if version.status is ProcessingStatus.EMPTY_NO_TEX:
+    if version.status in {
+        ProcessingStatus.EMPTY_NO_TEX,
+        ProcessingStatus.ROOT_NOT_FOUND,
+    }:
         if version.root_local_id is not None or version.nodes:
             diagnostics.append(
                 _diagnostic(
                     "INVALID_EMPTY_VERSION",
-                    "empty_no_tex version must have no root or nodes",
+                    f"{version.status.value} version must have no root or nodes",
                 )
             )
         if version.raw_element_count != 0:
             diagnostics.append(
                 _diagnostic(
                     "INVALID_EMPTY_COUNT",
-                    "empty_no_tex version must have zero raw elements",
+                    f"{version.status.value} version must have zero raw elements",
                 )
             )
     elif version.status in {
@@ -253,14 +367,33 @@ def validate_normalized_version(
                     f"{version.status.value} version must have a root",
                 )
             )
-        elif version.root_local_id not in known_node_ids:
+        if (
+            len(version.nodes) == 1
+            and version.nodes[0].kind == NodeKind.DOCUMENT.value
+            and not version.nodes[0].content.strip()
+        ):
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    code="EMPTY_PARSED_DOCUMENT",
+                    message=(
+                        "Non-empty source produced only an empty document root"
+                    ),
+                    arxiv_id=version.arxiv_id,
+                    version=version.version,
+                )
+            )
+        if (
+            version.root_local_id is not None
+            and version.root_local_id not in known_node_ids
+        ):
             diagnostics.append(
                 _diagnostic(
                     "UNKNOWN_NORMALIZED_ROOT",
                     "root_local_id does not reference a normalized node",
                 )
             )
-        elif not any(
+        elif version.root_local_id is not None and not any(
             node.local_id == version.root_local_id
             and node.kind == NodeKind.DOCUMENT.value
             for node in version.nodes
@@ -413,6 +546,13 @@ def validate_all(
         diagnostics.extend(validate_reference_bundle(reference_bundle))
     for version in normalized_versions:
         diagnostics.extend(validate_normalized_version(version))
+    if reference_bundle is not None and normalized_versions:
+        diagnostics.extend(
+            validate_citation_coverage(
+                reference_bundle,
+                normalized_versions,
+            )
+        )
     if publication is not None:
         diagnostics.extend(validate_publication(publication))
     return ValidationReport(tuple(diagnostics))
@@ -420,10 +560,13 @@ def validate_all(
 
 __all__ = [
     "ValidationReport",
+    "effective_status",
     "validate_all",
+    "validate_citation_coverage",
     "validate_normalized_version",
     "validate_publication",
     "validate_raw_tree",
     "validate_reference_bundle",
     "validate_source_bundle",
+    "validation_status_for_version",
 ]

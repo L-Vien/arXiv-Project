@@ -10,20 +10,22 @@ Pure Python (standard library only); no filesystem or network access.
 
 from __future__ import annotations
 
-from bisect import bisect_right
-from dataclasses import dataclass, field
 import posixpath
 import re
-from typing import Mapping
+from bisect import bisect_right
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
+from .compilation_path import NON_TEX_EXTS, is_known_tex_support_input
 from .contracts import (
     Diagnostic,
     DiagnosticSeverity,
     NodeKind,
     ProcessingStatus,
+    RawTree,
     SourceBundle,
     TreeNode,
-    RawTree,
 )
 
 # A heading command's logical nesting depth (small numbers = high in tree).
@@ -53,6 +55,60 @@ _LIST_ENVS = {
     "packed_itemize",     # NEW
     "packed_enumerate", 
     "asparaenum",
+    # Common list-like environments supplied by document classes/templates.
+    # They are structural lists for M2 even when their implementation lives in
+    # an external .sty/.cls file that is not part of SourceBundle.files.
+    "IEEEitemize",
+    "myitemize",
+    "pts",
+    "highlights",
+    "keypoints",
+    "affiliations",
+    "romanenumerate",
+    "algorithmic",
+    "algor",
+    "trivlist",
+    "tablenotes",
+    "TableNotes",
+    "indented",
+    "biog",
+    # Common list wrappers used by journal templates and author sources.
+    # They may be defined by an external class/package, so they cannot
+    # always be discovered from the gathered source files.
+    "Elist",
+    "Ilist",
+    "IIlist",
+    "Steps",
+    "pascal",
+    "arabiclist",
+    "longlist",
+    "certalgorithm",
+    "addendum",
+    "itdesc",
+    "ex",
+    "icompact",
+    "IEEEdescription",
+    "tightitemize",
+    "tightlist",
+    "tightenumerate",
+    "nomenclature",
+}
+
+# Theorem/proof environments implemented by amsthm and journal classes are
+# commonly based on LaTeX's ``trivlist``. Some sources therefore use ``\item``
+# directly inside them. Handle them as implicit lists only when a direct item
+# appears before any nested explicit list.
+_IMPLICIT_LIST_ENVS = {
+    "theorem",
+    "lemma",
+    "proposition",
+    "corollary",
+    "definition",
+    "remark",
+    "example",
+    "assumption",
+    "axiom",
+    "proof",
 }
 
 _MATH_ENVS = {
@@ -74,6 +130,9 @@ _RAW_TEXT_ENVS = {
     "alltt",
     "CodeInput",
     "CodeOutput",
+    # Treat comments as opaque while discovering includes, just like TV2.
+    # The structural parser still handles the environment via _SKIP_ENVS.
+    "comment",
 }
 _SKIP_ENVS = {"comment", "thebibliography"}
 _ACK_ENVS = {"acknowledgements", "acknowledgments", "acknowledgement", "acknowledgment", "acks"}
@@ -95,7 +154,8 @@ _SIMPLE_STRUCTURAL_MACRO_DEF_RE = re.compile(
     re.VERBOSE,
 )
 _INCLUDE_RE = re.compile(
-    r"\\(?:input|include)(?![A-Za-z])\s*(?:\{([^{}]*)\}|([A-Za-z0-9_./-]+))"
+    r"\\(?:input|include)(?![A-Za-z])"
+    r"\s*(?:\{([^{}]*)\}|([A-Za-z0-9_./-]+))"
 )
 _SIMPLE_PATH_MACRO_RE = re.compile(
     r"(?:"
@@ -121,8 +181,8 @@ _SPECIAL_RE = re.compile(
     r"\\(?:begin\s*\{[^{}]+\}|end\s*\{[^{}]+\}|"
     r"(?:part|chapter|section|subsection|subsubsection|paragraph|subparagraph)\*?(?![A-Za-z])|"
     r"(?:let|titleformat\*?|titlespacing\*?|RenewDocumentCommand)(?![A-Za-z@])|"
-    r"def(?=[ \t]*\\[A-Za-z@]+[ \t]*(?:#[1-9])+\s*\{\s*"
-    r"\\(?:begin|end)\s*\{(?:equation\*?|eqnarray\*?)\})|"
+    r"comment(?![A-Za-z@])|"
+    r"def(?=[ \t]*\\[A-Za-z@]+)|"
     r"item(?![A-Za-z])|appendix(?![A-Za-z])|"
     r"bibliography(?![A-Za-z])|printbibliography(?![A-Za-z])|"
     r"verb\*?(?![A-Za-z])|\[|\(|\]|\))|\$\$|\$"
@@ -291,6 +351,140 @@ def _collect_list_environments(tex: str) -> set[str]:
 
     return environments
 
+
+def _collect_parameterized_list_macros(
+    text: str,
+    known: set[str],
+) -> dict[str, tuple[str, int, int]]:
+    """Find safe parameterized macros that wrap one list environment.
+
+    The list body must be exactly one macro argument between a literal begin
+    and end pair.  This supports forms such as ``\\items{...}`` and
+    ``\\itm{margin}{...}`` without attempting general macro expansion.
+    """
+    document_start = re.search(r"\\begin\s*\{document\}", text)
+    preamble = text[:document_start.start()] if document_start else text
+    result: dict[str, tuple[str, int, int]] = {}
+
+    for match in _COMMAND_DEF_RE.finditer(preamble):
+        if match.group().startswith(r"\def"):
+            continue
+
+        cursor = match.end()
+        while cursor < len(preamble) and preamble[cursor].isspace():
+            cursor += 1
+
+        name_arg = _balanced(preamble, cursor, "{", "}")
+        if name_arg is None:
+            continue
+
+        name_match = re.fullmatch(r"\\([A-Za-z@]+)", name_arg[0].strip())
+        if name_match is None:
+            continue
+
+        cursor = name_arg[1]
+        while cursor < len(preamble) and preamble[cursor].isspace():
+            cursor += 1
+
+        arity = _balanced(preamble, cursor, "[", "]")
+        if arity is None or not arity[0].strip().isdigit():
+            continue
+        argument_count = int(arity[0].strip())
+        if not 1 <= argument_count <= 9:
+            continue
+
+        body = _balanced(preamble, arity[1], "{", "}")
+        if body is None:
+            continue
+
+        wrapper_body = body[0].strip()
+        outer_group = _balanced(wrapper_body, 0, "{", "}")
+        if outer_group is not None and outer_group[1] == len(wrapper_body):
+            wrapper_body = outer_group[0].strip()
+
+        wrapper = re.fullmatch(
+            r"\s*\\begin\s*\{([^{}]+)\}(?:\s*\[[^\]]*\])?\s*"
+            r"#([1-9])\s*\\end\s*\{\1\}\s*",
+            wrapper_body,
+            re.DOTALL,
+        )
+        if wrapper is None:
+            continue
+
+        environment, body_argument = wrapper.groups()
+        body_index = int(body_argument)
+        if environment in known and body_index <= argument_count:
+            result[name_match.group(1)] = (
+                environment,
+                argument_count,
+                body_index,
+            )
+
+    return result
+
+
+def _collect_parameterized_list_openers(
+    text: str,
+    known: set[str],
+) -> dict[str, tuple[str, int]]:
+    """Find macros whose body only opens a list environment.
+
+    Sources sometimes define an opener such as
+    ``\\newcommand{\\customitemize}[1]{\\begin{enumerate}[label=(#1)]}``
+    and close it later with an explicit ``\\end{enumerate}``.  This is
+    different from a wrapper macro because the macro argument configures the
+    environment rather than containing the list body.
+    """
+    document_start = re.search(r"\\begin\s*\{document\}", text)
+    preamble = text[:document_start.start()] if document_start else text
+    result: dict[str, tuple[str, int]] = {}
+
+    for match in _COMMAND_DEF_RE.finditer(preamble):
+        if match.group().startswith(r"\def"):
+            continue
+
+        cursor = match.end()
+        while cursor < len(preamble) and preamble[cursor].isspace():
+            cursor += 1
+
+        name_arg = _balanced(preamble, cursor, "{", "}")
+        if name_arg is None:
+            continue
+
+        name_match = re.fullmatch(r"\\([A-Za-z@]+)", name_arg[0].strip())
+        if name_match is None:
+            continue
+
+        cursor = name_arg[1]
+        while cursor < len(preamble) and preamble[cursor].isspace():
+            cursor += 1
+
+        arity_arg = _balanced(preamble, cursor, "[", "]")
+        if arity_arg is None or not arity_arg[0].strip().isdigit():
+            continue
+
+        arity = int(arity_arg[0].strip())
+        if arity < 1:
+            continue
+
+        cursor = arity_arg[1]
+        while cursor < len(preamble) and preamble[cursor].isspace():
+            cursor += 1
+
+        body = _balanced(preamble, cursor, "{", "}")
+        if body is None:
+            continue
+
+        event = _simple_structural_body(_strip_comments(body[0]))
+        if event is None:
+            continue
+
+        action, environment = event
+        if action == "begin" and environment in known:
+            result[name_match.group(1)] = (environment, arity)
+
+    return result
+
 # def _collect_custom_list_environments(
 #     text: str, known: set[str],
 # ) -> dict[str, bool]:
@@ -416,6 +610,9 @@ def _collect_custom_list_environments(
 
     def register(env, optional, start, end):
         result[env] = optional
+        mask_definition(start, end)
+
+    def mask_definition(start, end):
         for i in range(start, end):
             if chars[i] != "\n":
                 chars[i] = " "
@@ -444,6 +641,10 @@ def _collect_custom_list_environments(
         if end is None:
             continue
         consumed = end[1]
+        # Environment declarations are configuration, not document content.
+        # Mask every balanced declaration, including non-list wrappers such as
+        # proof environments whose implementation may contain \item.
+        mask_definition(start, consumed)
         env = name[0].strip()
         # Only zero-argument or single optional-argument wrappers.
         if not re.fullmatch(r"[A-Za-z@][A-Za-z0-9@_*-]*", env):
@@ -1440,7 +1641,14 @@ def _expand_bundle(source: SourceBundle, diagnostics: list[Diagnostic]) -> _Expa
                 continue
 
             # Skip compiled bibliography in hierarchy.
-            if resolved_name.strip().lower().endswith(".bbl"):
+            if resolved_name.strip().lower().endswith((".bib", ".bbl")):
+                position = match.end()
+                continue
+
+            # Keep TV3 consistent with TV2: known non-TeX resources are not
+            # hierarchy source files.  They may be absent from the bundle
+            # without making the textual parse partial.
+            if PurePosixPath(resolved_name.strip()).suffix.lower() in NON_TEX_EXTS:
                 position = match.end()
                 continue
 
@@ -1450,6 +1658,10 @@ def _expand_bundle(source: SourceBundle, diagnostics: list[Diagnostic]) -> _Expa
                 name=resolved_name,
                 contents=contents,
             )
+
+            if child not in contents and is_known_tex_support_input(resolved_name):
+                position = match.end()
+                continue
 
             if child is None:
                 diagnostics.append(_make_diagnostic(
@@ -1699,6 +1911,26 @@ def _matching_end_with_macros(
                 return end
 
         position = end
+
+
+def _has_direct_item_before_explicit_list(
+    text: str,
+    start: int,
+    stop: int,
+    list_envs: set[str],
+) -> bool:
+    """Check whether an implicit theorem-like body uses a direct item command."""
+    body = text[start:stop]
+    item = re.search(r"\\item(?![A-Za-z@])", body)
+    if item is None:
+        return False
+    for marker in _BEGIN_END_RE.finditer(body):
+        if (
+            marker.group(1) == "begin"
+            and marker.group(2).strip() in list_envs
+        ):
+            return item.start() < marker.start()
+    return True
 
 def _is_reference_heading(text: str) -> bool:
     # Match a heading's human-readable title, not its formatting syntax.
@@ -1972,7 +2204,7 @@ def _collect_simple_structural_macros(
 
 
 def _structural_call_pattern(
-    macros: Mapping[str, tuple[str, str]],
+    macros: Mapping[str, object],
 ) -> re.Pattern[str] | None:
 
     if not macros:
@@ -1991,6 +2223,8 @@ def _next_structural_token(
     position: int,
     macros: Mapping[str, tuple[str, str]],
     call_pattern: re.Pattern[str] | None,
+    parameterized_macros: Mapping[str, tuple[str, int, int]] | None = None,
+    parameterized_call_pattern: re.Pattern[str] | None = None,
 ) -> tuple[str, int, int] | None:
 
     normal = _SPECIAL_RE.search(text, position)
@@ -1999,6 +2233,23 @@ def _next_structural_token(
         call_pattern.search(text, position)
         if call_pattern is not None else None
     )
+
+    parameterized = (
+        parameterized_call_pattern.search(text, position)
+        if parameterized_call_pattern is not None else None
+    )
+
+    if parameterized is not None and (
+        normal is None or parameterized.start() < normal.start()
+    ) and (
+        macro is None or parameterized.start() < macro.start()
+    ):
+        environment = parameterized_macros[parameterized.group(1)][0]
+        return (
+            rf"\begin{{{environment}}}",
+            parameterized.start(),
+            parameterized.end(),
+        )
 
     if macro is not None and (
         normal is None or macro.start() < normal.start()
@@ -2131,6 +2382,31 @@ def _parse_expanded(expanded: _ExpandedSource, diagnostics: list[Diagnostic]) ->
         _collect_simple_structural_macros(expanded.text)
     )
 
+    # A&A-style sources commonly use ``\bi``/``\ei`` as shorthand for an
+    # itemize environment supplied by the document class.  The class file is
+    # often external to the arXiv source, so there is no local definition for
+    # _collect_simple_structural_macros to inspect.  Only enable the aliases
+    # when the pair is actually present in the source, avoiding a global
+    # reinterpretation of an unrelated one-off macro.
+    for begin_name, end_name in (("bi", "ei"), ("bitem", "eitem")):
+        if (
+            re.search(rf"\\{begin_name}(?![A-Za-z@])", parse_text)
+            and re.search(rf"\\{end_name}(?![A-Za-z@])", parse_text)
+        ):
+            structural_macros.setdefault(begin_name, ("begin", "itemize"))
+            structural_macros.setdefault(end_name, ("end", "itemize"))
+
+    parameterized_list_macros = _collect_parameterized_list_macros(
+        expanded.text,
+        list_envs,
+    )
+    parameterized_list_openers = _collect_parameterized_list_openers(
+        expanded.text,
+        list_envs,
+    )
+    for name, (environment, _) in parameterized_list_openers.items():
+        structural_macros.setdefault(name, ("begin", environment))
+
     # Detect custom list environments from the preamble.
     custom_lists, parse_text = (
         _collect_custom_list_environments(
@@ -2143,6 +2419,9 @@ def _parse_expanded(expanded: _ExpandedSource, diagnostics: list[Diagnostic]) ->
     macro_call_pattern = _structural_call_pattern(
         structural_macros
     )
+    parameterized_call_pattern = _structural_call_pattern(
+        parameterized_list_macros
+    )
     root = _MutableNode("document", source_file=expanded.fallback)
     headings: list[_MutableNode] = []
     lists: list[_ListFrame] = []
@@ -2151,6 +2430,7 @@ def _parse_expanded(expanded: _ExpandedSource, diagnostics: list[Diagnostic]) ->
     pending_start: int | None = None
     appendix = False
     suppressed_level: int | None = None
+    parameterized_list_ends: list[tuple[int, int, str]] = []
 
     def parent() -> _MutableNode:
         if lists:
@@ -2211,12 +2491,42 @@ def _parse_expanded(expanded: _ExpandedSource, diagnostics: list[Diagnostic]) ->
     position = document_start.end() if document_start else 0
 
     while position < len(parse_text):
-        event = _next_structural_token(
-            parse_text,
-            position,
-            structural_macros,
-            macro_call_pattern,
-        )
+        event: tuple[str, int, int] | None = None
+        synthetic_list_end: tuple[str, int, int] | None = None
+
+        if parameterized_list_ends:
+            end_start, end_after, environment = parameterized_list_ends[-1]
+            next_event = _next_structural_token(
+                parse_text,
+                position,
+                structural_macros,
+                macro_call_pattern,
+                parameterized_list_macros,
+                parameterized_call_pattern,
+            )
+            if position >= end_start or (
+                next_event is None or next_event[1] >= end_start
+            ):
+                parameterized_list_ends.pop()
+                synthetic_list_end = (
+                    rf"\end{{{environment}}}",
+                    end_start,
+                    end_after,
+                )
+            else:
+                event = next_event
+        else:
+            event = _next_structural_token(
+                parse_text,
+                position,
+                structural_macros,
+                macro_call_pattern,
+                parameterized_list_macros,
+                parameterized_call_pattern,
+            )
+
+        if synthetic_list_end is not None:
+            event = synthetic_list_end
 
         if event is None:
             if suppressed_level is None:
@@ -2279,7 +2589,13 @@ def _parse_expanded(expanded: _ExpandedSource, diagnostics: list[Diagnostic]) ->
                 )
 
                 if body is not None:
-                    if suppressed_level is None:
+                    is_math_alias = bool(
+                        re.search(
+                            r"\\begin\s*\{(?:equation\*?|eqnarray\*?)\}",
+                            body[0],
+                        )
+                    )
+                    if suppressed_level is None and is_math_alias:
                         diagnostics.append(_make_diagnostic(
                             "UNSUPPORTED_STRUCTURAL_MACRO",
                             (
@@ -2297,6 +2613,38 @@ def _parse_expanded(expanded: _ExpandedSource, diagnostics: list[Diagnostic]) ->
 
                     position = body[1]
                     continue
+
+        if token == r"\comment":
+            cursor = position
+            while cursor < len(tex) and tex[cursor].isspace():
+                cursor += 1
+            argument = _balanced(tex, cursor, "{", "}")
+            if argument is not None:
+                position = argument[1]
+                continue
+
+        if token == r"\def":
+            # Macro definitions are configuration, not document content.
+            # Generic definitions can contain literal ``\item`` tokens (for
+            # example a shorthand macro or a class hook), which must not be
+            # diagnosed as list items outside a list.  Structural aliases are
+            # already collected and masked before this scan; this branch
+            # handles the remaining definitions safely.
+            cursor = position
+            while cursor < len(tex) and tex[cursor].isspace():
+                cursor += 1
+            if cursor < len(tex) and tex[cursor] == "\\":
+                cursor += 1
+                while cursor < len(tex) and (
+                    tex[cursor].isalpha() or tex[cursor] == "@"
+                ):
+                    cursor += 1
+                while cursor < len(tex) and tex[cursor] != "{":
+                    cursor += 1
+                body = _balanced(tex, cursor, "{", "}")
+                if body is not None:
+                    position = body[1]
+                    continue
         
         if _BEGIN_END_RE.fullmatch(token):
             env_match = _BEGIN_END_RE.fullmatch(token)
@@ -2308,6 +2656,13 @@ def _parse_expanded(expanded: _ExpandedSource, diagnostics: list[Diagnostic]) ->
                     )
                 continue
             action, env = env_match.groups()
+            raw_token = parse_text[token_start:token_end]
+            parameterized_list_macro = parameterized_list_macros.get(
+                raw_token[1:]
+            )
+            parameterized_opener = parameterized_list_openers.get(
+                raw_token[1:]
+            )
             if action == "begin":
                 if env == "document":
                     flush()
@@ -2476,6 +2831,67 @@ def _parse_expanded(expanded: _ExpandedSource, diagnostics: list[Diagnostic]) ->
                         parse_text[token_start:token_end] != token
                     )
 
+                    if parameterized_list_macro is not None:
+                        _, argument_count, body_argument = parameterized_list_macro
+                        cursor = token_end
+                        arguments: list[tuple[int, tuple[str, int]]] = []
+                        for _ in range(argument_count):
+                            while cursor < len(tex) and tex[cursor].isspace():
+                                cursor += 1
+                            argument = _balanced(tex, cursor, "{", "}")
+                            if argument is None:
+                                break
+                            arguments.append((cursor, argument))
+                            cursor = argument[1]
+
+                        if len(arguments) != argument_count:
+                            diagnostics.append(_make_diagnostic(
+                                "UNSUPPORTED_STRUCTURAL_MACRO",
+                                (
+                                    f"List macro \\{raw_token[1:]} "
+                                    "has unbalanced arguments"
+                                ),
+                                file_path=expanded.source_file_at(token_start),
+                                line=expanded.source_line_at(token_start),
+                            ))
+                        else:
+                            body_start, body = arguments[body_argument - 1]
+                            parameterized_list_ends.append(
+                                (body[1] - 1, body[1], env)
+                            )
+                            position = body_start + 1
+                            continue
+
+                    if parameterized_opener is not None:
+                        cursor = token_end
+                        arguments_valid = True
+
+                        for _ in range(parameterized_opener[1]):
+                            while cursor < len(tex) and tex[cursor].isspace():
+                                cursor += 1
+
+                            argument = _balanced(tex, cursor, "{", "}")
+                            if argument is None:
+                                arguments_valid = False
+                                break
+
+                            cursor = argument[1]
+
+                        if arguments_valid:
+                            position = cursor
+                        else:
+                            diagnostics.append(_make_diagnostic(
+                                "UNSUPPORTED_STRUCTURAL_MACRO",
+                                (
+                                    f"List opener \\{raw_token[1:]} "
+                                    "has unbalanced arguments"
+                                ),
+                                file_path=expanded.source_file_at(token_start),
+                                line=expanded.source_line_at(token_start),
+                            ))
+
+                        continue
+
                     # Inline enumeration may have an optional label format:
                     # \begin{inparaenum}[(1)]
                     # The label format is configuration, not paragraph content.
@@ -2516,6 +2932,38 @@ def _parse_expanded(expanded: _ExpandedSource, diagnostics: list[Diagnostic]) ->
 
                     continue
 
+                if env in _IMPLICIT_LIST_ENVS:
+                    matching_end = _matching_end_with_macros(
+                        parse_text,
+                        position,
+                        env,
+                        structural_macros,
+                        macro_call_pattern,
+                    )
+                    if (
+                        matching_end is not None
+                        and _has_direct_item_before_explicit_list(
+                            parse_text,
+                            position,
+                            matching_end,
+                            list_envs,
+                        )
+                    ):
+                        if suppressed_level is None:
+                            flush()
+                            node = _MutableNode(
+                                "list",
+                                source_file=expanded.source_file_at(token_start),
+                                attributes={"environment": env},
+                            )
+                            parent().children.append(node)
+                            lists.append(_ListFrame(
+                                env,
+                                node,
+                                opening_offset=token_start,
+                            ))
+                        continue
+
                 if env == "appendices":
                     appendix = True
                     continue
@@ -2534,7 +2982,9 @@ def _parse_expanded(expanded: _ExpandedSource, diagnostics: list[Diagnostic]) ->
                 if suppressed_level is None:
                     flush()
                 break
-            if env in list_envs:
+            if env in list_envs or (
+                lists and lists[-1].environment == env
+            ):
                 if suppressed_level is None:
                     flush()
                     if lists and lists[-1].environment == env:
@@ -2922,10 +3372,19 @@ def parse_structure(source: SourceBundle) -> RawTree:
     diagnostics = list(source.diagnostics)
     source_status = _status_name(source.status)
     if source_status == "empty_no_tex" or not source.files:
-        status = (ProcessingStatus.EMPTY_NO_TEX if source_status == "empty_no_tex" else ProcessingStatus.ROOT_NOT_FOUND)
+        if source_status == "empty_no_tex":
+            status = ProcessingStatus.EMPTY_NO_TEX
+        elif source_status == "ok":
+            status = ProcessingStatus.ROOT_NOT_FOUND
+        else:
+            # Preserve a gathering error/partial status when TV2 has no
+            # readable files to parse.  Mapping every empty bundle to
+            # root_not_found would hide SOURCE_DIR_NOT_FOUND and similar
+            # diagnostics from downstream validation and statistics.
+            status = source.status
         return RawTree(
             arxiv_id=source.arxiv_id, version=source.version,
-            root=TreeNode(kind=NodeKind.DOCUMENT, source_file=source.root_file),
+            root=None,
             status=status, diagnostics=tuple(diagnostics),
         )
 
@@ -2933,7 +3392,7 @@ def parse_structure(source: SourceBundle) -> RawTree:
     if not expanded.text and any(d.code == "ROOT_NOT_FOUND" for d in diagnostics):
         return RawTree(
             arxiv_id=source.arxiv_id, version=source.version,
-            root=TreeNode(kind=NodeKind.DOCUMENT, source_file=source.root_file),
+            root=None,
             status=ProcessingStatus.ROOT_NOT_FOUND, diagnostics=tuple(diagnostics),
         )
 

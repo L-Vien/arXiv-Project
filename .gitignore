@@ -21,6 +21,7 @@ venv/
 # Crawled data and runtime outputs
 data/
 outputs/
+output/
 logs/
 *.log
 samples/

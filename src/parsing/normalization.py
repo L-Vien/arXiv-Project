@@ -18,6 +18,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import replace
 
+from src.parsing.citation_rewrite import rewrite_citations
 from src.parsing.contracts import NodeKind, NormalizedNode, NormalizedVersion, RawTree, TreeNode
 
 # TreeNode.kind is a plain string in the contract (not an Enum), so compare against string values.
@@ -145,21 +146,21 @@ def _protect_with_arg(
 _UNWRAP_CMDS = (
     "textbf", "textit", "emph", "textsc", "textrm", "textsf", "texttt", "textsl", "textup",
     "textmd", "textnormal", "underline", "uline", "mbox", "hbox", "bf", "it", "em",
-    "mathrm", "textcolor", "textgreek",
+    "mathrm", "textcolor", "textgreek", "abstract",
 )
 _DROP_CMDS = (
     "label", "index", "vspace", "hspace", "thispagestyle", "pagestyle", "phantom", "hphantom", "vphantom",
     # front matter and file-level commands: never prose
     "title", "author", "affiliation", "affil", "altaffiliation", "email", "address", "thanks", "date",
     "orcid", "institute", "collaboration", "input", "include", "usepackage", "bibliography",
-    "bibliographystyle",
+    "bibliographystyle", "nocite",
 )
 _BARE_CMDS = (
     "noindent", "centering", "raggedright", "raggedleft", "bfseries", "itshape", "scshape",
     "rmfamily", "sffamily", "ttfamily", "mdseries", "upshape", "slshape", "tiny", "scriptsize",
     "footnotesize", "small", "normalsize", "large", "Large", "LARGE", "huge", "Huge", "newpage",
     "clearpage", "medskip", "bigskip", "smallskip", "par", "linebreak", "newline", "quad", "qquad",
-    "maketitle", "tableofcontents",
+    "maketitle", "tableofcontents", "toprule", "midrule", "bottomrule",
 )
 # Environment markers left in text fragments (proof, lem, theorem, abstract, center, ...). Floats and display
 # math are extracted before this runs, so only the markers are dropped, never their content.
@@ -193,7 +194,9 @@ _FLOAT_ENVS = (
 )
 _FLOAT_RE = re.compile(rf"\\begin\{{(?P<fenv>(?:{_FLOAT_ENVS})\*?)\}}.*?\\end\{{(?P=fenv)\}}", re.DOTALL)
 _ITEM_SPLIT_RE = re.compile(r"\\item(?![A-Za-z])(?:\s*\[[^\]]*\])?")
-_MATH_NOISE_RE = re.compile(r"\\(?:nonumber|notag)(?![A-Za-z])")
+_MATH_NOISE_RE = re.compile(
+    r"\\(?:nonumber|notag|centering|toprule|midrule|bottomrule)(?![A-Za-z])"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +204,8 @@ _MATH_NOISE_RE = re.compile(r"\\(?:nonumber|notag)(?![A-Za-z])")
 # ---------------------------------------------------------------------------
 def _canon_inline(match: re.Match[str]) -> str:
     inner = match.group("d") if match.group("d") is not None else match.group("p")
+    inner = _drop_with_arg(inner, ("label",))
+    inner = _MATH_NOISE_RE.sub("", inner)
     return "$" + " ".join(inner.split()) + "$"
 
 
@@ -239,22 +244,8 @@ def normalize_block_formula(content: str) -> str:
 # Citation
 # ---------------------------------------------------------------------------
 def rewrite_citation_keys(text: str, citation_map: Mapping[str, str]) -> str:
-    """Rewrite keys inside \\cite{...} using citation_map (unknown keys are kept, duplicate keys dropped).
-
-    Local version owned by TV4; can be replaced by TV5's pure function in citation_rewrite.py if provided.
-    """
-    def repl(m: re.Match[str]) -> str:
-        mapped: list[str] = []
-        for key in (k.strip() for k in m.group(1).split(",")):
-            if not key:
-                continue
-            new = citation_map.get(key, key)
-            if new not in mapped:
-                mapped.append(new)
-        prefix = m.group(0)[: m.start(1) - m.start(0)]
-        return prefix + ",".join(mapped) + "}"
-
-    return _CITE_RE.sub(repl, text)
+    """Delegate citation rewriting to TV5's shared implementation."""
+    return rewrite_citations(text, citation_map)
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +253,6 @@ def rewrite_citation_keys(text: str, citation_map: Mapping[str, str]) -> str:
 # ---------------------------------------------------------------------------
 def _prepare_text(text: str, cmap: Mapping[str, str], prot: _Protector) -> str:
     text = _INLINE_RE.sub(lambda m: prot.hold(_canon_inline(m)), text)
-    text = _DECL_RE.sub(r"\1", text)
     text = _DECL_RE.sub(r"\1", text)
     text = _unwrap(text, _UNWRAP_CMDS)
     text = _drop_with_arg(text, _DROP_CMDS)

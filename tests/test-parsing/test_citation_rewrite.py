@@ -30,3 +30,22 @@ def test_rewrite_citations_various_commands():
 def test_rewrite_citations_empty_map():
     content = "No changes \\cite{key1}."
     assert rewrite_citations(content, {}) == content
+
+
+def test_rewrite_citations_with_optional_arguments_and_extended_commands():
+    content = (
+        r"See \citep[see][p. 2]{old_key} and "
+        r"\citeauthor{old_key}; also \parencite{other_key}."
+    )
+    citation_map = {
+        "old_key": "canonical_key",
+        "other_key": "other_key",
+    }
+
+    rewritten = rewrite_citations(content, citation_map)
+
+    expected = (
+        r"See \citep[see][p. 2]{canonical_key} and "
+        r"\citeauthor{canonical_key}; also \parencite{other_key}."
+    )
+    assert rewritten == expected

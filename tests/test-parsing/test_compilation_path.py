@@ -4,6 +4,7 @@ from pathlib import Path
 
 import os
 
+from src.parsing import compilation_path
 from src.parsing.compilation_path import ProcessingStatus, gather_version
 from src.parsing.contracts import SourceBundle
 from src.parsing.validation import validate_source_bundle
@@ -61,6 +62,63 @@ def test_nested_include_comment_and_unused_file(tmp_path):
     assert [f.order for f in b.files] == [0, 1, 2, 3]
 
 
+def test_gather_reuses_decoded_tex_files_within_one_version(tmp_path, monkeypatch):
+    make(tmp_path, {
+        "main.tex": DOC % "\\input{section}",
+        "section.tex": "Section content.",
+    })
+    original_read_text = compilation_path._read_text
+    calls: list[Path] = []
+
+    def tracked_read_text(path: Path) -> tuple[str, str]:
+        calls.append(path.resolve())
+        return original_read_text(path)
+
+    monkeypatch.setattr(compilation_path, "_read_text", tracked_read_text)
+
+    bundle = gather_version(tmp_path, "2501.01234", 1)
+
+    assert bundle.status is ProcessingStatus.OK
+    assert sorted(calls) == sorted(
+        [(tmp_path / "main.tex").resolve(), (tmp_path / "section.tex").resolve()]
+    )
+
+
+def test_simple_path_macro_resolves_include_from_root_directory(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\input{figures/combined}",
+        "figures/combined.tex": (
+            "\\providecommand{\\FigureRoot}{figures}\n"
+            "\\input{\\FigureRoot/geometry}"
+        ),
+        "figures/geometry.tex": "Geometry.",
+    })
+
+    bundle = gather_version(tmp_path, "2501.01234", 1)
+
+    assert bundle.status == ProcessingStatus.OK
+    assert paths(bundle) == [
+        "main.tex", "figures/combined.tex", "figures/geometry.tex",
+    ]
+    assert "MISSING_INCLUDE" not in codes(bundle)
+
+
+def test_include_inside_comment_environment_is_not_followed(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % (
+            "\\begin{comment}\n"
+            "\\input{not-a-real-source}\n"
+            "\\end{comment}\n"
+            "Visible."
+        ),
+    })
+
+    bundle = gather_version(tmp_path, "2501.01234", 1)
+
+    assert bundle.status == ProcessingStatus.OK
+    assert "MISSING_INCLUDE" not in codes(bundle)
+
+
 # TC09
 def test_empty_no_tex(tmp_path):
     make(tmp_path, {"figure.png": b"\x89PNG"})
@@ -90,13 +148,55 @@ def test_missing_include_is_partial_parse(tmp_path):
     assert paths(b) == ["main.tex", "intro.tex"]
 
 
-def test_root_not_found_plain_tex(tmp_path):
+def test_plain_tex_fallback_is_collected_as_partial_parse(tmp_path):
     make(tmp_path, {"paper.tex": "Some text\n\\bye\n"})
     b = gather_version(tmp_path, "2609.25098", 1)
-    assert b.status == ProcessingStatus.ROOT_NOT_FOUND
-    assert "ROOT_NOT_FOUND" in codes(b)
-    assert "PLAIN_TEX_SUSPECTED" in codes(b)
-    assert b.files == ()
+    assert b.status == ProcessingStatus.PARTIAL_PARSE
+    assert b.root_file == "paper.tex"
+    assert paths(b) == ["paper.tex"]
+    assert "NONSTANDARD_TEX_ROOT" in codes(b)
+    assert "ROOT_NOT_FOUND" not in codes(b)
+
+
+def test_ams_tex_fallback_is_collected_as_partial_parse(tmp_path):
+    make(tmp_path, {
+        "paper.tex": (
+            "\\documentstyle{amsppt}\n"
+            "\\document\n"
+            "Some AMS content.\n"
+            "\\enddocument\n"
+        ),
+    })
+    b = gather_version(tmp_path, "2608.00744", 1)
+    assert b.status == ProcessingStatus.PARTIAL_PARSE
+    assert b.root_file == "paper.tex"
+    assert paths(b) == ["paper.tex"]
+    assert "NONSTANDARD_TEX_ROOT" in codes(b)
+
+
+def test_obfuscated_documentclass_fallback_is_collected(tmp_path):
+    make(tmp_path, {
+        "main.tex": (
+            "\\expandafter\\relax\\csname documentclass\\endcsname{article}\n"
+            "\\begin{document}Body.\\end{document}\n"
+        ),
+    })
+    b = gather_version(tmp_path, "2512.11068", 1)
+    assert b.status == ProcessingStatus.PARTIAL_PARSE
+    assert b.root_file == "main.tex"
+    assert paths(b) == ["main.tex"]
+    assert "NONSTANDARD_TEX_ROOT" in codes(b)
+
+
+def test_standard_documentclass_beats_nonstandard_fallback(tmp_path):
+    make(tmp_path, {
+        "plain.tex": "Some text\n\\bye\n",
+        "main.tex": DOC % "Body.",
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert b.status == ProcessingStatus.OK
+    assert b.root_file == "main.tex"
+    assert "NONSTANDARD_TEX_ROOT" not in codes(b)
 
 
 def test_root_not_found_without_plain_tex(tmp_path):
@@ -138,6 +238,38 @@ def test_non_tex_and_dynamic_includes_do_not_cause_partial(tmp_path):
     assert "MISSING_INCLUDE" not in codes(b)
 
 
+def test_latex_auxiliary_inputs_do_not_cause_partial_parse(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % (
+            "\\input{font.fd}\n"
+            "\\input{supplement.toc}\n"
+            "\\input{generated.TPX}"
+        ),
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert b.status == ProcessingStatus.OK
+    assert paths(b) == ["main.tex"]
+    assert "MISSING_INCLUDE" not in codes(b)
+    assert codes(b).count("NON_TEX_INCLUDE_SKIPPED") == 3
+
+
+def test_missing_known_tex_support_input_is_reported_without_losing_content(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % (
+            "\\input{glyphtounicode}\n"
+            "\\input{epsf}\n"
+            "\\input{styles/layout.tikzstyles}"
+        ),
+    })
+
+    b = gather_version(tmp_path, "2501.01234", 1)
+
+    assert b.status == ProcessingStatus.OK
+    assert paths(b) == ["main.tex"]
+    assert codes(b).count("MISSING_SUPPORT_INCLUDE") == 3
+    assert "MISSING_INCLUDE" not in codes(b)
+
+
 def test_includegraphics_is_not_an_include(tmp_path):
     make(tmp_path, {"main.tex": DOC % "\\includegraphics{fig1}\n\\includeonly{a}"})
     b = gather_version(tmp_path, "2501.01234", 1)
@@ -152,14 +284,23 @@ def test_case_insensitive_include(tmp_path):
     assert paths(b) == ["main.tex", "intro.tex"]
 
 
-def test_include_with_explicit_tex_extension_and_subfile(tmp_path):
+def test_include_with_explicit_tex_extension(tmp_path):
     make(tmp_path, {
-        "main.tex": DOC % "\\input{a.tex}\n\\subfile{b}",
+        "main.tex": DOC % "\\input{a.tex}",
         "a.tex": "A.",
         "b.tex": "B.",
     })
     b = gather_version(tmp_path, "2501.01234", 1)
-    assert paths(b) == ["main.tex", "a.tex", "b.tex"]
+    assert paths(b) == ["main.tex", "a.tex"]
+
+
+def test_subfile_is_not_followed(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\subfile{b}",
+        "b.tex": "B.",
+    })
+    b = gather_version(tmp_path, "2501.01234", 1)
+    assert paths(b) == ["main.tex"]
 
 
 def test_bare_input(tmp_path):
@@ -238,14 +379,98 @@ def test_multiple_roots_real_ambiguity_is_deterministic_and_not_partial(tmp_path
     assert "MULTIPLE_ROOTS" in codes(b1)
 
 
-def test_subfiles_are_not_roots(tmp_path):
+def test_multiple_roots_prefers_manuscript_over_supplement(tmp_path):
+    make(tmp_path, {
+        "Supplementary_Material.tex": DOC % "\\section{Supplement}Extra.",
+        "DEID_manuscript.tex": DOC % (
+            "\\title{Main paper}\\begin{abstract}Summary.\\end{abstract}"
+            "\\section{Introduction}Main body."
+            "\\section{Conclusion}Done."
+        ),
+    })
+
+    bundle = gather_version(tmp_path, "2501.01234", 1)
+
+    assert bundle.root_file == "DEID_manuscript.tex"
+
+
+def test_multiple_roots_penalizes_cover_letter_and_old_revisions(tmp_path):
+    make(tmp_path, {
+        "Coverletter.tex": DOC % "Dear editor.",
+        "rev1.tex": DOC % "\\section{Introduction}Old body.",
+        "rev2_old.tex": DOC % "\\section{Introduction}Old backup.",
+        "rev2.tex": DOC % (
+            "\\section{Introduction}Current body."
+            "\\section{Results}Current results."
+        ),
+    })
+
+    bundle = gather_version(tmp_path, "2501.01234", 1)
+
+    assert bundle.root_file == "rev2.tex"
+
+
+def test_multiple_roots_does_not_prefer_scratch_main_over_current_revision(tmp_path):
+    make(tmp_path, {
+        "rev2.tex": DOC % (
+            "\\section{Introduction}Current body."
+            "\\section{Results}Current results."
+        ),
+        "scratch/main.tex": DOC % (
+            "\\section{Introduction}Scratch copy."
+            "\\section{Results}Scratch results."
+            "\\section{Notes}Internal notes."
+        ),
+    })
+
+    bundle = gather_version(tmp_path, "2501.01234", 1)
+
+    assert bundle.root_file == "rev2.tex"
+
+
+def test_outer_file_including_documentclass_fragment_is_selected(tmp_path):
+    make(tmp_path, {
+        "articlepreamble.tex": (
+            "\\documentclass{article}\n"
+            "\\begin{document}\n"
+            "\\maketitle\n"
+        ),
+        "paper.tex": (
+            "\\title{Actual paper}\n"
+            "\\input{articlepreamble}\n"
+            "\\begin{abstract}Summary.\\end{abstract}\n"
+            "\\section{Introduction}Body.\n"
+            "\\end{document}\n"
+        ),
+    })
+
+    bundle = gather_version(tmp_path, "2501.01234", 1)
+
+    assert bundle.root_file == "paper.tex"
+    assert paths(bundle) == ["paper.tex", "articlepreamble.tex"]
+
+
+def test_indistinguishable_root_candidates_are_marked_partial(tmp_path):
+    make(tmp_path, {
+        "a.tex": DOC % "Body A.",
+        "b.tex": DOC % "Body B.",
+    })
+
+    bundle = gather_version(tmp_path, "2501.01234", 1)
+
+    assert bundle.root_file == "a.tex"
+    assert bundle.status is ProcessingStatus.PARTIAL_PARSE
+    assert "ROOT_SELECTION_LOW_CONFIDENCE" in codes(bundle)
+
+
+def test_subfile_is_not_followed_or_selected_as_root(tmp_path):
     make(tmp_path, {
         "main.tex": DOC % "\\subfile{chap1}",
         "chap1.tex": "\\documentclass[main.tex]{subfiles}\n\\begin{document}C1\\end{document}",
     })
     b = gather_version(tmp_path, "2501.01234", 1)
     assert b.root_file == "main.tex"
-    assert paths(b) == ["main.tex", "chap1.tex"]
+    assert paths(b) == ["main.tex"]
 
 
 # Encoding / filesystem noise
@@ -374,6 +599,31 @@ def test_stray_bbl_ignored_when_no_bibliography_command(tmp_path):
     })
     b = gather_version(tmp_path, "2501.01234", 1)
     assert bib_paths(b) == []
+
+
+def test_undeclared_bibliography_fallback_collects_resources_when_cited(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "See \\cite{known}.",
+        "refs.bib": "@article{known, title={Known}}",
+        "generated.bbl": "\\bibitem{generated} Generated reference.",
+    })
+
+    bundle = gather_version(tmp_path, "2501.01234", 1)
+
+    assert bib_paths(bundle) == ["generated.bbl", "refs.bib"]
+    assert any(
+        diagnostic.code == "UNDECLARED_BIB_RESOURCE_FALLBACK"
+        for diagnostic in bundle.diagnostics
+    )
+
+
+def test_nocite_wildcard_does_not_trigger_undeclared_bibliography_fallback(tmp_path):
+    make(tmp_path, {
+        "main.tex": DOC % "\\nocite{*}",
+        "refs.bib": "@article{unused, title={Unused}}",
+    })
+
+    assert bib_paths(gather_version(tmp_path, "2501.01234", 1)) == []
 
 
 def test_unreferenced_bib_is_ignored(tmp_path):

@@ -15,15 +15,24 @@ from src.parsing.contracts import (
 
 DOCUMENTCLASS_PATTERN = re.compile(r"\\documentclass\b")
 BEGIN_DOCUMENT_PATTERN = re.compile(r"\\begin\s*\{document\}")
-PLAIN_TEX_PATTERN = re.compile(r"\\bye\b")
+# Legacy source formats found in arXiv submissions. They are deliberately
+# narrow fallbacks: a normal \documentclass root always wins.
+OBFUSCATED_DOCUMENTCLASS_PATTERN = re.compile(
+    r"\\csname\s*documentclass\s*\\endcsname(?![A-Za-z@])"
+)
+AMS_DOCUMENTSTYLE_PATTERN = re.compile(
+    r"(?m)^[ \t]*\\documentstyle(?![A-Za-z@])"
+)
+AMS_DOCUMENT_PATTERN = re.compile(r"(?m)^[ \t]*\\document(?![A-Za-z@])")
+AMS_ENDDOCUMENT_PATTERN = re.compile(r"(?m)^[ \t]*\\enddocument(?![A-Za-z@])")
+PLAIN_TEX_PATTERN = re.compile(r"(?m)^[ \t]*\\bye(?![A-Za-z@])")
 
 # Ví dụ cần nhận diện:
 # \input{intro}
 # \input{sections/method}
 # \include{appendix}
-# \subfile{sections/intro}
 INCLUDE_PATTERN = re.compile(
-    r"\\(?:input|include|subfile|subfileinclude)\s*\{([^{}]+)\}"
+    r"\\(?:input|include)\s*\{([^{}]+)\}"
 )
 # Kiểu plain-TeX: \input intro   (không có dấu ngoặc nhọn)
 BARE_INPUT_PATTERN = re.compile(r"\\input[ \t]+([A-Za-z0-9_./-]+)")
@@ -44,13 +53,42 @@ ADDBIB_PATTERN = re.compile(
 )
 # \printbibliography / \bibliography -> LaTeX sẽ đọc file .bbl
 PRINTBIB_PATTERN = re.compile(r"\\printbibliography\b")
+# A real citation is evidence that an otherwise undeclared .bib/.bbl file is
+# likely part of the source bundle.  ``\\nocite{*}`` intentionally does not
+# match: it requests all known entries but does not identify a missing source.
+CITATION_COMMAND_PATTERN = re.compile(
+    r"\\(?:[A-Za-z@]*cite[A-Za-z@]*)(?![A-Za-z@])"
+    r"(?:\s*\[[^\]]*\])*\s*\{[^{}]*[A-Za-z0-9][^{}]*\}"
+)
+
+# Safe, zero-expansion subset of path macros used in real source archives.
+# The value is deliberately limited to a static relative path.  Any macro
+# with arguments, nested braces, or dynamic TeX remains unsupported.
+SIMPLE_PATH_MACRO_PATTERN = re.compile(
+    r"(?:"
+    r"\\(?P<command_kind>providecommand|newcommand|renewcommand)"
+    r"\s*\{\\(?P<command_name>[A-Za-z@]+)\}"
+    r"|\\def\s*\\(?P<def_name>[A-Za-z@]+)"
+    r")\s*\{(?P<value>[A-Za-z0-9_./-]+)\}"
+)
+PATH_MACRO_USE_PATTERN = re.compile(r"\\([A-Za-z@]+)[ \t]*")
 
 # Include các file này không phải TeX source -> bỏ qua, không báo MISSING_INCLUDE.
 NON_TEX_EXTS = {
     ".bbl", ".bib", ".sty", ".cls", ".def", ".cfg",
     ".pdf", ".png", ".jpg", ".jpeg", ".eps", ".pdf_tex",
-    ".tikz", ".pgf", ".txt", ".dat", ".csv",
+    ".tikz", ".pgf", ".tpx", ".txt", ".dat", ".csv",
+    # LaTeX font/language definitions and generated auxiliary files.  These
+    # are not paper content and are commonly unavailable in source archives.
+    ".aux", ".bcf", ".clo", ".fd", ".ldf", ".lof", ".lot",
+    ".nav", ".out", ".snm", ".toc", ".vrb",
 }
+
+# Bare ``\input`` names provided by common TeX installations rather than the
+# publication archive.  If absent, report them but do not mark article content
+# as incomplete.  A matching local file is still collected normally.
+TEX_SUPPORT_INPUT_NAMES = frozenset({"epsf", "glyphtounicode", "xy"})
+TEX_SUPPORT_INPUT_SUFFIXES = frozenset({".tikzstyles"})
 
 # Chỉ những diagnostic này mới làm mất nội dung -> status = partial_parse.
 DEGRADING_CODES = frozenset(
@@ -60,6 +98,7 @@ DEGRADING_CODES = frozenset(
         "PATH_TRAVERSAL",
         "BIB_FILE_READ_ERROR",
         "BIB_PATH_TRAVERSAL",
+        "ROOT_SELECTION_LOW_CONFIDENCE",
     }
 )
 
@@ -102,6 +141,7 @@ __all__ = [
     "_resolve_include",
     "_resolve_resource",
     "gather_version",
+    "is_known_tex_support_input",
 ]
 
 
@@ -178,6 +218,28 @@ def _read_text(path: Path) -> tuple[str, str]:
     return data.decode("latin-1"), "latin-1"
 
 
+_ReadResult = tuple[str, str] | OSError
+
+
+def _read_cached(
+    path: Path,
+    cache: dict[Path, _ReadResult],
+) -> tuple[str, str]:
+    """Read a file at most once while gathering one source version."""
+
+    resolved = path.resolve(strict=False)
+    result = cache.get(resolved)
+    if result is None:
+        try:
+            result = _read_text(resolved)
+        except OSError as exc:
+            result = exc
+        cache[resolved] = result
+    if isinstance(result, OSError):
+        raise result
+    return result
+
+
 def _iter_files(base_dir: Path, suffixes: frozenset[str] | set[str]) -> list[Path]:
     """Liệt kê file có đuôi thuộc `suffixes` (không phân biệt hoa/thường), bỏ rác macOS.
 
@@ -248,6 +310,50 @@ def _classify_target(target: str) -> str:
     if PurePosixPath(t).suffix.lower() in NON_TEX_EXTS:
         return "non_tex"
     return "tex"
+
+
+def _register_path_macros(text: str, macros: dict[str, str]) -> None:
+    """Record static path macros declared before an include."""
+    for definition in SIMPLE_PATH_MACRO_PATTERN.finditer(text):
+        kind = definition.group("command_kind") or "def"
+        name = definition.group("command_name") or definition.group("def_name")
+        value = definition.group("value")
+        if kind == "providecommand":
+            macros.setdefault(name, value)
+        else:
+            macros[name] = value
+
+
+def _expand_path_macros(target: str, macros: dict[str, str]) -> str:
+    """Expand only known static path macros, with a bounded cycle guard."""
+    expanded = target
+    seen: set[str] = set()
+    for _ in range(16):
+        if expanded in seen:
+            break
+        seen.add(expanded)
+        replacement = PATH_MACRO_USE_PATTERN.sub(
+            lambda match: macros.get(match.group(1), match.group(0)),
+            expanded,
+        )
+        if replacement == expanded:
+            break
+        expanded = replacement
+    return expanded
+
+
+def is_known_tex_support_input(target: str) -> bool:
+    """Identify bare inputs supplied by common TeX installations.
+
+    TV2 and TV3 share this classifier so that an absent support resource does
+    not become a false missing-content diagnostic.
+    """
+    path = PurePosixPath(target.strip().strip('"'))
+    return (
+        path.stem.lower() in TEX_SUPPORT_INPUT_NAMES
+        or path.name.lower() in TEX_SUPPORT_INPUT_NAMES
+        or path.suffix.lower() in TEX_SUPPORT_INPUT_SUFFIXES
+    )
 
 
 def _candidate_bases(
@@ -368,17 +474,123 @@ def _resolve_resource(
 # Root detection
 # --------------------------------------------------------------------------- #
 
-def _find_root_file(source_dir: Path) -> tuple[Path | None, list[Diagnostic]]:
+_ROOT_PREFERRED_NAMES = re.compile(
+    r"(?:^|[_ .-])(?:main|manuscript|paper|article|arxiv|final|draft)(?:$|[_ .-])",
+    re.IGNORECASE,
+)
+_ROOT_AUXILIARY_NAMES = re.compile(
+    r"(?:^|[_ .-])(?:supp|supplement|supplementary|si|sm|coverletter|"
+    r"cover|response|rebuttal|template|checklist|preamble|figure)(?:$|[_ .-])",
+    re.IGNORECASE,
+)
+_ROOT_AUXILIARY_DIRECTORIES = frozenset(
+    {"archive", "backup", "old", "scratch"}
+)
+
+
+def _root_candidate_score(path: Path, source_dir: Path, text: str) -> int:
+    """Rank plausible compilation roots using deterministic semantic signals."""
+
+    resolved_source = source_dir.resolve(strict=False)
+    relative = path.resolve(strict=False).relative_to(resolved_source).as_posix()
+    relative_parts = PurePosixPath(relative).parts
+    name = path.stem.lower()
+    score = 0
+    if path.name.lower() == "main.tex" and len(relative_parts) == 1:
+        score += 500
+    if _ROOT_PREFERRED_NAMES.search(name):
+        score += 100
+    if _ROOT_AUXILIARY_NAMES.search(name):
+        score -= 300
+    if any(
+        part.lower() in _ROOT_AUXILIARY_DIRECTORIES
+        for part in relative_parts[:-1]
+    ):
+        score -= 300
+    if re.search(r"(?:^|[_ .-])old(?:$|[_ .-])", name):
+        score -= 100
+
+    revision = re.search(r"(?:^|[_ .-])(?:v|rev)(\d+)(?:$|[_ .-])", name)
+    if revision:
+        score += min(int(revision.group(1)), 20)
+
+    section_count = len(
+        re.findall(
+            r"\\(?:part|chapter|section|subsection)(?![A-Za-z@])",
+            text,
+        )
+    )
+    score += min(section_count * 5, 100)
+    if re.search(r"\\(?:begin\s*\{abstract\}|abstract\s*\{)", text):
+        score += 20
+    if re.search(r"\\title(?![A-Za-z@])", text):
+        score += 10
+    if re.search(r"\\(?:bibliography|printbibliography)(?![A-Za-z@])", text):
+        score += 10
+    if re.search(r"\\end\s*\{document\}", text):
+        score += 10
+    score += min(len(text) // 5000, 30)
+    score -= max(len(relative_parts) - 1, 0) * 5
+    return score
+
+
+def _outer_root_wrappers(
+    scanned: dict[Path, str],
+    matched_roots: list[Path],
+    source_dir: Path,
+) -> list[Path]:
+    """Find substantive outer files that include a documentclass fragment."""
+
+    matched = set(matched_roots)
+    wrappers: list[Path] = []
+    resolved_source = source_dir.resolve(strict=False)
+    for candidate, text in scanned.items():
+        if candidate in matched:
+            continue
+        if not re.search(r"\\end\s*\{document\}", text):
+            continue
+        if not re.search(
+            r"\\(?:title|abstract|part|chapter|section)(?![A-Za-z@])",
+            text,
+        ):
+            continue
+
+        requests = [
+            match.group(1)
+            for match in INCLUDE_PATTERN.finditer(text)
+        ]
+        requests.extend(
+            match.group(1)
+            for match in BARE_INPUT_PATTERN.finditer(text)
+        )
+        if any(
+            _resolve_include(
+                candidate,
+                target,
+                source_dir=resolved_source,
+                root_dir=candidate.parent,
+            )
+            in matched
+            for target in requests
+        ):
+            wrappers.append(candidate)
+    return wrappers
+
+def _find_root_file(
+    source_dir: Path,
+    read_cache: dict[Path, _ReadResult] | None = None,
+) -> tuple[Path | None, list[Diagnostic]]:
     r"""Tìm file .tex chứa \documentclass và trả về (root_path, diagnostics).
 
     Các bước (deterministic, không phụ thuộc thứ tự filesystem):
     1. Lấy mọi file có \documentclass (đã bỏ comment/verbatim).
     2. Ưu tiên file có \begin{document}.
-    3. Loại các file bị file khác trong nhóm đó \input/\include (vd. hình standalone, subfile).
+    3. Loại các file bị file khác trong nhóm đó \input/\include (vd. hình standalone).
     4. Còn nhiều ứng viên -> chọn theo Phương án A:
        độ sâu nông nhất -> main.tex -> alphabet đường dẫn POSIX.
     """
     diagnostics: list[Diagnostic] = []
+    read_cache = {} if read_cache is None else read_cache
     if not source_dir.exists() or not source_dir.is_dir():
         return None, diagnostics
 
@@ -396,7 +608,7 @@ def _find_root_file(source_dir: Path) -> tuple[Path | None, list[Diagnostic]]:
     for candidate in candidates:
         rel_path = _to_relative_posix(candidate, source_dir)
         try:
-            content, _ = _read_text(candidate)
+            content, _ = _read_cached(candidate, read_cache)
         except OSError as exc:
             diagnostics.append(
                 Diagnostic(
@@ -409,10 +621,10 @@ def _find_root_file(source_dir: Path) -> tuple[Path | None, list[Diagnostic]]:
             continue
 
         stripped = _strip_for_scan(content)
+        resolved = candidate.resolve()
+        scanned[resolved] = stripped
         if DOCUMENTCLASS_PATTERN.search(stripped):
-            resolved = candidate.resolve()
             matched_roots.append(resolved)
-            scanned[resolved] = stripped
 
     if not matched_roots:
         return None, diagnostics
@@ -427,17 +639,35 @@ def _find_root_file(source_dir: Path) -> tuple[Path | None, list[Diagnostic]]:
     included: set[Path] = set()
     if len(pool) > 1:
         for p in pool:
-            files, _, _ = _collect_files(p, source_dir)
+            files, _, _ = _collect_files(p, source_dir, read_cache)
             included.update(
                 (resolved_source / f.relative_path).resolve(strict=False)
                 for f in files[1:]
             )
     top = [p for p in pool if p not in included] or pool
-
-    chosen = top[0]
+    wrappers = _outer_root_wrappers(
+        scanned,
+        matched_roots,
+        source_dir,
+    )
+    root_options = list(dict.fromkeys((*top, *wrappers)))
+    ranked = sorted(
+        root_options,
+        key=lambda path: (
+            -_root_candidate_score(path, source_dir, scanned[path]),
+            len(
+                path.relative_to(source_dir.resolve(strict=False)).parts
+            ),
+            path.relative_to(source_dir.resolve(strict=False)).as_posix(),
+        ),
+    )
+    chosen = ranked[0]
     chosen_rel = _to_relative_posix(chosen, source_dir)
-    if len(top) > 1:
-        all_rel = ", ".join(_to_relative_posix(p, source_dir) for p in top)
+    if len(root_options) > 1:
+        all_rel = ", ".join(
+            _to_relative_posix(path, source_dir)
+            for path in root_options
+        )
         diagnostics.append(
             Diagnostic(
                 severity=DiagnosticSeverity.WARNING,
@@ -446,6 +676,24 @@ def _find_root_file(source_dir: Path) -> tuple[Path | None, list[Diagnostic]]:
                 file_path=chosen_rel,
             )
         )
+        best_score = _root_candidate_score(chosen, source_dir, scanned[chosen])
+        second_score = _root_candidate_score(
+            ranked[1],
+            source_dir,
+            scanned[ranked[1]],
+        )
+        if best_score == second_score:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    code="ROOT_SELECTION_LOW_CONFIDENCE",
+                    message=(
+                        "Root candidates have similar scores; selected "
+                        f"'{chosen_rel}'"
+                    ),
+                    file_path=chosen_rel,
+                )
+            )
     elif len(matched_roots) > 1:
         diagnostics.append(
             Diagnostic(
@@ -458,8 +706,69 @@ def _find_root_file(source_dir: Path) -> tuple[Path | None, list[Diagnostic]]:
                 file_path=chosen_rel,
             )
         )
+    if chosen in wrappers:
+        diagnostics.append(
+            Diagnostic(
+                severity=DiagnosticSeverity.INFO,
+                code="ROOT_WRAPPER_SELECTED",
+                message=(
+                    "Selected an outer source file that includes the "
+                    "documentclass fragment"
+                ),
+                file_path=chosen_rel,
+            )
+        )
 
     return chosen, diagnostics
+
+
+def _nonstandard_root_kind(text: str) -> str | None:
+    """Return a narrowly recognized non-LaTeX root marker, if present."""
+    if OBFUSCATED_DOCUMENTCLASS_PATTERN.search(text):
+        return "obfuscated_documentclass"
+    if (
+        AMS_DOCUMENTSTYLE_PATTERN.search(text)
+        and (
+            AMS_DOCUMENT_PATTERN.search(text)
+            or AMS_ENDDOCUMENT_PATTERN.search(text)
+        )
+    ):
+        return "ams_tex"
+    if PLAIN_TEX_PATTERN.search(text):
+        return "plain_tex"
+    return None
+
+
+def _find_nonstandard_root_file(
+    source_dir: Path,
+    read_cache: dict[Path, _ReadResult] | None = None,
+) -> tuple[Path | None, str | None]:
+    """Find a conservative Plain/AMS-TeX fallback when no LaTeX root exists."""
+    candidates: list[tuple[Path, str, str]] = []
+    read_cache = {} if read_cache is None else read_cache
+    for candidate in _iter_tex_files(source_dir):
+        try:
+            text, _ = _read_cached(candidate, read_cache)
+        except OSError:
+            continue
+        stripped = _strip_for_scan(text)
+        kind = _nonstandard_root_kind(stripped)
+        if kind is not None:
+            candidates.append((candidate.resolve(strict=False), kind, stripped))
+
+    if not candidates:
+        return None, None
+
+    resolved_source = source_dir.resolve(strict=False)
+    chosen, kind, _ = min(
+        candidates,
+        key=lambda item: (
+            -_root_candidate_score(item[0], resolved_source, item[2]),
+            len(item[0].relative_to(resolved_source).parts),
+            item[0].relative_to(resolved_source).as_posix(),
+        ),
+    )
+    return chosen, kind
 
 
 # --------------------------------------------------------------------------- #
@@ -469,6 +778,7 @@ def _find_root_file(source_dir: Path) -> tuple[Path | None, list[Diagnostic]]:
 def _collect_files(
     root_file: Path,
     source_dir: Path,
+    read_cache: dict[Path, _ReadResult] | None = None,
 ) -> tuple[list[SourceFile], list[Diagnostic], bool]:
     """Duyệt DFS theo thứ tự include, phân biệt lỗi đọc root với lỗi đọc file con.
 
@@ -482,6 +792,8 @@ def _collect_files(
     order: list[SourceFile] = []
     diagnostics: list[Diagnostic] = []
     root_read_failed = False
+    path_macros: dict[str, str] = {}
+    read_cache = {} if read_cache is None else read_cache
 
     def visit(file_path: Path) -> None:
         nonlocal root_read_failed
@@ -508,7 +820,7 @@ def _collect_files(
 
         recursion_stack.append(resolved)
         try:
-            text, encoding = _read_text(resolved)
+            text, encoding = _read_cached(resolved, read_cache)
         except OSError as exc:
             if resolved == root_resolved:
                 root_read_failed = True
@@ -555,9 +867,13 @@ def _collect_files(
         matches = [(m.start(), m.group(1)) for m in INCLUDE_PATTERN.finditer(stripped)]
         matches += [(m.start(), m.group(1)) for m in BARE_INPUT_PATTERN.finditer(stripped)]
         matches.sort(key=lambda item: item[0])
+        scan_cursor = 0
 
         for start, raw_target in matches:
-            include_target = raw_target.strip().strip('"')
+            _register_path_macros(stripped[scan_cursor:start], path_macros)
+            scan_cursor = start
+            original_target = raw_target.strip().strip('"')
+            include_target = _expand_path_macros(original_target, path_macros)
             line_no = stripped[:start].count("\n") + 1
 
             if not include_target:
@@ -606,10 +922,19 @@ def _collect_files(
                 root_dir=root_dir,
             )
             if include_path is None:
+                support_input = is_known_tex_support_input(include_target)
                 diagnostics.append(
                     Diagnostic(
-                        severity=DiagnosticSeverity.WARNING,
-                        code="MISSING_INCLUDE",
+                        severity=(
+                            DiagnosticSeverity.INFO
+                            if support_input
+                            else DiagnosticSeverity.WARNING
+                        ),
+                        code=(
+                            "MISSING_SUPPORT_INCLUDE"
+                            if support_input
+                            else "MISSING_INCLUDE"
+                        ),
                         message=f"Included file was not found: {include_target}",
                         file_path=rel_path,
                         line=line_no,
@@ -618,6 +943,8 @@ def _collect_files(
                 continue
 
             visit(include_path)
+
+        _register_path_macros(stripped[scan_cursor:], path_macros)
 
         recursion_stack.pop()
         visited.add(resolved)
@@ -776,23 +1103,42 @@ def _collect_bibliography(
             )
         )
 
+    # Some arXiv archives omit the declaration that normally connects their
+    # source to an included bibliography file.  When no declared resource was
+    # recovered but the document contains actual citations, retain local
+    # bibliography files deterministically.  This is intentionally a fallback
+    # rather than a general scan, so unused resources remain ignored in normal
+    # compilable projects.
+    has_citation = any(
+        CITATION_COMMAND_PATTERN.search(_strip_for_scan(source_file.content))
+        for source_file in tex_files
+    )
+    if not bib_files and has_citation:
+        fallback_files = sorted(
+            _iter_files(resolved_source, BIB_EXTS),
+            key=lambda path: _to_relative_posix(path, resolved_source),
+        )
+        for path in fallback_files:
+            add(path)
+        if bib_files:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.INFO,
+                    code="UNDECLARED_BIB_RESOURCE_FALLBACK",
+                    message=(
+                        "Collected local bibliography resources because "
+                        "citations were present but no declared resource was found"
+                    ),
+                    file_path=_to_relative_posix(root_resolved, resolved_source),
+                )
+            )
+
     return bib_files, diagnostics
 
 
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
-
-def _looks_like_plain_tex(tex_files: list[Path]) -> bool:
-    for f in tex_files:
-        try:
-            text, _ = _read_text(f)
-        except OSError:
-            continue
-        if PLAIN_TEX_PATTERN.search(_strip_for_scan(text)):
-            return True
-    return False
-
 
 def gather_version(
     source_dir: Path,
@@ -829,7 +1175,9 @@ def gather_version(
             diagnostics=(),
         )
 
-    root_file, root_diagnostics = _find_root_file(source_dir)
+    read_cache: dict[Path, _ReadResult] = {}
+    root_file, root_diagnostics = _find_root_file(source_dir, read_cache)
+    nonstandard_root_kind: str | None = None
     if root_file is None:
         has_candidate_read_error = any(
             d.code == "ROOT_CANDIDATE_READ_ERROR" for d in root_diagnostics
@@ -844,38 +1192,47 @@ def gather_version(
                 diagnostics=tuple(root_diagnostics),
             )
 
-        extra: list[Diagnostic] = []
-        if _looks_like_plain_tex(tex_files):
-            extra.append(
-                Diagnostic(
-                    severity=DiagnosticSeverity.INFO,
-                    code="PLAIN_TEX_SUSPECTED",
-                    message=(
-                        "No \\documentclass but \\bye found: source looks like Plain TeX, "
-                        "which is not supported"
+        root_file, nonstandard_root_kind = _find_nonstandard_root_file(
+            source_dir,
+            read_cache,
+        )
+        if root_file is None:
+            return SourceBundle(
+                arxiv_id=arxiv_id,
+                version=version,
+                status=ProcessingStatus.ROOT_NOT_FOUND,
+                root_file=None,
+                files=(),
+                diagnostics=(
+                    *root_diagnostics,
+                    Diagnostic(
+                        severity=DiagnosticSeverity.WARNING,
+                        code="ROOT_NOT_FOUND",
+                        message=(
+                            "No root TeX file with \\documentclass or a supported "
+                            f"Plain/AMS-TeX marker was found under {source_dir}"
+                        ),
                     ),
-                )
-            )
-
-        return SourceBundle(
-            arxiv_id=arxiv_id,
-            version=version,
-            status=ProcessingStatus.ROOT_NOT_FOUND,
-            root_file=None,
-            files=(),
-            diagnostics=(
-                *root_diagnostics,
-                Diagnostic(
-                    severity=DiagnosticSeverity.WARNING,
-                    code="ROOT_NOT_FOUND",
-                    message=f"No root TeX file with \\documentclass was found under {source_dir}",
                 ),
-                *extra,
-            ),
+            )
+        root_diagnostics.append(
+            Diagnostic(
+                severity=DiagnosticSeverity.WARNING,
+                code="NONSTANDARD_TEX_ROOT",
+                message=(
+                    "No standard \\documentclass root was found; selected "
+                    f"{nonstandard_root_kind} entrypoint"
+                ),
+                file_path=_to_relative_posix(root_file, source_dir),
+            )
         )
 
     rel_root = _to_relative_posix(root_file, source_dir)
-    files, collect_diagnostics, root_read_failed = _collect_files(root_file, source_dir)
+    files, collect_diagnostics, root_read_failed = _collect_files(
+        root_file,
+        source_dir,
+        read_cache,
+    )
     all_diagnostics = (*root_diagnostics, *collect_diagnostics)
 
     if root_read_failed:
@@ -896,7 +1253,8 @@ def gather_version(
 
     status = (
         ProcessingStatus.PARTIAL_PARSE
-        if any(_is_degrading(d) for d in all_diagnostics)
+        if nonstandard_root_kind is not None
+        or any(_is_degrading(d) for d in all_diagnostics)
         else ProcessingStatus.OK
     )
     return SourceBundle(

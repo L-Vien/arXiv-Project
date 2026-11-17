@@ -19,6 +19,7 @@ from src.parsing.contracts import (
 )
 from src.parsing.validation import (
     validate_all,
+    validate_citation_coverage,
     validate_normalized_version,
     validate_publication,
     validate_raw_tree,
@@ -76,6 +77,30 @@ class SourceValidationTests(unittest.TestCase):
         codes = {diagnostic.code for diagnostic in validate_source_bundle(source)}
         self.assertIn("ROOT_FILE_NOT_IN_PATH", codes)
 
+    def test_root_not_found_source_cannot_have_files(self) -> None:
+        source = SourceBundle(
+            arxiv_id="2501.01234",
+            version=1,
+            status=ProcessingStatus.ROOT_NOT_FOUND,
+            root_file="candidate.tex",
+            files=(SourceFile("candidate.tex", "", 0),),
+        )
+
+        codes = {diagnostic.code for diagnostic in validate_source_bundle(source)}
+        self.assertIn("INVALID_ROOT_NOT_FOUND_SOURCE", codes)
+
+    def test_partial_source_requires_root_in_compilation_path(self) -> None:
+        source = SourceBundle(
+            arxiv_id="2501.01234",
+            version=1,
+            status=ProcessingStatus.PARTIAL_PARSE,
+            root_file=None,
+            files=(),
+        )
+
+        codes = {diagnostic.code for diagnostic in validate_source_bundle(source)}
+        self.assertIn("MISSING_ROOT_FILE", codes)
+
 
 class TreeValidationTests(unittest.TestCase):
     def test_successful_raw_tree_requires_root(self) -> None:
@@ -100,6 +125,24 @@ class TreeValidationTests(unittest.TestCase):
         codes = {diagnostic.code for diagnostic in validate_raw_tree(tree)}
         self.assertIn("UNEXPECTED_TREE_ROOT", codes)
 
+    def test_root_not_found_normalized_version_must_be_empty(self) -> None:
+        version = NormalizedVersion(
+            arxiv_id="2501.01234",
+            version=1,
+            status=ProcessingStatus.ROOT_NOT_FOUND,
+            root_local_id="root-v1",
+            nodes=(
+                NormalizedNode("root-v1", NodeKind.DOCUMENT, "", None, 0),
+            ),
+            raw_element_count=1,
+        )
+
+        codes = {
+            diagnostic.code
+            for diagnostic in validate_normalized_version(version)
+        }
+        self.assertIn("INVALID_EMPTY_VERSION", codes)
+
 
 class ReferenceValidationTests(unittest.TestCase):
     def test_duplicate_and_unknown_citation_keys_are_reported(self) -> None:
@@ -120,6 +163,62 @@ class ReferenceValidationTests(unittest.TestCase):
             codes,
             {"DUPLICATE_CITATION_KEY", "UNKNOWN_CITATION_TARGET"},
         )
+
+    def test_unresolved_normalized_citations_are_reported_per_version(self) -> None:
+        references = ReferenceBundle(
+            arxiv_id="2501.01234",
+            entries=(BibEntry(citation_key="known", entry_type="article"),),
+            citation_maps={1: {"known": "known"}},
+        )
+        version = NormalizedVersion(
+            arxiv_id="2501.01234",
+            version=1,
+            status=ProcessingStatus.OK,
+            root_local_id="root-v1",
+            nodes=(
+                NormalizedNode(
+                    "root-v1", NodeKind.DOCUMENT, "", None, 0
+                ),
+                NormalizedNode(
+                    "sentence-1",
+                    NodeKind.SENTENCE,
+                    r"See \autocite[Sec.~2]{known,missing}.",
+                    "root-v1",
+                    1,
+                ),
+            ),
+            raw_element_count=2,
+        )
+
+        diagnostics = validate_citation_coverage(references, (version,))
+
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0].code, "UNRESOLVED_CITATION")
+        self.assertEqual(diagnostics[0].arxiv_id, "2501.01234")
+        self.assertEqual(diagnostics[0].version, 1)
+        self.assertIn("missing", diagnostics[0].message)
+
+    def test_nocite_wildcard_is_not_an_unresolved_citation(self) -> None:
+        references = ReferenceBundle(
+            arxiv_id="2501.01234",
+            entries=(BibEntry(citation_key="known", entry_type="article"),),
+            citation_maps={1: {"known": "known"}},
+        )
+        version = NormalizedVersion(
+            arxiv_id="2501.01234",
+            version=1,
+            status=ProcessingStatus.OK,
+            root_local_id="root-v1",
+            nodes=(
+                NormalizedNode("root-v1", NodeKind.DOCUMENT, "", None, 0),
+                NormalizedNode(
+                    "sentence-1", NodeKind.SENTENCE, r"\nocite{*}", "root-v1", 1
+                ),
+            ),
+            raw_element_count=2,
+        )
+
+        assert validate_citation_coverage(references, (version,)) == ()
 
 
 class NormalizedValidationTests(unittest.TestCase):
@@ -156,6 +255,61 @@ class NormalizedValidationTests(unittest.TestCase):
             codes,
             {"INVALID_EMPTY_VERSION", "INVALID_EMPTY_COUNT"},
         )
+
+    def test_non_empty_source_with_only_an_empty_root_is_partial(self) -> None:
+        version = NormalizedVersion(
+            arxiv_id="2501.01234",
+            version=1,
+            status=ProcessingStatus.OK,
+            root_local_id="root-v1",
+            nodes=(
+                NormalizedNode(
+                    "root-v1",
+                    NodeKind.DOCUMENT,
+                    "",
+                    None,
+                    0,
+                ),
+            ),
+            raw_element_count=1,
+        )
+
+        diagnostics = validate_normalized_version(version)
+
+        empty = [
+            diagnostic
+            for diagnostic in diagnostics
+            if diagnostic.code == "EMPTY_PARSED_DOCUMENT"
+        ]
+        self.assertEqual(len(empty), 1)
+        self.assertEqual(empty[0].severity.value, "warning")
+        self.assertEqual(empty[0].version, 1)
+
+    def test_empty_document_still_validates_root_reference(self) -> None:
+        version = NormalizedVersion(
+            arxiv_id="2501.01234",
+            version=1,
+            status=ProcessingStatus.OK,
+            root_local_id="missing-root",
+            nodes=(
+                NormalizedNode(
+                    "root-v1",
+                    NodeKind.DOCUMENT,
+                    "",
+                    None,
+                    0,
+                ),
+            ),
+            raw_element_count=1,
+        )
+
+        codes = {
+            diagnostic.code
+            for diagnostic in validate_normalized_version(version)
+        }
+
+        self.assertIn("EMPTY_PARSED_DOCUMENT", codes)
+        self.assertIn("UNKNOWN_NORMALIZED_ROOT", codes)
 
 
 class PublicationValidationTests(unittest.TestCase):

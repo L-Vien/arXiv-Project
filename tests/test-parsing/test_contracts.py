@@ -201,6 +201,18 @@ class DiagnosticAndManifestTests(unittest.TestCase):
 
         self.assertEqual(diagnostic.severity, DiagnosticSeverity.WARNING)
 
+    def test_diagnostic_can_keep_publication_version_context(self) -> None:
+        diagnostic = Diagnostic(
+            severity="warning",
+            code="UNCLOSED_MATH",
+            message="Unclosed $$",
+            arxiv_id="2501.01234",
+            version=2,
+        )
+
+        self.assertEqual(diagnostic.arxiv_id, "2501.01234")
+        self.assertEqual(diagnostic.version, 2)
+
     def test_manifest_preserves_empty_version_status(self) -> None:
         manifest = VersionManifestRow(
             arxiv_id="2501.01234",

@@ -204,6 +204,18 @@ def test_missing_include_is_not_silently_ignored():
     assert "After." in str(tree.root)
 
 
+def test_missing_non_tex_input_is_not_a_hierarchy_parse_error():
+    tree = parse_structure(
+        bundle(
+            r"\begin{document}\input{figures/plot.tikz}Body.\end{document}"
+        )
+    )
+
+    assert tree.status == ProcessingStatus.OK
+    assert not any(d.code == "MISSING_INCLUDE" for d in tree.diagnostics)
+    assert "Body." in str(tree.root)
+
+
 def test_empty_source_version():
     source = SourceBundle(
         "2501.01234", 2, ProcessingStatus.EMPTY_NO_TEX,
@@ -212,8 +224,41 @@ def test_empty_source_version():
     tree = parse_structure(source)
     assert tree.version == 2
     assert tree.status == ProcessingStatus.EMPTY_NO_TEX
-    assert tree.root.kind == NodeKind.DOCUMENT
-    assert tree.root.children == ()
+    assert tree.root is None
+
+
+def test_source_error_without_files_preserves_error_status():
+    source = SourceBundle(
+        arxiv_id="2501.01234",
+        version=1,
+        status=ProcessingStatus.ERROR,
+        root_file=None,
+        files=(),
+    )
+
+    tree = parse_structure(source)
+    assert tree.status == ProcessingStatus.ERROR
+    assert tree.root is None
+
+
+def test_bibliography_input_is_not_added_to_hierarchy():
+    source = bundle(
+        r"\begin{document}\input{refs.bib}Body.\end{document}",
+        extra=(SourceFile("refs.bib", "@article{a, title={Reference}}", 1),),
+    )
+    tree = parse_structure(source)
+    assert "Reference" not in str(tree.root)
+    assert "Body." in str(tree.root)
+
+
+def test_unsupported_subfile_is_not_expanded():
+    source = bundle(
+        r"\begin{document}\subfile{sections/body}\end{document}",
+        extra=(SourceFile("sections/body.tex", "Included body.", 1),),
+    )
+    tree = parse_structure(source)
+    assert "Included body." not in str(tree.root)
+    assert r"\subfile{sections/body}" in str(tree.root)
 
 
 def test_optional_section_title_and_nested_braces():
@@ -334,6 +379,15 @@ def test_input_without_braces_supported():
     main = "\\begin{document}\\input chapter\\end{document}"
     tree = parse_structure(bundle(main, extra=(SourceFile("chapter.tex", r"\section{Included}", 1),)))
     assert [h.content for h in find_all(tree.root, NodeKind.HEADING)] == ["Included"]
+
+
+def test_missing_known_tex_support_input_does_not_make_hierarchy_partial():
+    source = bundle(
+        r"\begin{document}\input{glyphtounicode}Body.\end{document}"
+    )
+    tree = parse_structure(source)
+    assert tree.status == ProcessingStatus.OK
+    assert "MISSING_INCLUDE" not in [d.code for d in tree.diagnostics]
 
 @pytest.mark.parametrize(
     "include_name",
@@ -679,6 +733,88 @@ After the list.
 
     # Content after the macro must not be swallowed.
     assert "After the list." in str(tree.root)
+
+
+@pytest.mark.parametrize(
+    ("environment", "body"),
+    [
+        ("Elist", r"\item First.\item Second."),
+        ("icompact", r"\item First.\item Second."),
+        ("IEEEdescription", r"\item[Term] Description."),
+        ("Steps", r"\item First.\item Second."),
+        ("tightitemize", r"\item First.\item Second."),
+    ],
+)
+def test_known_template_list_environments_preserve_items(environment, body):
+    tex = rf"""
+\begin{{document}}
+\begin{{{environment}}}
+{body}
+\end{{{environment}}}
+\end{{document}}
+"""
+
+    tree = parse_structure(bundle(tex))
+
+    lists = find_all(tree.root, NodeKind.LIST)
+    items = find_all(tree.root, NodeKind.LIST_ITEM)
+
+    assert len(lists) == 1
+    expected_items = 1 if environment == "IEEEdescription" else 2
+    assert len(items) == expected_items
+    assert not any(d.code == "ITEM_OUTSIDE_LIST" for d in tree.diagnostics)
+
+
+def test_known_bi_ei_list_alias_preserves_items():
+    tex = r"""
+\begin{document}
+\bi
+\item First.
+\item Second.
+\ei
+\end{document}
+"""
+
+    tree = parse_structure(bundle(tex))
+
+    lists = find_all(tree.root, NodeKind.LIST)
+    items = find_all(tree.root, NodeKind.LIST_ITEM)
+
+    assert len(lists) == 1
+    assert len(items) == 2
+    assert not any(d.code == "ITEM_OUTSIDE_LIST" for d in tree.diagnostics)
+
+
+def test_known_bitem_eitem_list_alias_preserves_items():
+    tex = r"""
+\begin{document}
+\bitem
+\item First.
+\item Second.
+\eitem
+\end{document}
+"""
+
+    tree = parse_structure(bundle(tex))
+
+    assert len(find_all(tree.root, NodeKind.LIST)) == 1
+    assert len(find_all(tree.root, NodeKind.LIST_ITEM)) == 2
+    assert not any(d.code == "ITEM_OUTSIDE_LIST" for d in tree.diagnostics)
+
+
+def test_generic_macro_definition_does_not_emit_item_warning():
+    tex = r"""
+\begin{document}
+\def\items#1{\\item{[#1]}}
+Body text.
+\end{document}
+"""
+
+    tree = parse_structure(bundle(tex))
+
+    assert tree.status == ProcessingStatus.OK
+    assert not any(d.code == "ITEM_OUTSIDE_LIST" for d in tree.diagnostics)
+    assert "Body text." in str(tree.root)
 
 
 def test_standard_list_consumes_two_arguments():
@@ -1568,6 +1704,143 @@ After the definition.
     ]
 
     assert "After the definition." in str(tree.root)
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        "IEEEitemize",
+        "myitemize",
+        "pts",
+        "highlights",
+        "keypoints",
+        "affiliations",
+        "romanenumerate",
+    ],
+)
+def test_common_template_list_environments_preserve_items(environment):
+    tex = (
+        r"\begin{document}\section{Method}"
+        + "\n"
+        + rf"\begin{{{environment}}}\n"
+        + r"\item First item.\n"
+        + r"\item Second item.\n"
+        + rf"\end{{{environment}}}\n"
+        + r"After.\end{document}"
+    )
+
+    tree = parse_structure(bundle(tex))
+
+    assert tree.status == ProcessingStatus.OK
+    assert not any(d.code == "ITEM_OUTSIDE_LIST" for d in tree.diagnostics)
+    lists = find_all(tree.root, NodeKind.LIST)
+    assert len(lists) == 1
+    assert lists[0].attributes["environment"] == environment
+    assert len(find_all(lists[0], NodeKind.LIST_ITEM)) == 2
+
+
+def test_parameterized_list_macro_preserves_items():
+    tex = r"""
+\documentclass{article}
+\newcommand{\items}[1]{\begin{itemize} #1 \end{itemize}}
+\begin{document}
+\section{Method}
+\items{
+  \item First item.
+  \item Second item.
+}
+After.
+\end{document}
+"""
+
+    tree = parse_structure(bundle(tex))
+
+    assert tree.status == ProcessingStatus.OK
+    assert not tree.diagnostics
+    lists = find_all(tree.root, NodeKind.LIST)
+    assert len(lists) == 1
+    assert len(find_all(lists[0], NodeKind.LIST_ITEM)) == 2
+
+
+def test_two_argument_list_wrapper_uses_the_list_body_argument():
+    tex = r"""
+\documentclass{article}
+\newcommand{\itm}[2]{{\begin{itemize}[leftmargin=#1pt]#2\end{itemize}}}
+\begin{document}
+\itm{25}{
+  \item First item.
+  \item Second item.
+}
+\end{document}
+"""
+
+    tree = parse_structure(bundle(tex))
+
+    assert tree.status == ProcessingStatus.OK
+    assert not any(d.code == "ITEM_OUTSIDE_LIST" for d in tree.diagnostics)
+    lists = find_all(tree.root, NodeKind.LIST)
+    assert len(lists) == 1
+    assert len(find_all(lists[0], NodeKind.LIST_ITEM)) == 2
+
+
+@pytest.mark.parametrize("environment", ["algor", "nomenclature"])
+def test_supported_list_like_environments_preserve_items(environment):
+    tree = parse_structure(bundle(
+        "\\begin{document}\n"
+        f"\\begin{{{environment}}}\n"
+        "\\item First item.\n"
+        "\\item Second item.\n"
+        f"\\end{{{environment}}}\n"
+        "\\end{document}"
+    ))
+
+    assert tree.status == ProcessingStatus.OK
+    assert not any(d.code == "ITEM_OUTSIDE_LIST" for d in tree.diagnostics)
+    assert len(find_all(tree.root, NodeKind.LIST_ITEM)) == 2
+
+
+def test_parameterized_list_opener_preserves_items_until_explicit_end():
+    tex = r"""
+\documentclass{article}
+\newcommand{\customitemize}[1]{%
+  \begin{enumerate}[label={(#1\arabic*)}, ref=#1\arabic*]
+}
+\begin{document}
+\customitemize{P}
+  \item First item.
+  \item Second item.
+\end{enumerate}
+After.
+\end{document}
+"""
+
+    tree = parse_structure(bundle(tex))
+
+    assert tree.status == ProcessingStatus.OK
+    assert not any(
+        diagnostic.code in {"ITEM_OUTSIDE_LIST", "LIST_MISMATCH"}
+        for diagnostic in tree.diagnostics
+    )
+    lists = find_all(tree.root, NodeKind.LIST)
+    assert len(lists) == 1
+    assert len(find_all(lists[0], NodeKind.LIST_ITEM)) == 2
+
+
+def test_comment_macro_hides_items_from_hierarchy():
+    tex = r"""
+\newcommand{\comment}[1]{}
+\begin{document}
+\comment{\item hidden draft content}
+Visible text.
+\end{document}
+"""
+
+    tree = parse_structure(bundle(tex))
+
+    assert tree.status == ProcessingStatus.OK
+    assert not any(d.code == "ITEM_OUTSIDE_LIST" for d in tree.diagnostics)
+    assert "Visible text." in str(tree.root)
+    assert "hidden draft content" not in str(tree.root)
 
 @pytest.mark.parametrize("env", [
     "packed_itemize",

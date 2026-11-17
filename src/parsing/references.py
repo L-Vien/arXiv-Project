@@ -8,7 +8,9 @@ merging fields, selecting canonical citation keys, and generating per-version ci
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import Mapping, Sequence, Tuple, List, Dict, Set, Optional, Any
+from urllib.parse import unquote
 
 from src.parsing.contracts import (
     BibEntry,
@@ -28,6 +30,72 @@ def _normalize_text(text: str) -> str:
     text = re.sub(r"[^\w\s]", "", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+_DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
+_ARXIV_PATTERN = re.compile(
+    r"(?<![0-9])((?:\d{4}\.\d{4,5}|[a-z][a-z0-9-]+/\d{7})(?:v\d+)?)(?![0-9])",
+    re.IGNORECASE,
+)
+
+_REFERENCE_BLOCK_PATTERN = re.compile(
+    r"\\begin\s*\{(?:verbatim\*?|lstlisting|comment)\}.*?"
+    r"\\end\s*\{(?:verbatim\*?|lstlisting|comment)\}",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_reference_comments(content: str) -> str:
+    """Remove comments and non-source environments before ``\\bibitem`` parsing."""
+
+    content = _REFERENCE_BLOCK_PATTERN.sub(
+        lambda match: re.sub(r"[^\n]", " ", match.group(0)),
+        content,
+    )
+    lines: list[str] = []
+    for line in content.splitlines(keepends=True):
+        output: list[str] = []
+        backslashes = 0
+        for char in line:
+            if char == "\\":
+                backslashes += 1
+                output.append(char)
+                continue
+            if char == "%" and backslashes % 2 == 0:
+                break
+            output.append(char)
+            backslashes = 0
+        lines.append("".join(output))
+    return "".join(lines)
+
+
+def _normalize_doi(value: str) -> str:
+    """Return a stable bare DOI for output and cross-version matching."""
+    cleaned = _clean_field_value(value)
+    if not cleaned:
+        return ""
+
+    cleaned = unquote(cleaned.replace(r"\%", "%"))
+    cleaned = re.sub(
+        r"^(?:https?://)?(?:dx\.)?doi\.org/",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"^doi\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+    match = _DOI_PATTERN.search(cleaned)
+    if match is None:
+        return ""
+    return match.group(0).rstrip(".,;:)]}").lower()
+
+
+def _normalize_arxiv_id(value: str) -> str:
+    """Return an arXiv identifier without a version suffix."""
+    cleaned = _clean_field_value(value)
+    match = _ARXIV_PATTERN.search(cleaned)
+    if match is None:
+        return ""
+    return re.sub(r"v\d+$", "", match.group(1), flags=re.IGNORECASE).lower()
 
 
 def _clean_latex_accents(text: str) -> str:
@@ -97,11 +165,71 @@ def _clean_field_value(val: str) -> str:
     return val
 
 
+def _unwrap_outer_group(value: str) -> str:
+    """Remove one outer BibTeX brace/quote pair without touching nested braces."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        return value[1:-1].strip()
+    if not (value.startswith("{") and value.endswith("}")):
+        return value
+
+    depth = 0
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and index != len(value) - 1:
+                return value
+    return value[1:-1].strip() if depth == 0 else value
+
+
+def _remove_field_comments(value: str) -> str:
+    """Remove BibTeX line comments while preserving escaped percent signs."""
+    lines: list[str] = []
+    for line in value.splitlines():
+        escaped = False
+        for index, char in enumerate(line):
+            if char == "%" and not escaped:
+                line = line[:index]
+                break
+            escaped = char == "\\" and not escaped
+            if char != "\\":
+                escaped = False
+        lines.append(line)
+    return " ".join(lines)
+
+
+def _extract_arxiv_id(fields: Mapping[str, str]) -> str:
+    """Extract an arXiv ID from eprint or an arXiv URL."""
+    eprint = fields.get("eprint", "")
+    if eprint:
+        arxiv_id = _normalize_arxiv_id(eprint)
+        if arxiv_id:
+            return arxiv_id
+
+    archiveprefix = _clean_field_value(fields.get("archiveprefix", ""))
+    url = _clean_field_value(fields.get("url", ""))
+    if "arxiv" in archiveprefix.lower() or "arxiv.org" in url.lower():
+        return _normalize_arxiv_id(url)
+    return ""
+
+
 def _parse_authors(author_str: str) -> Tuple[str, ...]:
     """Parse author string separated by 'and', '\\and', ';', or commas into a tuple of author names."""
     if not author_str:
         return ()
-    cleaned = _clean_field_value(author_str)
+    # Do not call _clean_field_value here: it removes all braces before the
+    # splitter can use them to protect corporate names containing "and".
+    cleaned = _remove_field_comments(author_str)
+    cleaned = _unwrap_outer_group(cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
     cleaned = re.sub(r"\\and\b", "and", cleaned, flags=re.IGNORECASE)
 
     parts = []
@@ -166,8 +294,10 @@ def _extract_url(field_dict: Dict[str, str]) -> str:
         for key in ("howpublished", "note", "eprint", "archiveprefix", "doi"):
             text = field_dict.get(key, "")
             if key == "doi" and text and not text.startswith("http"):
-                url = f"https://doi.org/{text}"
-                break
+                normalized_doi = _normalize_doi(text)
+                if normalized_doi:
+                    url = f"https://doi.org/{normalized_doi}"
+                    break
             href_match = re.search(r"\\href\{([^}]+)\}\{([^}]+)\}", text)
             if href_match:
                 url = href_match.group(1)
@@ -180,7 +310,12 @@ def _extract_url(field_dict: Dict[str, str]) -> str:
             if http_match:
                 url = http_match.group(1)
                 break
-    return _clean_field_value(url)
+    url = _clean_field_value(url)
+    if not url:
+        arxiv_id = _extract_arxiv_id(field_dict)
+        if arxiv_id:
+            return f"https://arxiv.org/abs/{arxiv_id}"
+    return url
 
 
 def _parse_bib_fields(fields_text: str) -> Dict[str, str]:
@@ -264,7 +399,8 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
                         brace_depth -= 1
                     j += 1
 
-                body_end = j - 1
+                entry_closed = brace_depth == 0
+                body_end = j - 1 if entry_closed else n
                 entry_body = content[body_start:body_end]
                 i = j
 
@@ -294,16 +430,27 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
                         except ValueError:
                             pass
 
-                doi = _clean_field_value(field_dict.get("doi", ""))
+                doi = _normalize_doi(field_dict.get("doi", ""))
                 journal = _clean_field_value(field_dict.get("journal", "") or field_dict.get("booktitle", "") or field_dict.get("journaltitle", ""))
                 url = _extract_url(field_dict)
 
-                if not citation_key or (not title and not authors and not doi):
+                # A syntactically valid entry can legitimately omit the
+                # subset of fields represented by our flat output schema. For
+                # example, an @misc entry may contain only howpublished or a
+                # custom field. Treating that as malformed produced a large
+                # number of false BIBTEX_PARTIAL warnings. Only report actual
+                # structural/key failures here; missing optional output fields
+                # remain represented by the contract's empty values.
+                if not entry_closed or not citation_key:
                     diagnostics.append(
                         Diagnostic(
                             severity=DiagnosticSeverity.WARNING,
                             code="BIBTEX_PARTIAL",
-                            message="Could not fully parse bibliography entry",
+                            message=(
+                                "BibTeX entry is not closed"
+                                if not entry_closed
+                                else "Could not fully parse bibliography entry"
+                            ),
                             file_path=file_path,
                         )
                     )
@@ -322,6 +469,14 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
                         )
                     )
             else:
+                diagnostics.append(
+                    Diagnostic(
+                        severity=DiagnosticSeverity.WARNING,
+                        code="BIBTEX_PARTIAL",
+                        message="BibTeX entry has no opening delimiter",
+                        file_path=file_path,
+                    )
+                )
                 i = j
         else:
             i += 1
@@ -330,15 +485,21 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
 
 def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagnostic]) -> List[BibEntry]:
     """Parse \\bibitem entries from TeX or BBL files."""
+    content = _strip_reference_comments(content)
     entries: List[BibEntry] = []
+    item_count = len(re.findall(r"\\bibitem(?![A-Za-z@])", content))
     bibitem_pattern = re.compile(
-        r"\\bibitem(?:\[.*?\])?\{([^}]+)\}(.*?)(?=\\bibitem|\\end\{thebibliography\}|\Z)",
-        re.DOTALL
+        r"\\bibitem(?![A-Za-z@])\s*"
+        r"(?:\[(?P<label>.*?)\]\s*)?"
+        r"\{(?P<key>[^{}]+)\}"
+        r"(?P<body>.*?)"
+        r"(?=\\bibitem(?![A-Za-z@])|\\end\s*\{thebibliography\}|\Z)",
+        re.DOTALL,
     )
 
     for match in bibitem_pattern.finditer(content):
-        citation_key = match.group(1).strip()
-        item_text = match.group(2).strip()
+        citation_key = match.group("key").strip()
+        item_text = match.group("body").strip()
 
         year_match = re.search(r"\b(19\d{2}|20\d{2})\b", item_text)
         year: Optional[int] = None
@@ -387,6 +548,9 @@ def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagn
                 )
             )
 
+        if not citation_key:
+            continue
+
         entries.append(
             BibEntry(
                 citation_key=citation_key,
@@ -400,31 +564,321 @@ def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagn
             )
         )
 
+    if item_count != len(entries):
+        diagnostics.append(
+            Diagnostic(
+                severity=DiagnosticSeverity.WARNING,
+                code="BIBTEX_PARTIAL",
+                message=(
+                    f"Parsed {len(entries)} of {item_count} bibliography items"
+                ),
+                file_path=file_path,
+            )
+        )
+
     return entries
+
+
+def _read_braced_group(text: str, position: int) -> tuple[str, int] | None:
+    """Read one balanced braced TeX argument without expanding macros."""
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if position >= len(text) or text[position] != "{":
+        return None
+
+    depth = 1
+    cursor = position + 1
+    escaped = False
+    while cursor < len(text):
+        char = text[cursor]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[position + 1:cursor], cursor + 1
+        cursor += 1
+    return None
+
+
+def _year_from_text(value: str) -> Optional[int]:
+    match = re.search(r"\b(19\d{2}|20\d{2})\b", _clean_field_value(value))
+    return int(match.group(1)) if match else None
+
+
+def _parse_biber_bbl_content(
+    content: str,
+    file_path: str,
+    diagnostics: List[Diagnostic],
+) -> List[BibEntry]:
+    r"""Extract the stable fields emitted by biblatex/Biber ``.bbl`` files.
+
+    Biber does not use ``\bibitem``; it writes ``\entry`` plus ``\field``
+    commands.  We deliberately read only those flat fields represented by the
+    shared contract and do not attempt to execute Biber macros.
+    """
+    content = _strip_reference_comments(content)
+    starts = list(re.finditer(r"\\entry\s*\{([^{}]+)\}\s*\{([^{}]+)\}", content))
+    entries: List[BibEntry] = []
+
+    for index, start in enumerate(starts):
+        next_start = starts[index + 1].start() if index + 1 < len(starts) else len(content)
+        block_end = content.find(r"\endrefsection", start.end(), next_start)
+        if block_end < 0:
+            block_end = next_start
+        block = content[start.end():block_end]
+        fields: Dict[str, str] = {}
+
+        for field_match in re.finditer(r"\\field\s*\{([^{}]+)\}", block):
+            value = _read_braced_group(block, field_match.end())
+            if value is not None:
+                fields[field_match.group(1).strip().lower()] = value[0]
+
+        citation_key = start.group(1).strip()
+        if not citation_key:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    code="BIBTEX_PARTIAL",
+                    message="Biber entry has no citation key",
+                    file_path=file_path,
+                )
+            )
+            continue
+
+        title = _clean_field_value(fields.get("title", ""))
+        year = _year_from_text(fields.get("year", "") or fields.get("date", ""))
+        doi = _normalize_doi(fields.get("doi", ""))
+        journal = _clean_field_value(
+            fields.get("journaltitle", "") or fields.get("journal", "")
+        )
+        url = _extract_url(fields)
+        entries.append(
+            BibEntry(
+                citation_key=citation_key,
+                entry_type=start.group(2).strip().lower() or "misc",
+                title=title,
+                year=year,
+                doi=doi,
+                journal=journal,
+                url=url,
+            )
+        )
+
+    return entries
+
+
+def _parse_harvard_bbl_content(
+    content: str,
+    file_path: str,
+    diagnostics: List[Diagnostic],
+) -> List[BibEntry]:
+    r"""Extract ``\harvarditem`` records used by Harvard-style ``.bbl`` files."""
+    content = _strip_reference_comments(content)
+    starts = list(re.finditer(r"\\harvarditem\*?(?![A-Za-z@])", content))
+    entries: List[BibEntry] = []
+
+    for index, start in enumerate(starts):
+        cursor = start.end()
+        while cursor < len(content) and content[cursor].isspace():
+            cursor += 1
+        if cursor < len(content) and content[cursor] == "[":
+            depth = 1
+            cursor += 1
+            while cursor < len(content) and depth:
+                if content[cursor] == "[":
+                    depth += 1
+                elif content[cursor] == "]":
+                    depth -= 1
+                cursor += 1
+
+        author_group = _read_braced_group(content, cursor)
+        year_group = _read_braced_group(content, author_group[1]) if author_group else None
+        key_group = _read_braced_group(content, year_group[1]) if year_group else None
+        if key_group is None:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    code="BIBTEX_PARTIAL",
+                    message="Could not parse Harvard bibliography entry",
+                    file_path=file_path,
+                )
+            )
+            continue
+
+        next_start = starts[index + 1].start() if index + 1 < len(starts) else len(content)
+        body = content[key_group[1]:next_start]
+        cleaned_body = _clean_field_value(body)
+        citation_key = key_group[0].strip()
+        if not citation_key:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    code="BIBTEX_PARTIAL",
+                    message="Harvard bibliography entry has no citation key",
+                    file_path=file_path,
+                )
+            )
+            continue
+
+        doi = _normalize_doi(cleaned_body)
+        url_match = re.search(r"https?://[^\s{}]+", cleaned_body)
+        entries.append(
+            BibEntry(
+                citation_key=citation_key,
+                entry_type="misc",
+                title=cleaned_body[:100].strip(),
+                authors=_parse_authors(author_group[0]),
+                year=_year_from_text(year_group[0]),
+                doi=doi,
+                journal="",
+                url=url_match.group(0) if url_match else "",
+            )
+        )
+
+    return entries
+
+
+def _parse_bbl_content(content: str, file_path: str, diagnostics: List[Diagnostic]) -> List[BibEntry]:
+    """Read the common BibTeX, Biber, and Harvard bibliography formats."""
+    return [
+        *_parse_bibitem_content(content, file_path, diagnostics),
+        *_parse_biber_bbl_content(content, file_path, diagnostics),
+        *_parse_harvard_bbl_content(content, file_path, diagnostics),
+    ]
+
+
+def _merge_same_key_entries(entries: Sequence[BibEntry]) -> list[BibEntry]:
+    """Merge duplicate citation keys within one version.
+
+    A source archive may contain both a structured ``.bib`` file and its
+    generated ``.bbl`` file.  The structured record is normally encountered
+    first; later records fill missing fields instead of creating a second
+    reference row.
+    """
+
+    merged: dict[str, BibEntry] = {}
+    for entry in entries:
+        current = merged.get(entry.citation_key)
+        if current is None:
+            merged[entry.citation_key] = entry
+            continue
+        merged[entry.citation_key] = BibEntry(
+            citation_key=current.citation_key,
+            entry_type=(
+                current.entry_type
+                if current.entry_type != "misc"
+                else entry.entry_type
+            ),
+            title=current.title or entry.title,
+            authors=(
+                current.authors
+                if len(current.authors) >= len(entry.authors)
+                else entry.authors
+            ),
+            year=current.year if current.year is not None else entry.year,
+            doi=_normalize_doi(current.doi or entry.doi),
+            journal=current.journal or entry.journal,
+            url=current.url or entry.url,
+        )
+    return list(merged.values())
+
+
+def _reference_group_key(
+    version: int,
+    entry: BibEntry,
+    sequence: int,
+) -> str:
+    """Build the deterministic identity used to deduplicate one reference."""
+    doi = _normalize_doi(entry.doi)
+    if doi:
+        return f"doi:{doi}"
+
+    arxiv_id = _normalize_arxiv_id(entry.url) if "arxiv.org" in entry.url.lower() else ""
+    if arxiv_id:
+        return f"arxiv:{arxiv_id}"
+
+    if entry.title and entry.authors and entry.year:
+        norm_title = _normalize_text(entry.title)
+        norm_authors = "_".join(sorted(_normalize_text(a) for a in entry.authors))
+        return f"t_a_y:{norm_title}|{norm_authors}|{entry.year}"
+
+    return f"unique:{version}_{entry.citation_key}_{sequence}"
 
 
 def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
     """Process all versions of a publication to extract, merge, and deduplicate references."""
     if not sources:
-        return ReferenceBundle(arxiv_id="unknown", entries=(), citation_maps={})
+        return ReferenceBundle(
+            arxiv_id="unknown",
+            entries=(),
+            citation_maps={},
+            raw_entry_count=0,
+        )
 
     arxiv_id = sources[0].arxiv_id
     diagnostics: List[Diagnostic] = []
 
     version_raw_entries: Dict[int, List[BibEntry]] = {}
+    raw_entry_count = 0
 
     for source in sources:
         if source.status is ProcessingStatus.EMPTY_NO_TEX:
             continue
-        v_entries: List[BibEntry] = []
+        source_diagnostics: List[Diagnostic] = []
+        bib_entries: List[BibEntry] = []
+        supplemental_entries: List[BibEntry] = []
         for file_obj in source.files:
             path_lower = file_obj.relative_path.lower()
             if path_lower.endswith(".bib"):
-                v_entries.extend(_parse_bib_content(file_obj.content, file_obj.relative_path, diagnostics))
+                bib_entries.extend(
+                    _parse_bib_content(
+                        file_obj.content,
+                        file_obj.relative_path,
+                        source_diagnostics,
+                    )
+                )
             elif path_lower.endswith(".bbl"):
-                v_entries.extend(_parse_bibitem_content(file_obj.content, file_obj.relative_path, diagnostics))
+                supplemental_entries.extend(
+                    _parse_bbl_content(
+                        file_obj.content,
+                        file_obj.relative_path,
+                        source_diagnostics,
+                    )
+                )
             elif path_lower.endswith(".tex"):
-                v_entries.extend(_parse_bibitem_content(file_obj.content, file_obj.relative_path, diagnostics))
+                supplemental_entries.extend(
+                    _parse_bibitem_content(
+                        file_obj.content,
+                        file_obj.relative_path,
+                        source_diagnostics,
+                    )
+                )
+
+        # Reference diagnostics originate from one concrete source version.
+        # Preserve that provenance so TV1 can expose bibtex_partial at the
+        # version level instead of only downgrading the whole publication.
+        diagnostics.extend(
+            replace(
+                diagnostic,
+                arxiv_id=diagnostic.arxiv_id or source.arxiv_id,
+                version=diagnostic.version or source.version,
+            )
+            for diagnostic in source_diagnostics
+        )
+
+        bib_keys = {entry.citation_key for entry in bib_entries}
+        v_entries = bib_entries + [
+            entry
+            for entry in supplemental_entries
+            if entry.citation_key not in bib_keys
+        ]
+        raw_entry_count += len(v_entries)
+        v_entries = _merge_same_key_entries(v_entries)
         version_raw_entries[source.version] = v_entries
 
     group_map: Dict[str, List[Tuple[int, BibEntry]]] = {}
@@ -432,17 +886,8 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
 
     for v_num, entries in version_raw_entries.items():
         for entry in entries:
-            g_key = ""
-            if entry.doi:
-                g_key = f"doi:{entry.doi.lower().strip()}"
-            elif entry.title and entry.authors and entry.year:
-                norm_title = _normalize_text(entry.title)
-                norm_authors = "_".join(sorted(_normalize_text(a) for a in entry.authors))
-                g_key = f"t_a_y:{norm_title}|{norm_authors}|{entry.year}"
-            else:
-                ungrouped_counter += 1
-                g_key = f"unique:{v_num}_{entry.citation_key}_{ungrouped_counter}"
-
+            ungrouped_counter += 1
+            g_key = _reference_group_key(v_num, entry, ungrouped_counter)
             group_map.setdefault(g_key, []).append((v_num, entry))
 
     merged_entries: List[BibEntry] = []
@@ -488,8 +933,9 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
                     authors = entry.authors
             if entry.year is not None and year is None:
                 year = entry.year
-            if entry.doi and not doi:
-                doi = entry.doi
+            normalized_doi = _normalize_doi(entry.doi)
+            if normalized_doi and not doi:
+                doi = normalized_doi
             if entry.journal and not journal:
                 journal = entry.journal
             if entry.url and not url:
@@ -514,15 +960,12 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
         if source.version not in citation_maps:
             citation_maps[source.version] = {}
 
-    for source in sources:
-        if source.version not in citation_maps:
-            citation_maps[source.version] = {}
-
     return ReferenceBundle(
         arxiv_id=arxiv_id,
         entries=tuple(merged_entries),
         citation_maps=citation_maps,
         diagnostics=tuple(diagnostics),
+        raw_entry_count=raw_entry_count,
     )
 
 

@@ -47,10 +47,28 @@ class TestCleanup(unittest.TestCase):
         nv = normalize_tree(tree_of(node(K.HEADING, r"\textbf{Intro}  duction\label{s1}", level=1)))
         self.assertEqual(leaves(nv), [("heading", "Intro duction")])
 
+    def test_abstract_command_keeps_its_text_without_the_command(self):
+        self.assertEqual(
+            sentences_of(r"\abstract{We study robust parsing.}"),
+            ["We study robust parsing."],
+        )
+
+    def test_table_layout_commands_are_removed_from_text(self):
+        self.assertEqual(
+            sentences_of(r"First row. \midrule Second row."),
+            ["First row.", "Second row."],
+        )
+
 
 class TestMath(unittest.TestCase):
     def test_inline_math_forms(self):
         self.assertEqual(sentences_of(r"Let \(x+y\) and $ a   b $ hold."), ["Let $x+y$ and $a b$ hold."])
+
+    def test_inline_math_drops_labels(self):
+        self.assertEqual(
+            sentences_of(r"Let $x\label{eq:x}=1$ hold."),
+            ["Let $x=1$ hold."],
+        )
 
     def test_escaped_dollar_is_not_math(self):
         self.assertEqual(sentences_of(r"It costs \$5 and \$6."), [r"It costs \$5 and \$6."])
@@ -60,6 +78,14 @@ class TestMath(unittest.TestCase):
         for raw in ("$$E = mc^2$$", r"\[ E = mc^2 \]", r"\begin{equation*}E = mc^2\end{equation*}",
                     r"\begin{equation} E = mc^2 \label{e1} \end{equation}", "E = mc^2"):
             self.assertEqual(normalize_block_formula(raw), want, raw)
+
+    def test_block_formula_drops_layout_commands(self):
+        self.assertEqual(
+            normalize_block_formula(
+                r"\begin{equation}\centering x = 1 \midrule \label{eq:x}\end{equation}"
+            ),
+            r"\begin{equation}x = 1\end{equation}",
+        )
 
     def test_align_becomes_aligned_in_equation(self):
         self.assertEqual(
@@ -197,6 +223,9 @@ class TestRealWorldMacros(unittest.TestCase):
 
 
 class TestCitations(unittest.TestCase):
+    def test_nocite_wildcard_is_not_exported_as_prose(self):
+        self.assertEqual(sentences_of(r"\nocite{*}"), [])
+
     def test_rewrite_and_dedupe_keys(self):
         got = sentences_of(r"As shown in \cite{a, b} and \citep[p. 5]{b}. Next.", {"a": "k1", "b": "k1"})
         self.assertEqual(got, [r"As shown in \cite{k1} and \citep[p. 5]{k1}.", "Next."])
@@ -206,6 +235,12 @@ class TestCitations(unittest.TestCase):
 
     def test_empty_map_still_canonical_spacing(self):
         self.assertEqual(sentences_of(r"See \cite{a, b}."), [r"See \cite{a,b}."])
+
+    def test_extended_citation_commands_use_tv5_rewriter(self):
+        self.assertEqual(
+            sentences_of(r"See \parencite[see][p. 2]{a, b}.", {"a": "k", "b": "k"}),
+            [r"See \parencite[see][p. 2]{k}."],
+        )
 
 
 class TestStructure(unittest.TestCase):

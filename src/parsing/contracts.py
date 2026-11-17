@@ -26,7 +26,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Mapping, Protocol, Sequence
 
-CONTRACT_VERSION = "1.0"
+CONTRACT_VERSION = "1.1"
 SCHEMA_VERSION = "1.0"
 
 class ProcessingStatus(str, Enum):
@@ -134,6 +134,8 @@ class Diagnostic:
     message: str
     file_path: str | None = None
     line: int | None = None
+    arxiv_id: str | None = None
+    version: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.severity, DiagnosticSeverity):
@@ -153,11 +155,19 @@ class Diagnostic:
             _require_non_empty(self.file_path, "file_path")
         if self.line is not None:
             _require_positive(self.line, "line")
+        if self.arxiv_id is not None:
+            _require_non_empty(self.arxiv_id, "arxiv_id")
+        if self.version is not None:
+            _require_positive(self.version, "version")
 
 
 @dataclass(frozen=True)
 class SourceFile:
-    """One file on the resolved LaTeX compilation path."""
+    """One file in the resolved source/reference dependency path.
+
+    Supported files include .tex, .bib, and .bbl.
+    The order is deterministic across all files in the bundle.
+    """
 
     relative_path: str
     content: str
@@ -174,7 +184,19 @@ class SourceFile:
 
 @dataclass(frozen=True)
 class SourceBundle:
-    """Output of TV2 for one publication version."""
+    """Output of TV2 for one publication version.
+
+    files contains all files needed by downstream modules:
+    the root and included .tex files, plus bibliography resources
+    declared through \\bibliography, \\addbibresource, or explicit .bbl input.
+    root_file normally identifies the file containing \\documentclass. A narrowly
+    recognized Plain/AMS-TeX entrypoint may be used as a fallback with
+    status=partial_parse and a NONSTANDARD_TEX_ROOT diagnostic.
+
+    TV2 owns path resolution.
+    TV3 consumes structural TeX files.
+    TV5 consumes bibliography files.
+    """
 
     arxiv_id: str
     version: int
@@ -272,12 +294,19 @@ class BibEntry:
 
 @dataclass(frozen=True)
 class ReferenceBundle:
-    """Output of TV5 for all versions of one publication."""
+    """Output of TV5 for all versions of one publication.
+
+    entries contains unified bibliography records.
+    citation_maps maps each version's original citation keys to
+    canonical citation keys.
+    diagnostics records incomplete or failed bibliography extraction.
+    """
 
     arxiv_id: str
     entries: tuple[BibEntry, ...]
     citation_maps: Mapping[int, Mapping[str, str]]
     diagnostics: tuple[Diagnostic, ...] = ()
+    raw_entry_count: int | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty(self.arxiv_id, "arxiv_id")
@@ -285,6 +314,8 @@ class ReferenceBundle:
             object.__setattr__(self, "entries", tuple(self.entries))
         if not isinstance(self.diagnostics, tuple):
             object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
+        if self.raw_entry_count is not None:
+            _require_non_negative(self.raw_entry_count, "raw_entry_count")
         if not isinstance(self.citation_maps, Mapping):
             raise TypeError("citation_maps must be a mapping")
 
