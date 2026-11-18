@@ -13,7 +13,11 @@ from src.parsing.contracts import (
     SourceBundle,
     SourceFile,
 )
-from src.parsing.export import export_publication, finalize_run
+from src.parsing.export import (
+    PublicationBatchWriter,
+    export_publication,
+    finalize_run,
+)
 from src.parsing.validation import ValidationReport
 
 
@@ -158,3 +162,40 @@ def test_export_manifest_marks_bibtex_partial_diagnostic(tmp_path):
 
     manifest = json.loads((tmp_path / "version_manifest.jsonl").read_text())
     assert manifest["status"] == "bibtex_partial"
+
+
+def test_batch_writer_reduces_shards_and_finalizes_contract(tmp_path):
+    publication = DeduplicatedPublication(
+        arxiv_id="2501.01234",
+        versions=(),
+        elements=(),
+        hierarchy=(),
+    )
+    references = ReferenceBundle(
+        arxiv_id="2501.01234",
+        entries=(),
+        citation_maps={},
+    )
+    validation = ValidationReport()
+
+    with PublicationBatchWriter(tmp_path, 0) as writer:
+        writer.write_publication(
+            publication=publication,
+            references=references,
+            sources=(),
+            validation_report=validation,
+        )
+
+    batch_dir = tmp_path / "batches" / "part-000000"
+    assert sorted(path.name for path in batch_dir.iterdir()) == [
+        "bibtex.jsonl",
+        "elements.jsonl",
+        "hierarchy.jsonl",
+        "validation_reports.jsonl",
+        "version_manifest.jsonl",
+    ]
+    finalize_run(tmp_path, shard_dir=tmp_path)
+    assert (tmp_path / "elements.jsonl").read_text(encoding="utf-8") == ""
+    assert json.loads(
+        (tmp_path / "validation_report.json").read_text(encoding="utf-8")
+    )["status"] == "passed"

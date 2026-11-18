@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -29,7 +30,7 @@ from src.parsing.contracts import (
     SourceBundle,
 )
 from src.parsing.export import (
-    export_publication,
+    PublicationBatchWriter,
     finalize_run,
     write_json,
 )
@@ -187,6 +188,7 @@ class PublicationRunResult:
     deduplicated: DeduplicatedPublication
     validation: ValidationReport
     elapsed_seconds: float
+    stage_timings: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -213,6 +215,7 @@ class PublicationWorkerSummary:
     outcome: str
     elapsed_seconds: float
     statistics: dict[str, object]
+    stage_timings: tuple[tuple[str, float], ...] = ()
 
 
 def current_dependencies(
@@ -364,12 +367,14 @@ def process_publication(
     """
 
     started = perf_counter()
+    stage_timings: dict[str, float] = {}
     logger.info(
         "m2_publication_start arxiv_id=%s versions=%d",
         publication.arxiv_id,
         len(publication.versions),
     )
     gathered_sources: list[SourceBundle] = []
+    stage_started = perf_counter()
     for item in publication.versions:
         if progress is not None:
             progress.set_stage(
@@ -398,9 +403,11 @@ def process_publication(
                     f"diagnostics={len(source.diagnostics)}"
                 ),
             )
+    stage_timings["gather"] = perf_counter() - stage_started
     sources = tuple(gathered_sources)
 
     raw_trees: list[RawTree] = []
+    stage_started = perf_counter()
     for source in sources:
         if progress is not None:
             progress.set_stage(
@@ -451,6 +458,7 @@ def process_publication(
             tree.root is not None,
             len(tree.diagnostics),
         )
+    stage_timings["hierarchy"] = perf_counter() - stage_started
 
     if progress is not None:
         progress.set_stage(
@@ -458,6 +466,7 @@ def process_publication(
             arxiv_id=publication.arxiv_id,
             message=f"input=SourceBundle[{len(sources)}]",
         )
+    stage_started = perf_counter()
     references = dependencies.process_references(sources)
     if progress is not None:
         progress.complete(
@@ -480,8 +489,10 @@ def process_publication(
         len(references.citation_maps),
         len(references.diagnostics),
     )
+    stage_timings["references"] = perf_counter() - stage_started
 
     normalized_versions: list[NormalizedVersion] = []
+    stage_started = perf_counter()
     for tree in raw_trees:
         if progress is not None:
             progress.set_stage(
@@ -529,6 +540,7 @@ def process_publication(
             len(normalized.nodes),
             len(normalized.diagnostics),
         )
+    stage_timings["normalization"] = perf_counter() - stage_started
 
     if progress is not None:
         progress.set_stage(
@@ -536,6 +548,7 @@ def process_publication(
             arxiv_id=publication.arxiv_id,
             message=f"input=NormalizedVersion[{len(normalized_versions)}]",
         )
+    stage_started = perf_counter()
     deduplicated = dependencies.deduplicate_publication(
         normalized_versions,
         publication.arxiv_id,
@@ -554,6 +567,8 @@ def process_publication(
         len(deduplicated.elements),
         len(deduplicated.hierarchy),
     )
+    stage_timings["deduplication"] = perf_counter() - stage_started
+    stage_started = perf_counter()
     validation = validate_all(
         source_bundles=sources,
         raw_trees=raw_trees,
@@ -568,6 +583,7 @@ def process_publication(
         references,
         normalized_versions,
     )
+    stage_timings["validation"] = perf_counter() - stage_started
     outcome = _publication_outcome(
         sources,
         references,
@@ -609,6 +625,7 @@ def process_publication(
         deduplicated=deduplicated,
         validation=validation,
         elapsed_seconds=elapsed_seconds,
+        stage_timings=tuple(sorted(stage_timings.items())),
     )
 
 
@@ -624,54 +641,67 @@ def _silence_worker_logging() -> None:
     app_logger.propagate = False
 
 
-def _process_and_export_publication(
-    publication: PublicationInput,
+def _process_and_export_batch(
+    batch_index: int,
+    publications: tuple[PublicationInput, ...],
     dependencies: PipelineDependencies,
-    output_dir: Path,
     shard_dir: Path,
-) -> PublicationWorkerSummary:
-    """Run one publication in a worker and return aggregate metadata only."""
+) -> tuple[PublicationWorkerSummary, ...]:
+    """Run one bounded publication batch and write five batch streams."""
 
     _silence_worker_logging()
-    result = process_publication(publication, dependencies)
-    export_publication(
-        publication=result.deduplicated,
-        references=result.references,
-        sources=result.sources,
-        validation_report=result.validation,
-        output_dir=output_dir,
-        shard_dir=shard_dir,
-        raw_trees=result.raw_trees,
-        normalized_versions=result.normalized_versions,
-    )
+    summaries: list[PublicationWorkerSummary] = []
+    with PublicationBatchWriter(shard_dir, batch_index) as writer:
+        for publication in publications:
+            publication_started = perf_counter()
+            result = process_publication(publication, dependencies)
+            stage_timings = dict(result.stage_timings)
 
-    worker_statistics = StatisticsAccumulator()
-    worker_statistics.record_publication(
-        sources=result.sources,
-        references=result.references,
-        normalized_versions=result.normalized_versions,
-        raw_trees=result.raw_trees,
-        publication=result.deduplicated,
-        validation=result.validation,
-        elapsed_seconds=result.elapsed_seconds,
-        expected_version_count=len(result.publication.versions),
-        diagnostics=result.validation.diagnostics,
-    )
-    outcome = _publication_outcome(
-        result.sources,
-        result.references,
-        result.validation,
-        raw_trees=result.raw_trees,
-        normalized_versions=result.normalized_versions,
-    )
-    return PublicationWorkerSummary(
-        arxiv_id=publication.arxiv_id,
-        version_count=len(result.sources),
-        element_count=len(result.deduplicated.elements),
-        outcome=outcome,
-        elapsed_seconds=result.elapsed_seconds,
-        statistics=worker_statistics.to_dict(),
-    )
+            stage_started = perf_counter()
+            writer.write_publication(
+                publication=result.deduplicated,
+                references=result.references,
+                sources=result.sources,
+                validation_report=result.validation,
+                raw_trees=result.raw_trees,
+                normalized_versions=result.normalized_versions,
+            )
+            stage_timings["export"] = perf_counter() - stage_started
+
+            stage_started = perf_counter()
+            worker_statistics = StatisticsAccumulator()
+            worker_statistics.record_publication(
+                sources=result.sources,
+                references=result.references,
+                normalized_versions=result.normalized_versions,
+                raw_trees=result.raw_trees,
+                publication=result.deduplicated,
+                validation=result.validation,
+                elapsed_seconds=result.elapsed_seconds,
+                expected_version_count=len(result.publication.versions),
+                diagnostics=result.validation.diagnostics,
+            )
+            stage_timings["statistics"] = perf_counter() - stage_started
+
+            outcome = _publication_outcome(
+                result.sources,
+                result.references,
+                result.validation,
+                raw_trees=result.raw_trees,
+                normalized_versions=result.normalized_versions,
+            )
+            summaries.append(
+                PublicationWorkerSummary(
+                    arxiv_id=publication.arxiv_id,
+                    version_count=len(result.sources),
+                    element_count=len(result.deduplicated.elements),
+                    outcome=outcome,
+                    elapsed_seconds=perf_counter() - publication_started,
+                    statistics=worker_statistics.to_dict(),
+                    stage_timings=tuple(sorted(stage_timings.items())),
+                )
+            )
+    return tuple(summaries)
 
 
 def _complete_parallel_progress(
@@ -708,63 +738,74 @@ def _complete_parallel_progress(
 def _run_parallel_publications(
     publications: Sequence[PublicationInput],
     dependencies: PipelineDependencies,
-    output_dir: Path,
     shard_dir: Path,
     workers: int,
+    batch_size: int,
     progress: M2ProgressMonitor,
     benchmark: BenchmarkRecorder,
     statistics: StatisticsAccumulator,
 ) -> tuple[int, int, int]:
-    """Process a bounded number of independent publication tasks at once."""
+    """Process bounded publication batches with deterministic shard order."""
 
-    publication_iterator = iter(enumerate(publications, start=1))
-    futures: dict[Future, tuple[int, PublicationInput]] = {}
+    batches = tuple(
+        tuple(publications[index : index + batch_size])
+        for index in range(0, len(publications), batch_size)
+    )
+    futures: dict[Future, tuple[int, tuple[PublicationInput, ...]]] = {}
     max_in_flight = workers * 2
     publication_count = 0
     version_count = 0
     element_count = 0
 
-    def submit_next(executor: ProcessPoolExecutor) -> bool:
-        try:
-            index, publication = next(publication_iterator)
-        except StopIteration:
+    next_batch_index = 0
+
+    def submit_next_ordered(executor: ProcessPoolExecutor) -> bool:
+        nonlocal next_batch_index
+        if next_batch_index >= len(batches):
             return False
-        progress.set_publication(publication.arxiv_id)
+        batch_index = next_batch_index
+        next_batch_index += 1
+        batch = batches[batch_index]
+        progress.set_publication(batch[0].arxiv_id)
         logger.info(
-            "m2_progress publication=%d/%d arxiv_id=%s",
-            index,
-            len(publications),
-            publication.arxiv_id,
+            "m2_progress batch=%d/%d first_arxiv_id=%s publications=%d",
+            batch_index + 1,
+            len(batches),
+            batch[0].arxiv_id,
+            len(batch),
         )
         future = executor.submit(
-            _process_and_export_publication,
-            publication,
+            _process_and_export_batch,
+            batch_index,
+            batch,
             dependencies,
-            output_dir,
             shard_dir,
         )
-        futures[future] = (index, publication)
+        futures[future] = (batch_index, batch)
         return True
 
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        while len(futures) < max_in_flight and submit_next(executor):
+        while len(futures) < max_in_flight and submit_next_ordered(executor):
             pass
         while futures:
             completed, _ = wait(futures, return_when=FIRST_COMPLETED)
             for future in completed:
-                _, publication = futures.pop(future)
-                summary = future.result()
-                statistics.merge_single_publication(summary.statistics)
-                _complete_parallel_progress(progress, summary)
-                benchmark.finish_publication(
-                    publication.arxiv_id,
-                    summary.elapsed_seconds,
-                )
-                progress.finish_publication(status=summary.outcome)
-                publication_count += 1
-                version_count += summary.version_count
-                element_count += summary.element_count
-                while len(futures) < max_in_flight and submit_next(executor):
+                _, batch = futures.pop(future)
+                summaries = future.result()
+                for summary in summaries:
+                    statistics.merge_single_publication(summary.statistics)
+                    for stage, elapsed_seconds in summary.stage_timings:
+                        benchmark.record_stage(stage, elapsed_seconds)
+                    _complete_parallel_progress(progress, summary)
+                    benchmark.finish_publication(
+                        summary.arxiv_id,
+                        summary.elapsed_seconds,
+                    )
+                    progress.finish_publication(status=summary.outcome)
+                    publication_count += 1
+                    version_count += summary.version_count
+                    element_count += summary.element_count
+                while len(futures) < max_in_flight and submit_next_ordered(executor):
                     pass
 
     return publication_count, version_count, element_count
@@ -780,6 +821,7 @@ def run_pipeline(
     input_description: str = "publication iterable",
     collect_results: bool = False,
     workers: int = 1,
+    batch_size: int = 8,
 ) -> PipelineRunResult:
     """Process, validate, export, and benchmark a deterministic M2 run.
 
@@ -790,6 +832,8 @@ def run_pipeline(
 
     if isinstance(workers, bool) or workers < 1:
         raise ValueError("workers must be a positive integer")
+    if isinstance(batch_size, bool) or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
     if workers > 1 and collect_results:
         raise ValueError(
             "collect_results=True is not supported when workers is greater than 1"
@@ -836,79 +880,106 @@ def run_pipeline(
                 ) = _run_parallel_publications(
                     ordered_publications,
                     dependencies,
-                    output_dir,
                     shard_dir,
                     workers,
+                    batch_size,
                     progress,
                     benchmark,
                     statistics,
                 )
                 sequential_publications = ()
 
-            for index, publication in enumerate(sequential_publications, start=1):
-                progress.set_publication(publication.arxiv_id)
-                logger.info(
-                    "m2_progress publication=%d/%d arxiv_id=%s",
-                    index,
-                    len(ordered_publications),
-                    publication.arxiv_id,
-                )
-                benchmark.start_publication(publication.arxiv_id)
-                result = process_publication(publication, dependencies, progress)
-                progress.set_stage(
-                    "export",
-                    arxiv_id=publication.arxiv_id,
-                    message=f"input={output_dir}",
-                )
-                export_publication(
-                    publication=result.deduplicated,
-                    references=result.references,
-                    sources=result.sources,
-                    validation_report=result.validation,
-                    output_dir=output_dir,
-                    shard_dir=shard_dir,
-                    raw_trees=result.raw_trees,
-                    normalized_versions=result.normalized_versions,
-                )
-                progress.complete(
-                    "export",
-                    message=(
-                        f"elements={len(result.deduplicated.elements)} "
-                        f"hierarchy={len(result.deduplicated.hierarchy)}"
-                    ),
-                )
-                statistics.record_publication(
-                    sources=result.sources,
-                    references=result.references,
-                    normalized_versions=result.normalized_versions,
-                    raw_trees=result.raw_trees,
-                    publication=result.deduplicated,
-                    validation=result.validation,
-                    elapsed_seconds=result.elapsed_seconds,
-                    expected_version_count=len(result.publication.versions),
-                    diagnostics=result.validation.diagnostics,
-                )
-                publication_status = _publication_outcome(
-                    result.sources,
-                    result.references,
-                    result.validation,
-                    raw_trees=result.raw_trees,
-                    normalized_versions=result.normalized_versions,
-                )
-                benchmark.finish_publication(publication.arxiv_id)
-                progress.finish_publication(status=publication_status)
-                processed_publication_count += 1
-                processed_version_count += len(result.sources)
-                exported_element_count += len(result.deduplicated.elements)
-                if collect_results:
-                    results.append(result)
-                else:
-                    # Avoid retaining the final publication's source text and
-                    # trees while the run-level shards are being merged.
-                    del result
+            serial_writer = (
+                PublicationBatchWriter(shard_dir, 0)
+                if workers == 1
+                else nullcontext(None)
+            )
+            with serial_writer as batch_writer:
+                for index, publication in enumerate(
+                    sequential_publications,
+                    start=1,
+                ):
+                    progress.set_publication(publication.arxiv_id)
+                    logger.info(
+                        "m2_progress publication=%d/%d arxiv_id=%s",
+                        index,
+                        len(ordered_publications),
+                        publication.arxiv_id,
+                    )
+                    benchmark.start_publication(publication.arxiv_id)
+                    result = process_publication(
+                        publication,
+                        dependencies,
+                        progress,
+                    )
+                    for stage, elapsed_seconds in result.stage_timings:
+                        benchmark.record_stage(stage, elapsed_seconds)
+                    progress.set_stage(
+                        "export",
+                        arxiv_id=publication.arxiv_id,
+                        message=f"input={output_dir}",
+                    )
+                    export_started = perf_counter()
+                    if batch_writer is None:
+                        raise RuntimeError("serial batch writer is unavailable")
+                    batch_writer.write_publication(
+                        publication=result.deduplicated,
+                        references=result.references,
+                        sources=result.sources,
+                        validation_report=result.validation,
+                        raw_trees=result.raw_trees,
+                        normalized_versions=result.normalized_versions,
+                    )
+                    benchmark.record_stage(
+                        "export",
+                        perf_counter() - export_started,
+                    )
+                    progress.complete(
+                        "export",
+                        message=(
+                            f"elements={len(result.deduplicated.elements)} "
+                            f"hierarchy={len(result.deduplicated.hierarchy)}"
+                        ),
+                    )
+                    statistics_started = perf_counter()
+                    statistics.record_publication(
+                        sources=result.sources,
+                        references=result.references,
+                        normalized_versions=result.normalized_versions,
+                        raw_trees=result.raw_trees,
+                        publication=result.deduplicated,
+                        validation=result.validation,
+                        elapsed_seconds=result.elapsed_seconds,
+                        expected_version_count=len(result.publication.versions),
+                        diagnostics=result.validation.diagnostics,
+                    )
+                    benchmark.record_stage(
+                        "statistics",
+                        perf_counter() - statistics_started,
+                    )
+                    publication_status = _publication_outcome(
+                        result.sources,
+                        result.references,
+                        result.validation,
+                        raw_trees=result.raw_trees,
+                        normalized_versions=result.normalized_versions,
+                    )
+                    benchmark.finish_publication(publication.arxiv_id)
+                    progress.finish_publication(status=publication_status)
+                    processed_publication_count += 1
+                    processed_version_count += len(result.sources)
+                    exported_element_count += len(result.deduplicated.elements)
+                    if collect_results:
+                        results.append(result)
+                    else:
+                        del result
 
+            finalize_started = perf_counter()
             finalize_run(output_dir, shard_dir=shard_dir)
+            benchmark.record_stage("finalize", perf_counter() - finalize_started)
+        statistics_started = perf_counter()
         stats = statistics.to_dict()
+        benchmark.record_stage("run_statistics", perf_counter() - statistics_started)
         # Write statistics before measuring output size so the benchmark includes
         # the main run-level report in the generated storage footprint.
         write_json(output_dir / "statistics.json", stats)
@@ -918,6 +989,10 @@ def run_pipeline(
             version_count=processed_version_count,
             element_count=exported_element_count,
         )
+        benchmark_result["execution"] = {
+            "workers": workers,
+            "batch_size": batch_size,
+        }
         write_json(output_dir / "benchmark.json", benchmark_result)
         # The benchmark file is itself part of the generated output.  Re-write
         # its size after measuring the first complete output tree so the

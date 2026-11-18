@@ -331,6 +331,18 @@ Pipeline output.
         (output_dir / "benchmark.json").read_text(encoding="utf-8")
     )
     assert benchmark["output"]["size_bytes"] == directory_size_bytes(output_dir)
+    assert benchmark["execution"] == {"workers": 1, "batch_size": 8}
+    assert set(benchmark["stage_timings_seconds"]) >= {
+        "gather",
+        "hierarchy",
+        "references",
+        "normalization",
+        "deduplication",
+        "validation",
+        "export",
+        "finalize",
+        "run_statistics",
+    }
 
 
 def test_run_pipeline_counts_merged_diagnostics_in_statistics(tmp_path):
@@ -559,6 +571,7 @@ def test_parallel_pipeline_matches_serial_dataset_output(tmp_path):
     assert parallel.statistics["versions"] == serial.statistics["versions"]
     assert parallel.statistics["elements"] == serial.statistics["elements"]
     assert parallel.statistics["references"] == serial.statistics["references"]
+    assert parallel.benchmark["stage_timings_seconds"]
 
 
 def test_parallel_pipeline_rejects_retaining_large_results(tmp_path):

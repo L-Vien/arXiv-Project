@@ -7,7 +7,7 @@ import os
 import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from src.parsing.contracts import (
     BibEntry,
@@ -71,6 +71,17 @@ def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
             for row in rows
         ),
     )
+
+
+def _write_jsonl_rows(
+    handle: TextIO,
+    rows: Iterable[Mapping[str, Any]],
+) -> None:
+    """Write JSONL rows to an already-open stream."""
+
+    for row in rows:
+        handle.write(json.dumps(row, ensure_ascii=False, sort_keys=False))
+        handle.write("\n")
 
 
 def _element_row(row: ElementRow) -> dict[str, Any]:
@@ -175,6 +186,101 @@ def _publication_dir(output_dir: Path, arxiv_id: str) -> Path:
     return output_dir / "publications" / safe_id
 
 
+class PublicationBatchWriter:
+    """Write many publications into a small deterministic batch shard.
+
+    The historical exporter creates five files per publication.  The pipeline
+    uses this writer so a worker creates five files per batch instead, while
+    direct callers can continue using :func:`export_publication` unchanged.
+    """
+
+    def __init__(self, shard_dir: Path, batch_index: int) -> None:
+        self.batch_dir = (
+            Path(shard_dir) / "batches" / f"part-{batch_index:06d}"
+        )
+        self._handles: dict[str, TextIO] = {}
+
+    def __enter__(self) -> "PublicationBatchWriter":
+        self.batch_dir.mkdir(parents=True, exist_ok=True)
+        for filename in (
+            "elements.jsonl",
+            "hierarchy.jsonl",
+            "bibtex.jsonl",
+            "version_manifest.jsonl",
+            "validation_reports.jsonl",
+        ):
+            self._handles[filename] = (self.batch_dir / filename).open(
+                "w",
+                encoding="utf-8",
+                newline="\n",
+            )
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        for handle in self._handles.values():
+            handle.close()
+        self._handles.clear()
+
+    def write_publication(
+        self,
+        *,
+        publication: DeduplicatedPublication,
+        references: ReferenceBundle,
+        sources: tuple[SourceBundle, ...],
+        validation_report: ValidationReport,
+        raw_trees: tuple[RawTree, ...] = (),
+        normalized_versions: tuple[NormalizedVersion, ...] = (),
+    ) -> None:
+        """Append one publication to this batch's five open streams."""
+
+        if len(self._handles) != 5:
+            raise RuntimeError(
+                "PublicationBatchWriter must be used as a context manager"
+            )
+        raw_trees_by_version = {tree.version: tree for tree in raw_trees}
+        normalized_by_version = {
+            version.version: version for version in normalized_versions
+        }
+        _write_jsonl_rows(
+            self._handles["elements.jsonl"],
+            (_element_row(row) for row in publication.elements),
+        )
+        _write_jsonl_rows(
+            self._handles["hierarchy.jsonl"],
+            (_hierarchy_row(row) for row in publication.hierarchy),
+        )
+        _write_jsonl_rows(
+            self._handles["bibtex.jsonl"],
+            (
+                _bibtex_row(publication.arxiv_id, entry)
+                for entry in references.entries
+            ),
+        )
+        _write_jsonl_rows(
+            self._handles["version_manifest.jsonl"],
+            (
+                _manifest_dict(
+                    _manifest_row(
+                        source,
+                        raw_trees_by_version.get(source.version),
+                        normalized_by_version.get(source.version),
+                        validation_report,
+                    )
+                )
+                for source in sources
+            ),
+        )
+        _write_jsonl_rows(
+            self._handles["validation_reports.jsonl"],
+            (
+                {
+                    "arxiv_id": publication.arxiv_id,
+                    "report": validation_report.to_dict(),
+                },
+            ),
+        )
+
+
 def export_publication(
     *,
     publication: DeduplicatedPublication,
@@ -263,6 +369,16 @@ def _merge_validation_reports(shard_root: Path) -> dict[str, Any]:
     warnings: list[dict[str, Any]] = []
     if shard_root.exists():
         for shard in sorted(path for path in shard_root.iterdir() if path.is_dir()):
+            batch_reports_path = shard / "validation_reports.jsonl"
+            if batch_reports_path.is_file():
+                with batch_reports_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        report = json.loads(line)["report"]
+                        errors.extend(report.get("errors", []))
+                        warnings.extend(report.get("warnings", []))
+                continue
             report_path = shard / "validation_report.json"
             if not report_path.exists():
                 continue
@@ -285,7 +401,9 @@ def finalize_run(
 
     output_dir = Path(output_dir)
     shard_base = output_dir if shard_dir is None else Path(shard_dir)
-    shard_root = shard_base / "publications"
+    batch_root = shard_base / "batches"
+    publication_root = shard_base / "publications"
+    shard_root = batch_root if batch_root.exists() else publication_root
     for filename in (
         "elements.jsonl",
         "hierarchy.jsonl",
@@ -304,6 +422,7 @@ def finalize_run(
 
 
 __all__ = [
+    "PublicationBatchWriter",
     "export_publication",
     "finalize_run",
     "write_json",
