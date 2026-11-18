@@ -209,6 +209,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="publication worker processes; start with 2 or 3 for large runs",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="publications processed per worker task (default: 8)",
+    )
     return parser
 
 
@@ -347,6 +353,7 @@ def _print_terminal_summary(
     timing = _section(statistics, "timing")
     memory = _section(benchmark, "memory")
     benchmark_output = _section(benchmark, "output")
+    stage_timings = _section(benchmark, "stage_timings_seconds")
 
     failed = _integer(publications.get("failed"))
     partial = _integer(publications.get("partial"))
@@ -404,6 +411,14 @@ def _print_terminal_summary(
         f"peak_rss:{_megabytes(memory.get('peak_rss_bytes'))} "
         f"output_size:{_megabytes(benchmark_output.get('size_bytes'))}"
     )
+    if stage_timings:
+        print(
+            "stage_timing="
+            + " ".join(
+                f"{name}:{_decimal(seconds) or 0.0:.3f}s"
+                for name, seconds in stage_timings.items()
+            )
+        )
     print(f"selection={selection_mode}")
     print(f"output_dir={output_dir}")
     print(f"statistics={output_dir / 'statistics.json'}")
@@ -419,6 +434,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--progress-interval must be greater than zero")
     if args.workers <= 0:
         parser.error("--workers must be greater than zero")
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be greater than zero")
     publications, mode = _select_from_args(parser, args)
     _print_selection(publications, mode)
 
@@ -433,7 +450,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         len(publications),
         sum(len(publication.versions) for publication in publications),
     )
-    logger.info("m2_run_start output_dir=%s", args.output_dir)
+    logger.info(
+        "m2_run_start output_dir=%s workers=%d batch_size=%d",
+        args.output_dir,
+        args.workers,
+        args.batch_size,
+    )
 
     result = run_pipeline(
         publications=publications,
@@ -442,6 +464,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         progress_enabled=not args.no_progress,
         progress_interval_seconds=args.progress_interval,
         workers=args.workers,
+        batch_size=args.batch_size,
         input_description=(
             f"corpus={args.corpus_dir} selection={mode} "
             f"publications={len(publications)}"

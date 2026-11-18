@@ -112,6 +112,21 @@ def test_cli_accepts_worker_count():
     assert args.workers == 3
 
 
+def test_cli_accepts_batch_size():
+    args = build_parser().parse_args(
+        [
+            "--corpus-dir",
+            "corpus",
+            "--output-dir",
+            "output",
+            "--all",
+            "--batch-size",
+            "16",
+        ]
+    )
+    assert args.batch_size == 16
+
+
 def test_cli_rejects_csv_and_explicit_id_modes():
     parser = build_parser()
     with pytest.raises(SystemExit):

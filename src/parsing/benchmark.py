@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import threading
+from collections import defaultdict
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -46,6 +47,7 @@ class BenchmarkRecorder:
         self._peak_rss: int | None = None
         self._publication_started_at: dict[str, float] = {}
         self._publication_seconds: dict[str, float] = {}
+        self._stage_seconds: dict[str, float] = defaultdict(float)
         self._sample_lock = threading.Lock()
         self._sampler_stop = threading.Event()
         self._sampler_thread: threading.Thread | None = None
@@ -128,6 +130,15 @@ class BenchmarkRecorder:
         self._publication_seconds[arxiv_id] = max(0.0, elapsed_seconds)
         self._sample()
 
+    def record_stage(self, stage: str, elapsed_seconds: float) -> None:
+        """Accumulate elapsed time for one named pipeline stage."""
+
+        if not stage:
+            raise ValueError("stage must be non-empty")
+        if elapsed_seconds < 0:
+            raise ValueError("elapsed_seconds must be non-negative")
+        self._stage_seconds[stage] += elapsed_seconds
+
     def finish(
         self,
         *,
@@ -156,6 +167,11 @@ class BenchmarkRecorder:
                 sorted(self._publication_seconds.items())
             ),
             "average_publication_time_seconds": average_publication_seconds,
+            "stage_timings_seconds": dict(sorted(self._stage_seconds.items())),
+            "stage_timing_scope": (
+                "aggregate elapsed time recorded by the parent and worker "
+                "processes; parallel stage totals may exceed wall time"
+            ),
             "publication_timing_scope": (
                 "processing, validation, export, and per-publication statistics"
             ),

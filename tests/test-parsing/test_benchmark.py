@@ -21,6 +21,8 @@ def test_benchmark_records_time_memory_and_output_size(tmp_path):
     assert result["wall_time_seconds"] >= 0
     assert result["publication_times_seconds"]["2501.01234"] == 0.01
     assert result["average_publication_time_seconds"] == 0.01
+    assert result["stage_timings_seconds"] == {}
+    assert "parallel stage totals" in result["stage_timing_scope"]
     assert "export" in result["publication_timing_scope"]
     assert "peak_rss_bytes" in result["memory"]
     assert result["memory"]["rss_scope"] == (
