@@ -25,7 +25,14 @@ logs/
 *.log
 samples/
 out/
-input/
+# Keep small, versioned M3 input definitions.  Generated corpus data stays out
+# of Git under ../data/.
+input/*
+!input/README.md
+!input/input_manifest.json
+!input/member_ranges.csv
+!input/member-paper-ids/
+!input/member-paper-ids/*.txt
 
 # OS files
 .DS_Store

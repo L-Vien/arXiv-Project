@@ -1,0 +1,50 @@
+{
+  "config_version": "1.0",
+  "runtime": {
+    "data_root_env": "M3_DATA_ROOT",
+    "default_data_root": "../data",
+    "global_random_seed": 42
+  },
+  "versions": {
+    "matching_schema_version": "1.0",
+    "feature_schema_version": "1.0",
+    "model_version": "1.0"
+  },
+  "paths": {
+    "m1_corpus": "corpus",
+    "m2_outputs": "m2",
+    "input_manifest": "input/input_manifest.json",
+    "member_ranges": "input/member_ranges.csv",
+    "member_paper_ids": "input/member-paper-ids",
+    "frozen_inputs": "m3/frozen-inputs",
+    "labels": "m3/labels",
+    "features": "m3/features",
+    "models": "m3/models",
+    "predictions": "m3/predictions",
+    "member_datasets": "m3/member-datasets",
+    "validation_reports": "m3/validation-reports"
+  },
+  "split_policy": {
+    "unit": "publication",
+    "partitions": ["train", "valid", "test"],
+    "manual_publications_per_member": {
+      "train": 3,
+      "valid": 1,
+      "test": 1
+    },
+    "automatic_publications_per_member": {
+      "valid_minimum": 1,
+      "test_minimum": 1
+    }
+  },
+  "label_policy": {
+    "manual_statuses": ["match", "no_match", "uncertain"],
+    "final_statuses": ["match", "no_match"],
+    "automatic_statuses": ["match", "no_match"]
+  },
+  "candidate_policy": {
+    "scope": "same_citing_publication",
+    "deduplicate_by": "ref_arxiv_id",
+    "tie_break": ["score_desc", "title_similarity_desc", "ref_arxiv_id_asc"]
+  }
+}
