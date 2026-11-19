@@ -1,0 +1,59 @@
+{
+  "manifest_version": "1.0",
+  "status": "m2_outputs_available_pending_freeze",
+  "path_resolution": {
+    "data_root_env": "M3_DATA_ROOT",
+    "cli_override": "--data-root",
+    "local_example": "../data",
+    "colab_example": "/content/arxiv-data",
+    "rule": "Every path below is relative to data_root. Do not store machine-specific absolute paths."
+  },
+  "versions": {
+    "m1_data_version": "1.0",
+    "m2_data_version": "available_pending_commit_and_checksum",
+    "matching_schema_version": "1.0"
+  },
+  "inputs": {
+    "m1_corpus_root": {
+      "relative_path": "corpus",
+      "required": true,
+      "description": "M1 corpus grouped as corpus/range-XX/<paper-slug>/metadata.json."
+    },
+    "m1_metadata": {
+      "relative_glob": "corpus/range-*/**/metadata.json",
+      "required": true
+    },
+    "m1_references": {
+      "relative_glob": "corpus/range-*/**/references.json",
+      "required": true
+    },
+    "m2_bibtex": {
+      "relative_path_template": "m2/{range_id}/bibtex.jsonl",
+      "required": true,
+      "status": "available"
+    },
+    "m2_elements": {
+      "relative_path_template": "m2/{range_id}/elements.jsonl",
+      "required": true,
+      "status": "available"
+    },
+    "m2_hierarchy": {
+      "relative_path_template": "m2/{range_id}/hierarchy.jsonl",
+      "required": true,
+      "status": "available"
+    }
+  },
+  "freeze_requirements": {
+    "m2_git_commit": null,
+    "frozen_at": null,
+    "row_counts": {},
+    "file_sizes_bytes": {},
+    "sha256": {},
+    "validation_status": "pending"
+  },
+  "notes": [
+    "Copy this manifest to <data-root>/m3/frozen-inputs/input_manifest.json before the first full M3 run.",
+    "Fill row counts, file sizes, checksums, freeze timestamp, and M2 commit in that copied manifest.",
+    "The repository version intentionally contains no local or Colab absolute path."
+  ]
+}
