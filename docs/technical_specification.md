@@ -93,6 +93,8 @@ The pipeline is resumable. Progress is persisted in JSON/JSONL journals and run-
 | `src/crawling/processor.py` | Safely extract source archives and retain `.tex`, `.bib`, and `.bbl` files. |
 | `src/crawling/metadata.py` | Normalize paper metadata and construct stable corpus paths. |
 | `src/crawling/reference_crawler.py` | Retrieve and persist reference metadata from Semantic Scholar. |
+| `src/crawling/reference_enrichment.py` | Resolve arXiv candidate submission metadata without confusing it with publication metadata. |
+| `src/crawling/reconciliation.py` | Audit that every discovered version has an explicit source-status record. |
 | `src/crawling/pipeline.py` | Coordinate discovery, source processing, reference crawling, checkpoints, and resume. |
 | `src/crawling/stats.py` | Collect runtime, memory, disk, throughput, and status metrics. |
 | `src/crawling/config.py` | Resolve paths, API settings, retry defaults, and request pacing. |
@@ -123,10 +125,19 @@ The working corpus retains all references returned by Semantic Scholar. The norm
 | `ref_arxiv_id` | string | ID of the cited paper. |
 | `ref_title` | string | Cited paper title. |
 | `ref_authors` | list of strings | Cited paper authors. |
-| `ref_submission_date` | string | Publication or submission date when available. |
+| `ref_submission_date` | nullable ISO date | First arXiv submission date only; never a Semantic Scholar publication date or year. |
 | `ref_s2_id` | string | Semantic Scholar paper ID. |
 
 References without an arXiv ID remain in the local working corpus even when they are not included in this table.
+
+`references.json` schema version 2 also carries the following working fields for
+M3 enrichment. They are intentionally not added to the required public
+six-table schema: `ref_doi`, `ref_publication_date`,
+`ref_publication_year`, `ref_venue`, `ref_arxiv_last_updated_date`, and field
+provenance such as `ref_doi_source`. Semantic Scholar supplies bibliographic
+publication metadata; the separate arXiv enrichment pass supplies
+`ref_submission_date` from the cited paper's first arXiv submission. Missing
+scalars are JSON `null`, never sentinel strings.
 
 ### 6.3. Version processing status
 
@@ -154,6 +165,11 @@ corpus/
 ```
 
 A version may contain multiple `.tex`, `.bib`, and `.bbl` files. Their relative paths are preserved. A version without usable TeX still has a status record and is not silently discarded.
+
+Before M2, `python -m src.crawling.reconciliation --corpus-dir <corpus>` must
+report zero `missing_version_records`. The report distinguishes an absent record
+from an explicit `ok`, `no_tex`, `missing`, or failed status so a full rebuild
+can be resumed safely and audited later.
 
 ## 8. Inputs, outputs, and configuration
 

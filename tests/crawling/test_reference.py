@@ -109,7 +109,12 @@ class TestReferenceStandardization(unittest.TestCase):
                 "title": "Test Paper Title 1",
                 "authors": [{"name": "Alice"}, {"name": "Bob"}],
                 "publicationDate": "2023-01-15",
-                "externalIds": {"ArXiv": "2301.00001v1"}
+                "year": 2023,
+                "venue": "Journal of Careful Metadata",
+                "externalIds": {
+                    "ArXiv": "2301.00001v1",
+                    "DOI": "https://doi.org/10.1000/Example.1",
+                }
             },
             {
                 "paperId": "s2_id_2",
@@ -124,14 +129,38 @@ class TestReferenceStandardization(unittest.TestCase):
         std = self.crawler.standardize_references("2310.12345", raw_refs)
         self.assertEqual(len(std), 2)
         self.assertEqual(std[0]["arxiv_id"], "2310.12345")
-        self.assertEqual(std[0]["ref_arxiv_id"], "2301.00001v1")
+        self.assertEqual(std[0]["ref_arxiv_id"], "2301.00001")
         self.assertEqual(std[0]["ref_title"], "Test Paper Title 1")
         self.assertEqual(std[0]["ref_authors"], ["Alice", "Bob"])
-        self.assertEqual(std[0]["ref_submission_date"], "2023-01-15")
+        self.assertIsNone(std[0]["ref_submission_date"])
         self.assertEqual(std[0]["ref_s2_id"], "s2_id_1")
+        self.assertEqual(std[0]["ref_doi"], "10.1000/example.1")
+        self.assertEqual(std[0]["ref_publication_date"], "2023-01-15")
+        self.assertEqual(std[0]["ref_publication_year"], 2023)
+        self.assertEqual(std[0]["ref_venue"], "Journal of Careful Metadata")
 
         self.assertEqual(std[1]["ref_arxiv_id"], None)
-        self.assertEqual(std[1]["ref_submission_date"], "2022")
+        self.assertIsNone(std[1]["ref_submission_date"])
+        self.assertEqual(std[1]["ref_publication_year"], 2022)
+
+    def test_standardize_references_does_not_emit_string_missing_values(self):
+        std = self.crawler.standardize_references(
+            "2310.12345",
+            [{"paperId": None, "title": "  ", "authors": None, "externalIds": {}}],
+        )
+
+        self.assertEqual(std, [{
+            "arxiv_id": "2310.12345",
+            "ref_arxiv_id": None,
+            "ref_title": None,
+            "ref_authors": [],
+            "ref_submission_date": None,
+            "ref_s2_id": None,
+            "ref_doi": None,
+            "ref_publication_date": None,
+            "ref_publication_year": None,
+            "ref_venue": None,
+        }])
 
 
 class TestCachingAndAtomicSave(unittest.TestCase):

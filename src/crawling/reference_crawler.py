@@ -62,6 +62,8 @@ logging.Logger.fail = logger_fail
 logger = logging.getLogger("ReferenceCrawler")
 logger.setLevel(logging.INFO)
 
+REFERENCE_SCHEMA_VERSION = 2
+
 if not logger.handlers:
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
@@ -76,6 +78,39 @@ def _normalize_arxiv_id(aid: str) -> str:
         cleaned = re.sub(r"v\d+$", "", rest)
         return f"{cat}/{cleaned}"
     return re.sub(r"v\d+$", "", aid)
+
+
+def _optional_text(value: Any) -> Optional[str]:
+    """Return a trimmed metadata value or ``None`` for absent/sentinel text."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.casefold() in {"none", "null"}:
+        return None
+    return text
+
+
+def _normalize_doi(value: Any) -> Optional[str]:
+    """Normalize a DOI without treating arbitrary text as a DOI."""
+
+    text = _optional_text(value)
+    if text is None:
+        return None
+    text = re.sub(r"^(?:doi\s*:\s*|https?://(?:dx\.)?doi\.org/)", "", text, flags=re.IGNORECASE)
+    match = re.search(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", text, flags=re.IGNORECASE)
+    if match is None:
+        return None
+    return match.group(0).rstrip(".,;:)]}").casefold()
+
+
+def _publication_year(value: Any) -> Optional[int]:
+    """Return a four-digit bibliographic year, without inventing a date."""
+
+    if isinstance(value, bool) or value is None:
+        return None
+    match = re.search(r"\b(1[6-9]\d{2}|20\d{2}|21\d{2})\b", str(value))
+    return int(match.group(1)) if match else None
 
 
 class APIKeyPool:
@@ -263,18 +298,43 @@ class ReferenceCrawler:
         return arxiv_id.replace('/', '-').replace('.', '-')
 
     def standardize_references(self, arxiv_id: str, raw_references: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Map Semantic Scholar records to the versioned M1 working schema.
+
+        ``publicationDate`` and ``year`` describe Semantic Scholar publication
+        metadata, not arXiv submission time.  The latter is filled only by the
+        separate arXiv-enrichment pass, so this method deliberately leaves
+        ``ref_submission_date`` null.
+        """
+
         std_list = []
         for ref in raw_references:
             if not isinstance(ref, dict):
                 continue
             external_ids = ref.get("externalIds", {}) or {}
+            external_ids = external_ids if isinstance(external_ids, dict) else {}
+            raw_arxiv_id = _optional_text(external_ids.get("ArXiv"))
+            try:
+                ref_arxiv_id = _normalize_arxiv_id(raw_arxiv_id) if raw_arxiv_id else None
+            except (AttributeError, TypeError):
+                ref_arxiv_id = None
+            raw_authors = ref.get("authors")
+            raw_authors = raw_authors if isinstance(raw_authors, list) else []
             std_list.append({
                 "arxiv_id": arxiv_id,
-                "ref_arxiv_id": external_ids.get("ArXiv") if isinstance(external_ids, dict) else None,
-                "ref_title": ref.get("title"),
-                "ref_authors": [a.get("name", "") for a in ref.get("authors", []) if isinstance(a, dict) and a.get("name")],
-                "ref_submission_date": ref.get("publicationDate") or str(ref.get("year", "")),
-                "ref_s2_id": ref.get("paperId")
+                "ref_arxiv_id": ref_arxiv_id,
+                "ref_title": _optional_text(ref.get("title")),
+                "ref_authors": [
+                    name for author in raw_authors
+                    if isinstance(author, dict)
+                    for name in [_optional_text(author.get("name"))]
+                    if name is not None
+                ],
+                "ref_submission_date": None,
+                "ref_s2_id": _optional_text(ref.get("paperId")),
+                "ref_doi": _normalize_doi(external_ids.get("DOI")),
+                "ref_publication_date": _optional_text(ref.get("publicationDate")),
+                "ref_publication_year": _publication_year(ref.get("year")),
+                "ref_venue": _optional_text(ref.get("venue")),
             })
         return std_list
 
@@ -306,8 +366,8 @@ class ReferenceCrawler:
                 pass
 
         data = {
-            "schema_version": 1,
-            "crawler_version": "1.0.0",
+            "schema_version": REFERENCE_SCHEMA_VERSION,
+            "crawler_version": "2.0.0",
             "arxiv_id": arxiv_id,
             "status": status,
             "retryable": retryable,
@@ -336,7 +396,13 @@ class ReferenceCrawler:
     def fetch_batch(self, arxiv_ids: List[str]) -> Tuple[Optional[List[Dict[str, Any]]], bool, Optional[str], int]:
         clean_ids = [f"ARXIV:{_normalize_arxiv_id(aid)}" for aid in arxiv_ids]
         url = "https://api.semanticscholar.org/graph/v1/paper/batch"
-        params = {"fields": "references.title,references.authors,references.year,references.publicationDate,references.externalIds"}
+        params = {
+            "fields": (
+                "references.paperId,references.title,references.authors,references.year,"
+                "references.publicationDate,references.venue,"
+                "references.externalIds"
+            )
+        }
         body = {"ids": clean_ids}
 
         transient_attempts = 0
@@ -470,7 +536,7 @@ class ReferenceCrawler:
                     try:
                         with open(output_file, "r", encoding="utf-8") as f:
                             cache = json.load(f)
-                        if isinstance(cache, dict) and cache.get("schema_version") == 1:
+                        if isinstance(cache, dict) and cache.get("schema_version") == REFERENCE_SCHEMA_VERSION:
                             status = cache.get("status")
                             if status == "success":
                                 std_refs = self.standardize_references(aid, cache.get("references", []))
