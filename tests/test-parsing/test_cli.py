@@ -84,6 +84,32 @@ def test_load_publications_keeps_publication_without_version_as_empty_v1(tmp_pat
     assert publications[0].versions == (VersionInput(1, paper_dir),)
 
 
+def test_load_publications_materializes_missing_versions_from_metadata(tmp_path):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    paper_dir = corpus / "2609-22836"
+    paper_dir.mkdir()
+    (paper_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "arxiv_id": "2609.22836",
+                "revised_dates": ["2026-09-22", "2026-09-28"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    for version in (1, 3):
+        (paper_dir / f"v{version}").mkdir()
+
+    publication = load_publications(corpus)[0]
+
+    assert publication.versions == (
+        VersionInput(1, paper_dir / "v1"),
+        VersionInput(2, paper_dir / "v2"),
+        VersionInput(3, paper_dir / "v3"),
+    )
+
+
 def test_cli_accepts_run_all_alias():
     args = build_parser().parse_args(
         [

@@ -26,7 +26,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Mapping, Protocol, Sequence
 
-CONTRACT_VERSION = "1.1"
+CONTRACT_VERSION = "1.2"
 SCHEMA_VERSION = "1.0"
 
 class ProcessingStatus(str, Enum):
@@ -271,6 +271,7 @@ class BibEntry:
     citation_key: str
     entry_type: str
     raw_citation_key: str | None = None
+    raw_entry: str | None = None
     source_kind: str = "unknown"
     parse_status: str = "parsed"
     title: str = ""
@@ -287,6 +288,8 @@ class BibEntry:
             object.__setattr__(self, "raw_citation_key", self.citation_key)
         else:
             _require_non_empty(self.raw_citation_key, "raw_citation_key")
+        if self.raw_entry is not None and not isinstance(self.raw_entry, str):
+            raise TypeError("raw_entry must be a string or None")
         _require_non_empty(self.source_kind, "source_kind")
         _require_non_empty(self.parse_status, "parse_status")
         for field_name in ("title", "doi", "journal", "url"):

@@ -11,6 +11,7 @@ import hashlib
 import re
 import unicodedata
 from dataclasses import replace
+from datetime import date
 from typing import Mapping, Sequence, Tuple, List, Dict, Set, Optional, Any
 from urllib.parse import unquote
 
@@ -49,6 +50,59 @@ _REFERENCE_BLOCK_PATTERN = re.compile(
     r"\\end\s*\{(?:verbatim\*?|lstlisting|comment)\}",
     re.IGNORECASE | re.DOTALL,
 )
+
+_BIB_ENTRY_START_PATTERN = re.compile(
+    r"(?im)(?<!\\)@\s*(?:article|book|booklet|conference|dataset|inbook|"
+    r"incollection|inproceedings|manual|mastersthesis|misc|online|phdthesis|"
+    r"proceedings|software|techreport|unpublished)\s*[\{(]"
+)
+_TITLE_FIELD_LEAK_PATTERN = re.compile(
+    r"(?:,\s*|\s{2,})(?:abstract|author|authors|booktitle|doi|eprint|isbn|issn|"
+    r"journal|journaltitle|month|note|number|pages|publisher|school|series|url|"
+    r"volume|year)\s*=",
+    re.IGNORECASE,
+)
+_BIB_FIELD_ASSIGNMENT_PATTERN = re.compile(
+    r"(?im)(?:^|,\s*|\n\s*)(?P<name>abstract|address|arxivid|author|authors|"
+    r"booktitle|chapter|date|doi|edition|eprint|howpublished|institution|isbn|"
+    r"issn|journal|journaltitle|keywords|month|note|number|organization|pages|"
+    r"publisher|school|series|title|type|url|volume|year)\s*=\s*"
+)
+
+_LATEX_COMMAND_REPLACEMENTS = {
+    "apj": "The Astrophysical Journal",
+    "apjl": "The Astrophysical Journal Letters",
+    "apjs": "The Astrophysical Journal Supplement Series",
+    "aaps": "Astronomy and Astrophysics Supplement Series",
+    "aj": "The Astronomical Journal",
+    "mnras": "Monthly Notices of the Royal Astronomical Society",
+    "aap": "Astronomy & Astrophysics",
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "epsilon": "ε",
+    "lambda": "λ",
+    "mu": "μ",
+    "nu": "ν",
+    "pi": "π",
+    "rho": "ρ",
+    "sigma": "σ",
+    "tau": "τ",
+    "phi": "φ",
+    "chi": "χ",
+    "psi": "ψ",
+    "omega": "ω",
+    "rightarrow": "→",
+    "leftarrow": "←",
+    "leftrightarrow": "↔",
+    "times": "×",
+    "pm": "±",
+    "leq": "≤",
+    "geq": "≥",
+    "neq": "≠",
+    "infty": "∞",
+}
 
 
 def _safe_citation_key(
@@ -167,11 +221,19 @@ def _normalize_arxiv_id(value: str) -> str:
 
 
 def _clean_latex_accents(text: str) -> str:
-    """Clean LaTeX accent commands and braces into clean unicode characters."""
+    """Convert common semantic LaTeX to stable display text."""
     if not text:
         return ""
+
+    text = re.sub(
+        r"\\href\s*\{[^{}]*\}\s*\{([^{}]*)\}",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
     wrapper = re.compile(
-        r"\\(?:emph|textit|textbf|texttt|textrm|textsf|mathrm|mathit|mathbf|url)\s*\{([^{}]*)\}",
+        r"\\(?:emph|ensuremath|mbox|operatorname|text|textit|textbf|texttt|"
+        r"textnormal|textrm|textsf|mathrm|mathit|mathbf|url)\s*\{([^{}]*)\}",
         re.IGNORECASE,
     )
     while wrapper.search(text):
@@ -191,6 +253,11 @@ def _clean_latex_accents(text: str) -> str:
             match.group(2) + accent_combining[match.group(1)],
         )
 
+    text = re.sub(
+        r"\\([`'\"^~])\{?\\([ij])\}?",
+        compose_accent,
+        text,
+    )
     text = re.sub(
         r"\\([`'\"^~])\{?([a-zA-Z])\}?",
         compose_accent,
@@ -212,15 +279,34 @@ def _clean_latex_accents(text: str) -> str:
     while wrapper.search(text):
         text = wrapper.sub(r"\1", text)
     text = text.replace(r"\LaTeX", "LaTeX").replace(r"\TeX", "TeX")
+    text = re.sub(r"\\text([A-Z][A-Za-z0-9]*)", r"\1", text)
+    for command, replacement in sorted(
+        _LATEX_COMMAND_REPLACEMENTS.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        text = re.sub(
+            rf"\\{re.escape(command)}(?![A-Za-z@])",
+            lambda _match, value=replacement: value,
+            text,
+            flags=re.IGNORECASE,
+        )
+    text = re.sub(r"\\(?:quad|qquad|,|;|:|!)(?![A-Za-z@])", " ", text)
+    text = re.sub(r"\\(?:&|%|#|_|\$)", lambda match: match.group(0)[1:], text)
+    text = text.replace(r"\{", "").replace(r"\}", "")
+    text = re.sub(r"\\{2,}", " ", text)
     text = re.sub(
-        r"\\(?:emph|textit|textbf|texttt|textrm|textsf|mathrm|mathit|mathbf|url)\s*\{",
+        r"\\(?:emph|ensuremath|mbox|operatorname|text|textit|textbf|texttt|"
+        r"textnormal|textrm|textsf|mathrm|mathit|mathbf|url)\s*\{",
         "",
         text,
         flags=re.IGNORECASE,
     )
     text = re.sub(r"\\[a-zA-Z]+\{([a-zA-Z])\}", lambda m: m.group(1), text)
+    text = re.sub(r"\\([A-Za-z@]+)(?![A-Za-z@])", r"\1", text)
     text = re.sub(r"[{}]", "", text)
-    return text
+    text = text.replace("~", " ")
+    return unicodedata.normalize("NFC", text)
 
 
 def _clean_field_value(val: str) -> str:
@@ -264,6 +350,22 @@ def _clean_field_value(val: str) -> str:
     val = _clean_latex_accents(val)
     val = re.sub(r"\s+", " ", val).strip()
     return val
+
+
+def _clean_title_value(value: str) -> str:
+    """Clean a title without retaining text leaked from malformed fields."""
+
+    title = _clean_field_value(value)
+    next_entry = _BIB_ENTRY_START_PATTERN.search(title)
+    if next_entry is not None:
+        title = title[:next_entry.start()]
+    leaked_field = _TITLE_FIELD_LEAK_PATTERN.search(title)
+    if leaked_field is not None:
+        title = title[:leaked_field.start()]
+    title = title.strip(" \t\r\n,;:'\"")
+    if re.fullmatch(r"(?:https?://|doi\s*:).+", title, flags=re.IGNORECASE):
+        return ""
+    return title
 
 
 def _unwrap_outer_group(value: str) -> str:
@@ -437,7 +539,7 @@ def _parse_bib_fields(fields_text: str) -> Dict[str, str]:
         elif c == '\\':
             escape = True
             current.append(c)
-        elif c == '"' and not escape:
+        elif c == '"' and brace_depth == 0 and not escape:
             in_quote = not in_quote
             current.append(c)
         elif c == '{' and not in_quote:
@@ -468,6 +570,33 @@ def _parse_bib_fields(fields_text: str) -> Dict[str, str]:
     return fields
 
 
+def _recover_bib_fields(fields_text: str, fields: Dict[str, str]) -> Dict[str, str]:
+    """Recover explicit assignments after a malformed quote or brace.
+
+    This fallback is intentionally narrow: it runs only when the normal
+    top-level parser found at most one field or when the parsed title visibly
+    contains another assignment. Values are bounded by the next recognized
+    field name, so a damaged title cannot consume the rest of the entry.
+    """
+
+    cleaned_title = _clean_field_value(fields.get("title", ""))
+    if len(fields) > 1 and not _TITLE_FIELD_LEAK_PATTERN.search(cleaned_title):
+        return fields
+
+    matches = list(_BIB_FIELD_ASSIGNMENT_PATTERN.finditer(fields_text))
+    if not matches:
+        return fields
+
+    recovered = dict(fields)
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(fields_text)
+        value = fields_text[match.end():end].rstrip(" \t\r\n,")
+        name = match.group("name").lower()
+        if value and (name not in recovered or name == "title"):
+            recovered[name] = value
+    return recovered
+
+
 def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnostic]) -> List[BibEntry]:
     """Parse BibTeX format content into BibEntry objects robustly."""
     entries: List[BibEntry] = []
@@ -476,6 +605,7 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
     n = len(content)
     while i < n:
         if content[i] == '@':
+            entry_start = i
             start_type = i + 1
             j = start_type
             while j < n and (content[j].isalnum() or content[j] in '_-'):
@@ -501,8 +631,16 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
                     j += 1
 
                 entry_closed = brace_depth == 0
-                body_end = j - 1 if entry_closed else n
+                if entry_closed:
+                    body_end = j - 1
+                    entry_end = j
+                else:
+                    next_entry = _BIB_ENTRY_START_PATTERN.search(content, body_start)
+                    body_end = next_entry.start() if next_entry is not None else n
+                    entry_end = body_end
+                    j = body_end
                 entry_body = content[body_start:body_end]
+                raw_entry = content[entry_start:entry_end].strip()
                 i = j
 
                 comma_idx = entry_body.find(',')
@@ -525,22 +663,20 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
                     else ""
                 )
 
-                field_dict = _parse_bib_fields(fields_text)
+                field_dict = _recover_bib_fields(
+                    fields_text,
+                    _parse_bib_fields(fields_text),
+                )
 
-                title = _clean_field_value(field_dict.get("title", ""))
+                title = _clean_title_value(field_dict.get("title", ""))
                 author_raw = field_dict.get("author", "") or field_dict.get("authors", "")
                 authors = _parse_authors(author_raw)
 
-                year_raw = field_dict.get("year", "")
-                year: Optional[int] = None
-                if year_raw:
-                    clean_year_str = _clean_field_value(year_raw)
-                    year_match = re.search(r"\b(19\d{2}|20\d{2})\b", clean_year_str)
-                    if year_match:
-                        try:
-                            year = int(year_match.group(1))
-                        except ValueError:
-                            pass
+                year = _year_from_text(
+                    field_dict.get("year", ""),
+                    file_path=file_path,
+                    diagnostics=diagnostics,
+                )
 
                 doi = _normalize_doi(field_dict.get("doi", ""))
                 journal = _clean_field_value(field_dict.get("journal", "") or field_dict.get("booktitle", "") or field_dict.get("journaltitle", ""))
@@ -573,6 +709,7 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
                             citation_key=citation_key,
                             entry_type=entry_type or "misc",
                             raw_citation_key=raw_citation_key,
+                            raw_entry=raw_entry,
                             source_kind="bibtex",
                             parse_status="partial" if not entry_closed else "parsed",
                             title=title,
@@ -626,16 +763,11 @@ def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagn
         )
         item_text = match.group("body").strip()
 
-        year_match = re.search(r"\b(19\d{2}|20\d{2})\b", item_text)
+        # A rendered citation may mention several years, future horizons, or
+        # access dates. Without a structured year field there is no reliable
+        # way to identify the publication year, so leave it unknown for M3.
         year: Optional[int] = None
-        if year_match:
-            try:
-                year = int(year_match.group(1))
-            except ValueError:
-                pass
-            before_year = item_text[:year_match.start()]
-        else:
-            before_year = item_text
+        before_year = item_text
 
         authors: Tuple[str, ...] = ()
         if before_year:
@@ -685,9 +817,10 @@ def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagn
             BibEntry(
                 citation_key=citation_key,
                 entry_type="misc",
-                    raw_citation_key=raw_citation_key,
-                    source_kind="bibitem",
-                    parse_status="citation_text_only",
+                raw_citation_key=raw_citation_key,
+                raw_entry=item_text,
+                source_kind="bibitem",
+                parse_status="citation_text_only",
                 title=title,
                 authors=authors,
                 year=year,
@@ -738,9 +871,30 @@ def _read_braced_group(text: str, position: int) -> tuple[str, int] | None:
     return None
 
 
-def _year_from_text(value: str) -> Optional[int]:
-    match = re.search(r"\b(19\d{2}|20\d{2})\b", _clean_field_value(value))
-    return int(match.group(1)) if match else None
+def _year_from_text(
+    value: str,
+    *,
+    file_path: str = "",
+    diagnostics: List[Diagnostic] | None = None,
+) -> Optional[int]:
+    """Return a plausible year only from an explicitly structured field."""
+
+    match = re.search(r"\b(\d{4})\b", _clean_field_value(value))
+    if match is None:
+        return None
+    year = int(match.group(1))
+    if 1600 <= year <= date.today().year + 1:
+        return year
+    if diagnostics is not None:
+        diagnostics.append(
+            Diagnostic(
+                severity=DiagnosticSeverity.WARNING,
+                code="INVALID_YEAR",
+                message=f"Discarded implausible structured year {year}",
+                file_path=file_path,
+            )
+        )
+    return None
 
 
 def _parse_biber_bbl_content(
@@ -789,8 +943,12 @@ def _parse_biber_bbl_content(
             diagnostics=diagnostics,
         )
 
-        title = _clean_field_value(fields.get("title", ""))
-        year = _year_from_text(fields.get("year", "") or fields.get("date", ""))
+        title = _clean_title_value(fields.get("title", ""))
+        year = _year_from_text(
+            fields.get("year", "") or fields.get("date", ""),
+            file_path=file_path,
+            diagnostics=diagnostics,
+        )
         doi = _normalize_doi(fields.get("doi", ""))
         journal = _clean_field_value(
             fields.get("journaltitle", "") or fields.get("journal", "")
@@ -801,6 +959,7 @@ def _parse_biber_bbl_content(
                 citation_key=citation_key,
                 entry_type=start.group(2).strip().lower() or "misc",
                 raw_citation_key=raw_citation_key,
+                raw_entry=content[start.start():block_end].strip(),
                 source_kind="biber_bbl",
                 title=title,
                 year=year,
@@ -879,11 +1038,16 @@ def _parse_harvard_bbl_content(
                 citation_key=citation_key,
                 entry_type="misc",
                 raw_citation_key=raw_citation_key,
+                raw_entry=body.strip(),
                 source_kind="harvard_bbl",
                 parse_status="citation_text_only",
                 title="",
                 authors=_parse_authors(author_group[0]),
-                year=_year_from_text(year_group[0]),
+                year=_year_from_text(
+                    year_group[0],
+                    file_path=file_path,
+                    diagnostics=diagnostics,
+                ),
                 doi=doi,
                 journal="",
                 url=url_match.group(0) if url_match else "",
@@ -933,6 +1097,11 @@ def _merge_same_key_entries(entries: Sequence[BibEntry]) -> list[BibEntry]:
                 else entry.entry_type
             ),
             raw_citation_key=current.raw_citation_key,
+            raw_entry=(
+                current.raw_entry
+                if _entry_quality(current) >= _entry_quality(entry)
+                else entry.raw_entry
+            ),
             source_kind=current.source_kind,
             parse_status=(
                 "parsed"
@@ -1121,6 +1290,10 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
             citation_key=canonical_key,
             entry_type=entry_type,
             raw_citation_key=items_sorted[0][1].raw_citation_key,
+            raw_entry=max(
+                (entry for _, entry in items_sorted),
+                key=_entry_quality,
+            ).raw_entry,
             source_kind=next(
                 (entry.source_kind for _, entry in items_sorted if entry.parse_status == "parsed"),
                 items_sorted[0][1].source_kind,
