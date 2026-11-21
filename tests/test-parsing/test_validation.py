@@ -5,6 +5,7 @@ import unittest
 from src.parsing.contracts import (
     BibEntry,
     DeduplicatedPublication,
+    DiagnosticSeverity,
     ElementRow,
     HierarchyRow,
     NodeKind,
@@ -162,6 +163,36 @@ class ReferenceValidationTests(unittest.TestCase):
         self.assertEqual(
             codes,
             {"DUPLICATE_CITATION_KEY", "UNKNOWN_CITATION_TARGET"},
+        )
+
+    def test_invalid_bibliographic_values_are_reported_without_rejecting_the_bundle(self) -> None:
+        references = ReferenceBundle(
+            arxiv_id="2501.01234",
+            entries=(
+                BibEntry(
+                    citation_key="bad key",
+                    entry_type="article",
+                    title=r"An \\emph{un-normalized} title",
+                    year=1500,
+                    doi="not-a-doi",
+                ),
+            ),
+            citation_maps={1: {"bad key": "bad key"}},
+        )
+
+        diagnostics = validate_reference_bundle(references)
+
+        self.assertEqual(
+            {diagnostic.code for diagnostic in diagnostics},
+            {
+                "INVALID_CITATION_KEY",
+                "INVALID_YEAR",
+                "INVALID_DOI",
+                "RESIDUAL_LATEX",
+            },
+        )
+        self.assertTrue(
+            all(diagnostic.severity is DiagnosticSeverity.WARNING for diagnostic in diagnostics)
         )
 
     def test_unresolved_normalized_citations_are_reported_per_version(self) -> None:

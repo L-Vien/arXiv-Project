@@ -127,6 +127,18 @@ def _bibtex_row(arxiv_id: str, entry: BibEntry) -> dict[str, Any]:
     }
 
 
+def _bibtex_provenance_row(arxiv_id: str, entry: BibEntry) -> dict[str, Any]:
+    """Internal audit metadata; it is intentionally not part of final Parquet."""
+
+    return {
+        "arxiv_id": arxiv_id,
+        "citation_key": entry.citation_key,
+        "raw_citation_key": entry.raw_citation_key,
+        "source_kind": entry.source_kind,
+        "parse_status": entry.parse_status,
+    }
+
+
 def _manifest_row(
     source: SourceBundle,
     raw_tree: RawTree | None = None,
@@ -206,6 +218,7 @@ class PublicationBatchWriter:
             "elements.jsonl",
             "hierarchy.jsonl",
             "bibtex.jsonl",
+            "bibtex_provenance.jsonl",
             "version_manifest.jsonl",
             "validation_reports.jsonl",
         ):
@@ -233,7 +246,7 @@ class PublicationBatchWriter:
     ) -> None:
         """Append one publication to this batch's five open streams."""
 
-        if len(self._handles) != 5:
+        if len(self._handles) != 6:
             raise RuntimeError(
                 "PublicationBatchWriter must be used as a context manager"
             )
@@ -253,6 +266,13 @@ class PublicationBatchWriter:
             self._handles["bibtex.jsonl"],
             (
                 _bibtex_row(publication.arxiv_id, entry)
+                for entry in references.entries
+            ),
+        )
+        _write_jsonl_rows(
+            self._handles["bibtex_provenance.jsonl"],
+            (
+                _bibtex_provenance_row(publication.arxiv_id, entry)
                 for entry in references.entries
             ),
         )
@@ -317,6 +337,13 @@ def export_publication(
         publication_dir / "bibtex.jsonl",
         (
             _bibtex_row(publication.arxiv_id, entry)
+            for entry in references.entries
+        ),
+    )
+    _write_jsonl(
+        publication_dir / "bibtex_provenance.jsonl",
+        (
+            _bibtex_provenance_row(publication.arxiv_id, entry)
             for entry in references.entries
         ),
     )
@@ -408,6 +435,7 @@ def finalize_run(
         "elements.jsonl",
         "hierarchy.jsonl",
         "bibtex.jsonl",
+        "bibtex_provenance.jsonl",
         "version_manifest.jsonl",
     ):
         _merge_jsonl_shards(

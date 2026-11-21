@@ -38,6 +38,12 @@ _CITATION_RE = re.compile(
     r"\\(?P<command>[A-Za-z]*[Cc]ite[A-Za-z]*)"
     r"\*?(?:\s*\[[^\]]*\]){0,2}\s*\{(?P<keys>[^{}]+)\}"
 )
+_UNSAFE_CITATION_KEY = re.compile(
+    r"\s|[\x00-\x1f\x7f]|\\|^(?:https?://|doi:)",
+    re.IGNORECASE,
+)
+_DOI_RE = re.compile(r"^10\.\d{4,9}/[-._;()/:A-Z0-9]+$", re.IGNORECASE)
+_LATEX_COMMAND_RE = re.compile(r"\\[A-Za-z]+")
 
 _PARTIAL_DIAGNOSTIC_STATUSES = {
     "BIBTEX_PARTIAL": ProcessingStatus.BIBTEX_PARTIAL,
@@ -265,6 +271,44 @@ def validate_reference_bundle(
                         f"version {version} maps to unknown key {new_key!r}",
                     )
                 )
+
+    for entry in references.entries:
+        if _UNSAFE_CITATION_KEY.search(entry.citation_key):
+            diagnostics.append(
+                _diagnostic(
+                    "INVALID_CITATION_KEY",
+                    f"citation key is not safe for a published table: {entry.citation_key!r}",
+                    severity=DiagnosticSeverity.WARNING,
+                )
+            )
+        if entry.year is not None and not 1600 <= entry.year <= 2100:
+            diagnostics.append(
+                _diagnostic(
+                    "INVALID_YEAR",
+                    f"year is outside the accepted range: {entry.year}",
+                    severity=DiagnosticSeverity.WARNING,
+                )
+            )
+        if entry.doi and not _DOI_RE.fullmatch(entry.doi):
+            diagnostics.append(
+                _diagnostic(
+                    "INVALID_DOI",
+                    f"DOI does not have canonical syntax: {entry.doi!r}",
+                    severity=DiagnosticSeverity.WARNING,
+                )
+            )
+        if any(
+            _LATEX_COMMAND_RE.search(value)
+            for value in (entry.title, entry.journal, *entry.authors)
+            if value
+        ):
+            diagnostics.append(
+                _diagnostic(
+                    "RESIDUAL_LATEX",
+                    f"entry {entry.citation_key!r} still contains a LaTeX command",
+                    severity=DiagnosticSeverity.WARNING,
+                )
+            )
 
     return tuple(diagnostics)
 

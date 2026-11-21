@@ -96,6 +96,9 @@ def test_export_uses_flat_jsonl_schema_and_version_manifest(tmp_path):
 
     element = json.loads((tmp_path / "elements.jsonl").read_text().strip())
     bibtex = json.loads((tmp_path / "bibtex.jsonl").read_text().strip())
+    provenance = json.loads(
+        (tmp_path / "bibtex_provenance.jsonl").read_text().strip()
+    )
     manifests = [
         json.loads(line)
         for line in (tmp_path / "version_manifest.jsonl").read_text().splitlines()
@@ -104,6 +107,13 @@ def test_export_uses_flat_jsonl_schema_and_version_manifest(tmp_path):
     assert publication_dir.name == "2501-01234"
     assert set(element) == {"element_id", "arxiv_id", "kind", "content"}
     assert bibtex["authors"] == ["A. Author", "B. Author"]
+    assert provenance == {
+        "arxiv_id": "2501.01234",
+        "citation_key": "vaswani2017",
+        "raw_citation_key": "vaswani2017",
+        "source_kind": "unknown",
+        "parse_status": "parsed",
+    }
     assert manifests[0]["status"] == "bibtex_partial"
     assert manifests[1]["status"] == "empty_no_tex"
     assert json.loads(
@@ -189,6 +199,7 @@ def test_batch_writer_reduces_shards_and_finalizes_contract(tmp_path):
     batch_dir = tmp_path / "batches" / "part-000000"
     assert sorted(path.name for path in batch_dir.iterdir()) == [
         "bibtex.jsonl",
+        "bibtex_provenance.jsonl",
         "elements.jsonl",
         "hierarchy.jsonl",
         "validation_reports.jsonl",

@@ -270,6 +270,9 @@ class BibEntry:
 
     citation_key: str
     entry_type: str
+    raw_citation_key: str | None = None
+    source_kind: str = "unknown"
+    parse_status: str = "parsed"
     title: str = ""
     authors: tuple[str, ...] = ()
     year: int | None = None
@@ -280,6 +283,12 @@ class BibEntry:
     def __post_init__(self) -> None:
         _require_non_empty(self.citation_key, "citation_key")
         _require_non_empty(self.entry_type, "entry_type")
+        if self.raw_citation_key is None:
+            object.__setattr__(self, "raw_citation_key", self.citation_key)
+        else:
+            _require_non_empty(self.raw_citation_key, "raw_citation_key")
+        _require_non_empty(self.source_kind, "source_kind")
+        _require_non_empty(self.parse_status, "parse_status")
         for field_name in ("title", "doi", "journal", "url"):
             if not isinstance(getattr(self, field_name), str):
                 raise TypeError(f"{field_name} must be a string")
