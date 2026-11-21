@@ -134,6 +134,7 @@ def _bibtex_provenance_row(arxiv_id: str, entry: BibEntry) -> dict[str, Any]:
         "arxiv_id": arxiv_id,
         "citation_key": entry.citation_key,
         "raw_citation_key": entry.raw_citation_key,
+        "raw_entry": entry.raw_entry,
         "source_kind": entry.source_kind,
         "parse_status": entry.parse_status,
     }

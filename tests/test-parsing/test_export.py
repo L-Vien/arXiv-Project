@@ -111,6 +111,7 @@ def test_export_uses_flat_jsonl_schema_and_version_manifest(tmp_path):
         "arxiv_id": "2501.01234",
         "citation_key": "vaswani2017",
         "raw_citation_key": "vaswani2017",
+        "raw_entry": None,
         "source_kind": "unknown",
         "parse_status": "parsed",
     }

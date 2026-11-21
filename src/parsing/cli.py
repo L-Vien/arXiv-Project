@@ -84,21 +84,30 @@ def _parse_range(
     return ArxivRange(start=start, end=end)
 
 
-def _version_inputs(paper_dir: Path) -> tuple[VersionInput, ...]:
-    versions: list[VersionInput] = []
+def _version_inputs(
+    paper_dir: Path,
+    expected_count: int | None = None,
+) -> tuple[VersionInput, ...]:
+    observed: dict[int, Path] = {}
     for version_dir in paper_dir.iterdir():
         if not version_dir.is_dir():
             continue
         match = _VERSION_PATTERN.fullmatch(version_dir.name)
         if match is None:
             continue
-        versions.append(
-            VersionInput(
-                version=int(match.group(1)),
-                source_dir=version_dir,
-            )
+        observed[int(match.group(1))] = version_dir
+
+    if not observed and expected_count is None:
+        return ()
+
+    version_count = max(expected_count or 0, max(observed, default=0))
+    return tuple(
+        VersionInput(
+            version=version,
+            source_dir=observed.get(version, paper_dir / f"v{version}"),
         )
-    return tuple(sorted(versions, key=lambda item: item.version))
+        for version in range(1, version_count + 1)
+    )
 
 
 def load_publications(
@@ -126,13 +135,21 @@ def load_publications(
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             arxiv_id = base_arxiv_id(metadata["arxiv_id"])
+            revised_dates = metadata.get("revised_dates")
+            if revised_dates is not None and not isinstance(revised_dates, list):
+                raise TypeError("revised_dates must be a list when present")
+            expected_count = (
+                1 + len(revised_dates)
+                if revised_dates is not None
+                else None
+            )
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError(f"invalid metadata: {metadata_path}: {exc}") from exc
 
         if arxiv_range is not None and not arxiv_range.contains(arxiv_id):
             continue
 
-        versions = _version_inputs(paper_dir)
+        versions = _version_inputs(paper_dir, expected_count)
         if not versions:
             # M1 keeps PDF-only or otherwise source-less publications as an
             # empty record.  Preserve them in M2 instead of aborting a full

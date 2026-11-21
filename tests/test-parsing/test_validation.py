@@ -195,6 +195,34 @@ class ReferenceValidationTests(unittest.TestCase):
             all(diagnostic.severity is DiagnosticSeverity.WARNING for diagnostic in diagnostics)
         )
 
+    def test_contaminated_titles_are_reported_for_regeneration(self) -> None:
+        references = ReferenceBundle(
+            arxiv_id="2501.01234",
+            entries=(
+                BibEntry(
+                    citation_key="field-leak",
+                    entry_type="article",
+                    title="A title, journal = Fake Journal, year = 2024",
+                ),
+                BibEntry(
+                    citation_key="citation-blob",
+                    entry_type="misc",
+                    title="Doe et al. 2024. https://example.org/paper",
+                ),
+            ),
+            citation_maps={1: {}},
+        )
+
+        codes = {
+            diagnostic.code
+            for diagnostic in validate_reference_bundle(references)
+        }
+
+        self.assertEqual(
+            codes,
+            {"FIELD_BOUNDARY_LEAK", "TITLE_IS_CITATION_BLOB"},
+        )
+
     def test_unresolved_normalized_citations_are_reported_per_version(self) -> None:
         references = ReferenceBundle(
             arxiv_id="2501.01234",

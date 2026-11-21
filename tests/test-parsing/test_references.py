@@ -139,8 +139,35 @@ def test_unstructured_bibitem_is_not_published_as_a_truncated_title():
 
     assert len(bundle.entries) == 1
     assert bundle.entries[0].title == ""
+    assert bundle.entries[0].year is None
     assert bundle.entries[0].doi == "10.1000/long"
+    assert "deliberately longer" in bundle.entries[0].raw_entry
     assert any(d.code == "CITATION_TEXT_ONLY" for d in bundle.diagnostics)
+
+
+def test_unstructured_bibitem_does_not_invent_a_publication_year():
+    source = SourceBundle(
+        arxiv_id="2501.99992",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="main.tex",
+                content=(
+                    "\\begin{thebibliography}{1}\n"
+                    "\\bibitem{scenario} Doe, Jane. A scenario evaluated through 2050.\n"
+                    "\\end{thebibliography}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+
+    assert entry.year is None
+    assert entry.raw_entry == "Doe, Jane. A scenario evaluated through 2050."
 
 
 def test_malformed_citation_key_is_replaced_but_preserved_in_citation_map():
@@ -164,6 +191,9 @@ def test_malformed_citation_key_is_replaced_but_preserved_in_citation_map():
     safe_key = bundle.entries[0].citation_key
     assert safe_key.startswith("ref_")
     assert bundle.citation_maps[1]["bad key"] == safe_key
+    assert rewrite_citations(r"See \cite{bad key}.", bundle.citation_maps[1]) == (
+        rf"See \cite{{{safe_key}}}."
+    )
     assert any(d.code == "INVALID_CITATION_KEY" for d in bundle.diagnostics)
 
 
@@ -294,6 +324,141 @@ def test_structured_bibtex_unwraps_formatting_and_latex_accents_for_matching_tex
 
     assert entry.authors == ("García, Ana",)
     assert entry.title == "Étude on Törnqvist"
+
+
+def test_structured_bibtex_normalizes_semantic_latex_and_venue_macros():
+    source = SourceBundle(
+        arxiv_id="2501.99991",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="refs.bib",
+        files=(
+            SourceFile(
+                relative_path="refs.bib",
+                content=(
+                    r"@article{latex, title={\ensuremath{\alpha \rightarrow \beta} "
+                    r"in \textbf{Networks}}, author={Vin\'\i cius, Jos\'e and C.~E. Doe}, "
+                    r"journal={\apj}, year={2024}}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+
+    assert entry.title == "α → β in Networks"
+    assert entry.authors == ("Viní cius, José", "C. E. Doe")
+    assert entry.journal == "The Astrophysical Journal"
+    assert "\\" not in entry.title
+    assert "\\" not in entry.journal
+
+
+def test_escaped_protection_braces_do_not_become_latex_commands():
+    source = SourceBundle(
+        arxiv_id="2501.99987",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="refs.bib",
+        files=(
+            SourceFile(
+                relative_path="refs.bib",
+                content=(
+                    r"@article{escaped, title={{\{}CNN{\}}s}, "
+                    r"author={Sidky, \{Emil Y.\}}, year={2024}}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+
+    assert entry.title == "CNNs"
+    assert entry.authors == ("Sidky, Emil Y.",)
+
+
+def test_malformed_bibtex_entry_cannot_swallow_the_next_entry():
+    source = SourceBundle(
+        arxiv_id="2501.99990",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="refs.bib",
+        files=(
+            SourceFile(
+                relative_path="refs.bib",
+                content=(
+                    "@article{broken, title={Broken title, author={Doe, Jane}, "
+                    "pages={1--9}, volume={4}, year={2023}\n"
+                    "@article{next, title={Independent title}, author={Roe, Richard}, "
+                    "year={2024}}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    bundle = process_references([source])
+    entries = {entry.citation_key: entry for entry in bundle.entries}
+
+    assert set(entries) == {"broken", "next"}
+    assert entries["broken"].parse_status == "partial"
+    assert "@article" not in entries["broken"].title
+    assert entries["broken"].authors == ("Doe, Jane",)
+    assert entries["broken"].year == 2023
+    assert entries["next"].title == "Independent title"
+    assert entries["next"].year == 2024
+
+
+def test_malformed_title_is_cut_before_leaked_field_assignments():
+    source = SourceBundle(
+        arxiv_id="2501.99989",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="refs.bib",
+        files=(
+            SourceFile(
+                relative_path="refs.bib",
+                content=(
+                    '@article{leak, title="A usable title, journal = {Fake Journal}, '
+                    'year = {2024}}'
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+
+    assert entry.title == "A usable title"
+
+
+def test_ascii_quote_inside_braced_title_does_not_swallow_following_fields():
+    source = SourceBundle(
+        arxiv_id="2501.99988",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="refs.bib",
+        files=(
+            SourceFile(
+                relative_path="refs.bib",
+                content=(
+                    "@article{quoted, author={Barnett, Alexander}, "
+                    "title={An “Exponential of Semicircle\" Kernel}, "
+                    "journal={SIAM Journal}, year={2019}, doi={10.1000/quoted}}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+
+    assert entry.title == 'An “Exponential of Semicircle" Kernel'
+    assert entry.authors == ("Barnett, Alexander",)
+    assert entry.journal == "SIAM Journal"
+    assert entry.year == 2019
+    assert entry.doi == "10.1000/quoted"
 
 
 def test_dedup_keeps_complete_title_and_reports_same_key_identity_conflict():

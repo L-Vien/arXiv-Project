@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Mapping, Sequence
 
 from src.parsing.contracts import (
@@ -44,6 +45,16 @@ _UNSAFE_CITATION_KEY = re.compile(
 )
 _DOI_RE = re.compile(r"^10\.\d{4,9}/[-._;()/:A-Z0-9]+$", re.IGNORECASE)
 _LATEX_COMMAND_RE = re.compile(r"\\[A-Za-z]+")
+_TITLE_FIELD_LEAK_RE = re.compile(
+    r"(?:abstract|author|authors|booktitle|doi|eprint|journal|journaltitle|"
+    r"pages|publisher|url|volume|year)\s*=",
+    re.IGNORECASE,
+)
+_TITLE_CITATION_BLOB_RE = re.compile(
+    r"(?:\bet\s+al\.?\b.*\b(?:19|20)\d{2}\b.*https?://|"
+    r"^(?:https?://|doi\s*:))",
+    re.IGNORECASE,
+)
 
 _PARTIAL_DIAGNOSTIC_STATUSES = {
     "BIBTEX_PARTIAL": ProcessingStatus.BIBTEX_PARTIAL,
@@ -281,7 +292,7 @@ def validate_reference_bundle(
                     severity=DiagnosticSeverity.WARNING,
                 )
             )
-        if entry.year is not None and not 1600 <= entry.year <= 2100:
+        if entry.year is not None and not 1600 <= entry.year <= date.today().year + 1:
             diagnostics.append(
                 _diagnostic(
                     "INVALID_YEAR",
@@ -306,6 +317,26 @@ def validate_reference_bundle(
                 _diagnostic(
                     "RESIDUAL_LATEX",
                     f"entry {entry.citation_key!r} still contains a LaTeX command",
+                    severity=DiagnosticSeverity.WARNING,
+                )
+            )
+        contaminated_values = (entry.title, entry.journal, *entry.authors)
+        if any(
+            value and _TITLE_FIELD_LEAK_RE.search(value)
+            for value in contaminated_values
+        ):
+            diagnostics.append(
+                _diagnostic(
+                    "FIELD_BOUNDARY_LEAK",
+                    f"entry {entry.citation_key!r} contains another field assignment inside a value",
+                    severity=DiagnosticSeverity.WARNING,
+                )
+            )
+        if entry.title and _TITLE_CITATION_BLOB_RE.search(entry.title):
+            diagnostics.append(
+                _diagnostic(
+                    "TITLE_IS_CITATION_BLOB",
+                    f"entry {entry.citation_key!r} title looks like a rendered citation",
                     severity=DiagnosticSeverity.WARNING,
                 )
             )
