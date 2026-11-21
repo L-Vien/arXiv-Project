@@ -7,7 +7,9 @@ merging fields, selecting canonical citation keys, and generating per-version ci
 
 from __future__ import annotations
 
+import hashlib
 import re
+import unicodedata
 from dataclasses import replace
 from typing import Mapping, Sequence, Tuple, List, Dict, Set, Optional, Any
 from urllib.parse import unquote
@@ -37,12 +39,78 @@ _ARXIV_PATTERN = re.compile(
     r"(?<![0-9])((?:\d{4}\.\d{4,5}|[a-z][a-z0-9-]+/\d{7})(?:v\d+)?)(?![0-9])",
     re.IGNORECASE,
 )
+_INVALID_CITATION_KEY = re.compile(
+    r"\s|[\x00-\x1f\x7f]|\\|^(?:https?://|doi:)",
+    re.IGNORECASE,
+)
 
 _REFERENCE_BLOCK_PATTERN = re.compile(
     r"\\begin\s*\{(?:verbatim\*?|lstlisting|comment)\}.*?"
     r"\\end\s*\{(?:verbatim\*?|lstlisting|comment)\}",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _safe_citation_key(
+    raw_key: str,
+    *,
+    file_path: str,
+    sequence: int,
+    diagnostics: List[Diagnostic],
+) -> str:
+    """Return a table-safe key while preserving the original source key.
+
+    Citation commands must still map from their original key.  Invalid keys
+    receive deterministic surrogates and are rewritten through citation maps
+    rather than being silently trimmed.
+    """
+
+    if raw_key and not _INVALID_CITATION_KEY.search(raw_key):
+        return raw_key
+    diagnostics.append(
+        Diagnostic(
+            severity=DiagnosticSeverity.WARNING,
+            code="INVALID_CITATION_KEY",
+            message=f"Invalid citation key {raw_key!r} was replaced by a stable surrogate",
+            file_path=file_path,
+        )
+    )
+    digest = hashlib.sha256(
+        f"{file_path}\x1f{sequence}\x1f{raw_key}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"ref_{digest}"
+
+
+def _entry_quality(entry: BibEntry) -> int:
+    """Rank parser evidence before choosing a conflicting field value."""
+
+    source_rank = {
+        "bibtex": 40,
+        "biber_bbl": 30,
+        "bibitem": 20,
+        "harvard_bbl": 10,
+    }.get(entry.source_kind, 0)
+    status_rank = {"parsed": 4, "partial": 2, "citation_text_only": 0}.get(
+        entry.parse_status,
+        0,
+    )
+    return source_rank + status_rank
+
+
+def _prefer_title(current: BibEntry | None, candidate: BibEntry) -> BibEntry:
+    """Choose title evidence without preferring a shorter string by default."""
+
+    if current is None or not current.title:
+        return candidate
+    if not candidate.title:
+        return current
+    current_blob = bool(re.search(r"(doi:|https?://|\bet al\b)", current.title, re.IGNORECASE))
+    candidate_blob = bool(re.search(r"(doi:|https?://|\bet al\b)", candidate.title, re.IGNORECASE))
+    if current_blob != candidate_blob:
+        return candidate if not candidate_blob else current
+    if _entry_quality(candidate) != _entry_quality(current):
+        return candidate if _entry_quality(candidate) > _entry_quality(current) else current
+    return candidate if len(candidate.title) > len(current.title) else current
 
 
 def _strip_reference_comments(content: str) -> str:
@@ -102,8 +170,32 @@ def _clean_latex_accents(text: str) -> str:
     """Clean LaTeX accent commands and braces into clean unicode characters."""
     if not text:
         return ""
-    # Unpack braces in commands like {\'n} -> \'n or {\'e} -> \'e
-    text = re.sub(r"\\([\\`^~\"vvcstudb])\{([a-zA-Z])\}", r"\\\1\2", text)
+    wrapper = re.compile(
+        r"\\(?:emph|textit|textbf|texttt|textrm|textsf|mathrm|mathit|mathbf|url)\s*\{([^{}]*)\}",
+        re.IGNORECASE,
+    )
+    while wrapper.search(text):
+        text = wrapper.sub(r"\1", text)
+
+    accent_combining = {
+        "'": "\u0301",
+        "`": "\u0300",
+        '"': "\u0308",
+        "^": "\u0302",
+        "~": "\u0303",
+    }
+
+    def compose_accent(match: re.Match[str]) -> str:
+        return unicodedata.normalize(
+            "NFC",
+            match.group(2) + accent_combining[match.group(1)],
+        )
+
+    text = re.sub(
+        r"\\([`'\"^~])\{?([a-zA-Z])\}?",
+        compose_accent,
+        text,
+    )
 
     accent_map = {
         "\\'a": "á", "\\`a": "à", "\\'e": "é", "\\`e": "è", "\\'i": "í", "\\`i": "ì",
@@ -117,6 +209,15 @@ def _clean_latex_accents(text: str) -> str:
 
     text = re.sub(r"\\v\{([a-zA-Z])\}", lambda m: {"c": "č", "s": "š", "z": "ž", "C": "Č", "S": "Š", "Z": "Ž"}.get(m.group(1), m.group(1)), text)
     text = re.sub(r"\\c\{([a-zA-Z])\}", lambda m: {"c": "ç", "C": "Ç"}.get(m.group(1), m.group(1)), text)
+    while wrapper.search(text):
+        text = wrapper.sub(r"\1", text)
+    text = text.replace(r"\LaTeX", "LaTeX").replace(r"\TeX", "TeX")
+    text = re.sub(
+        r"\\(?:emph|textit|textbf|texttt|textrm|textsf|mathrm|mathit|mathbf|url)\s*\{",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(r"\\[a-zA-Z]+\{([a-zA-Z])\}", lambda m: m.group(1), text)
     text = re.sub(r"[{}]", "", text)
     return text
@@ -406,12 +507,23 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
 
                 comma_idx = entry_body.find(',')
                 if comma_idx != -1:
-                    citation_key = entry_body[:comma_idx].strip()
-                    citation_key = re.sub(r"[\{\}\"']", "", citation_key).strip()
+                    raw_citation_key = entry_body[:comma_idx].strip()
+                    raw_citation_key = re.sub(r"[\{\}\"']", "", raw_citation_key).strip()
                     fields_text = entry_body[comma_idx+1:]
                 else:
-                    citation_key = entry_body.strip()
+                    raw_citation_key = entry_body.strip()
                     fields_text = ""
+
+                citation_key = (
+                    _safe_citation_key(
+                        raw_citation_key,
+                        file_path=file_path,
+                        sequence=len(entries),
+                        diagnostics=diagnostics,
+                    )
+                    if raw_citation_key
+                    else ""
+                )
 
                 field_dict = _parse_bib_fields(fields_text)
 
@@ -460,6 +572,9 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
                         BibEntry(
                             citation_key=citation_key,
                             entry_type=entry_type or "misc",
+                            raw_citation_key=raw_citation_key,
+                            source_kind="bibtex",
+                            parse_status="partial" if not entry_closed else "parsed",
                             title=title,
                             authors=authors,
                             year=year,
@@ -498,7 +613,17 @@ def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagn
     )
 
     for match in bibitem_pattern.finditer(content):
-        citation_key = match.group("key").strip()
+        raw_citation_key = match.group("key").strip()
+        citation_key = (
+            _safe_citation_key(
+                raw_citation_key,
+                file_path=file_path,
+                sequence=len(entries),
+                diagnostics=diagnostics,
+            )
+            if raw_citation_key
+            else ""
+        )
         item_text = match.group("body").strip()
 
         year_match = re.search(r"\b(19\d{2}|20\d{2})\b", item_text)
@@ -516,29 +641,25 @@ def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagn
         if before_year:
             cleaned_before = re.sub(r"\\[a-zA-Z]+(?:\[.*?\])?(?:\{.*?\})?", " ", before_year)
             cleaned_before = _clean_latex_accents(cleaned_before)
-            parts = re.split(r"\.\s+|\,\s+|\bby\b|\band\b", cleaned_before, flags=re.IGNORECASE)
-            if parts and len(parts) > 1:
-                potential_authors = []
-                for p in parts[:2]:
-                    p = p.strip()
-                    if p and len(p.split()) < 6 and any(char.isupper() for char in p):
-                        potential_authors.append(p)
-                if potential_authors:
-                    authors = tuple(potential_authors)
+            author_prefix = cleaned_before.split(".", maxsplit=1)[0].strip()
+            authors = _parse_authors(author_prefix)
 
         cleaned_text = re.sub(r"\\[a-zA-Z]+(?:\[.*?\])?(?:\{.*?\})?", " ", item_text)
         cleaned_text = _clean_latex_accents(cleaned_text)
         cleaned_text = re.sub(r"\s+", " ", cleaned_text)
 
-        doi_match = re.search(r"(?:doi[:\s]*)(10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)", cleaned_text, re.IGNORECASE)
-        doi = doi_match.group(1) if doi_match else ""
+        doi = _normalize_doi(cleaned_text)
 
         url_match = re.search(r"(https?://[^\s]+)", cleaned_text)
         url = url_match.group(1) if url_match else ""
 
-        title = cleaned_text[:100].strip()
+        # A normal \bibitem body is a rendered citation, not a structured
+        # title field. Publishing it as a title (and historically truncating it
+        # at 100 characters) corrupts matching data. Keep the identity fields
+        # that can be extracted deterministically and record a review signal.
+        title = ""
 
-        if not citation_key or not title:
+        if not citation_key:
             diagnostics.append(
                 Diagnostic(
                     severity=DiagnosticSeverity.WARNING,
@@ -551,10 +672,22 @@ def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagn
         if not citation_key:
             continue
 
+        diagnostics.append(
+            Diagnostic(
+                severity=DiagnosticSeverity.INFO,
+                code="CITATION_TEXT_ONLY",
+                message="Unstructured \\bibitem body was retained without inventing a title",
+                file_path=file_path,
+            )
+        )
+
         entries.append(
             BibEntry(
                 citation_key=citation_key,
                 entry_type="misc",
+                    raw_citation_key=raw_citation_key,
+                    source_kind="bibitem",
+                    parse_status="citation_text_only",
                 title=title,
                 authors=authors,
                 year=year,
@@ -638,8 +771,8 @@ def _parse_biber_bbl_content(
             if value is not None:
                 fields[field_match.group(1).strip().lower()] = value[0]
 
-        citation_key = start.group(1).strip()
-        if not citation_key:
+        raw_citation_key = start.group(1).strip()
+        if not raw_citation_key:
             diagnostics.append(
                 Diagnostic(
                     severity=DiagnosticSeverity.WARNING,
@@ -649,6 +782,12 @@ def _parse_biber_bbl_content(
                 )
             )
             continue
+        citation_key = _safe_citation_key(
+            raw_citation_key,
+            file_path=file_path,
+            sequence=index,
+            diagnostics=diagnostics,
+        )
 
         title = _clean_field_value(fields.get("title", ""))
         year = _year_from_text(fields.get("year", "") or fields.get("date", ""))
@@ -661,6 +800,8 @@ def _parse_biber_bbl_content(
             BibEntry(
                 citation_key=citation_key,
                 entry_type=start.group(2).strip().lower() or "misc",
+                raw_citation_key=raw_citation_key,
+                source_kind="biber_bbl",
                 title=title,
                 year=year,
                 doi=doi,
@@ -713,8 +854,8 @@ def _parse_harvard_bbl_content(
         next_start = starts[index + 1].start() if index + 1 < len(starts) else len(content)
         body = content[key_group[1]:next_start]
         cleaned_body = _clean_field_value(body)
-        citation_key = key_group[0].strip()
-        if not citation_key:
+        raw_citation_key = key_group[0].strip()
+        if not raw_citation_key:
             diagnostics.append(
                 Diagnostic(
                     severity=DiagnosticSeverity.WARNING,
@@ -724,6 +865,12 @@ def _parse_harvard_bbl_content(
                 )
             )
             continue
+        citation_key = _safe_citation_key(
+            raw_citation_key,
+            file_path=file_path,
+            sequence=index,
+            diagnostics=diagnostics,
+        )
 
         doi = _normalize_doi(cleaned_body)
         url_match = re.search(r"https?://[^\s{}]+", cleaned_body)
@@ -731,12 +878,23 @@ def _parse_harvard_bbl_content(
             BibEntry(
                 citation_key=citation_key,
                 entry_type="misc",
-                title=cleaned_body[:100].strip(),
+                raw_citation_key=raw_citation_key,
+                source_kind="harvard_bbl",
+                parse_status="citation_text_only",
+                title="",
                 authors=_parse_authors(author_group[0]),
                 year=_year_from_text(year_group[0]),
                 doi=doi,
                 journal="",
                 url=url_match.group(0) if url_match else "",
+            )
+        )
+        diagnostics.append(
+            Diagnostic(
+                severity=DiagnosticSeverity.INFO,
+                code="CITATION_TEXT_ONLY",
+                message="Unstructured Harvard bibliography body was retained without inventing a title",
+                file_path=file_path,
             )
         )
 
@@ -774,7 +932,14 @@ def _merge_same_key_entries(entries: Sequence[BibEntry]) -> list[BibEntry]:
                 if current.entry_type != "misc"
                 else entry.entry_type
             ),
-            title=current.title or entry.title,
+            raw_citation_key=current.raw_citation_key,
+            source_kind=current.source_kind,
+            parse_status=(
+                "parsed"
+                if current.parse_status == "parsed" or entry.parse_status == "parsed"
+                else current.parse_status
+            ),
+            title=_prefer_title(current, entry).title,
             authors=(
                 current.authors
                 if len(current.authors) >= len(entry.authors)
@@ -890,6 +1055,27 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
             g_key = _reference_group_key(v_num, entry, ungrouped_counter)
             group_map.setdefault(g_key, []).append((v_num, entry))
 
+    entries_by_raw_key: Dict[str, List[BibEntry]] = {}
+    for entries in version_raw_entries.values():
+        for entry in entries:
+            entries_by_raw_key.setdefault(
+                entry.raw_citation_key or entry.citation_key,
+                [],
+            ).append(entry)
+    for raw_key, entries in entries_by_raw_key.items():
+        distinct_dois = {_normalize_doi(entry.doi) for entry in entries if _normalize_doi(entry.doi)}
+        if len(distinct_dois) > 1:
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.WARNING,
+                    code="REFERENCE_IDENTITY_CONFLICT",
+                    message=(
+                        f"citation key {raw_key!r} has conflicting DOIs across versions: "
+                        + ", ".join(sorted(distinct_dois))
+                    ),
+                )
+            )
+
     merged_entries: List[BibEntry] = []
     citation_maps: Dict[int, Dict[str, str]] = {}
     used_canonical_keys: Set[str] = set()
@@ -906,7 +1092,7 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
         used_canonical_keys.add(canonical_key)
 
         entry_type = "misc"
-        title = ""
+        title_entry: BibEntry | None = None
         authors: Tuple[str, ...] = ()
         year: Optional[int] = None
         doi = ""
@@ -917,17 +1103,7 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
             if entry.entry_type and entry.entry_type != "misc":
                 entry_type = entry.entry_type
             if entry.title:
-                if not title:
-                    title = entry.title
-                else:
-                    is_current_blob = bool(re.search(r"(doi:|http|et al|\d{4})", title, re.IGNORECASE))
-                    is_entry_blob = bool(re.search(r"(doi:|http|et al|\d{4})", entry.title, re.IGNORECASE))
-                    if is_current_blob and not is_entry_blob:
-                        title = entry.title
-                    elif not is_current_blob and is_entry_blob:
-                        pass
-                    elif len(entry.title) < len(title):
-                        title = entry.title
+                title_entry = _prefer_title(title_entry, entry)
             if entry.authors:
                 if not authors or len(entry.authors) > len(authors):
                     authors = entry.authors
@@ -944,7 +1120,17 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
         merged_entry = BibEntry(
             citation_key=canonical_key,
             entry_type=entry_type,
-            title=title,
+            raw_citation_key=items_sorted[0][1].raw_citation_key,
+            source_kind=next(
+                (entry.source_kind for _, entry in items_sorted if entry.parse_status == "parsed"),
+                items_sorted[0][1].source_kind,
+            ),
+            parse_status=(
+                "parsed"
+                if any(entry.parse_status == "parsed" for _, entry in items_sorted)
+                else items_sorted[0][1].parse_status
+            ),
+            title=title_entry.title if title_entry is not None else "",
             authors=authors,
             year=year,
             doi=doi,
@@ -954,7 +1140,9 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
         merged_entries.append(merged_entry)
 
         for v_num, entry in items:
-            citation_maps.setdefault(v_num, {})[entry.citation_key] = canonical_key
+            citation_maps.setdefault(v_num, {})[
+                entry.raw_citation_key or entry.citation_key
+            ] = canonical_key
 
     for source in sources:
         if source.version not in citation_maps:

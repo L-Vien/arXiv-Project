@@ -114,6 +114,59 @@ def test_malformed_bibitem_with_empty_key_is_skipped_with_diagnostic():
     )
 
 
+def test_unstructured_bibitem_is_not_published_as_a_truncated_title():
+    source = SourceBundle(
+        arxiv_id="2501.99995",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="main.tex",
+                content=(
+                    "\\begin{thebibliography}{1}\n"
+                    "\\bibitem{long-citation} Doe, Jane and Roe, Richard. "
+                    "A rendered bibliography string that is deliberately longer than one hundred characters "
+                    "and cannot reliably be separated into an article title. 2024. doi:10.1000/long\n"
+                    "\\end{thebibliography}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    bundle = process_references([source])
+
+    assert len(bundle.entries) == 1
+    assert bundle.entries[0].title == ""
+    assert bundle.entries[0].doi == "10.1000/long"
+    assert any(d.code == "CITATION_TEXT_ONLY" for d in bundle.diagnostics)
+
+
+def test_malformed_citation_key_is_replaced_but_preserved_in_citation_map():
+    source = SourceBundle(
+        arxiv_id="2501.99994",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="refs.bib",
+                content="@article{bad key, title={A Clean Title}, year={2024}}",
+                order=0,
+            ),
+        ),
+    )
+
+    bundle = process_references([source])
+
+    assert len(bundle.entries) == 1
+    safe_key = bundle.entries[0].citation_key
+    assert safe_key.startswith("ref_")
+    assert bundle.citation_maps[1]["bad key"] == safe_key
+    assert any(d.code == "INVALID_CITATION_KEY" for d in bundle.diagnostics)
+
+
 def test_biber_bbl_entries_are_available_for_citation_mapping():
     source = SourceBundle(
         arxiv_id="2501.99997",
@@ -215,6 +268,74 @@ def test_advanced_bib_features():
     assert e.title == "Quoted Title with, comma"
     assert e.year == 2023
     assert e.url == "https://example.org/report"
+
+
+def test_structured_bibtex_unwraps_formatting_and_latex_accents_for_matching_text():
+    source = SourceBundle(
+        arxiv_id="2501.99993",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="refs.bib",
+                content=(
+                    "@article{accented, "
+                    "author={{Garc\\'i}a, Ana}, "
+                    "title={{\\'E}tude on \\emph{T\\\"{o}rnqvist}}, "
+                    "year={2024}}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+
+    assert entry.authors == ("García, Ana",)
+    assert entry.title == "Étude on Törnqvist"
+
+
+def test_dedup_keeps_complete_title_and_reports_same_key_identity_conflict():
+    sources = [
+        SourceBundle(
+            arxiv_id="2501.99994",
+            version=1,
+            status=ProcessingStatus.OK,
+            root_file="refs.bib",
+            files=(
+                SourceFile(
+                    relative_path="refs.bib",
+                    content=(
+                        "@article{same, title={Complete Reference Title}, "
+                        "author={Ada Lovelace}, year={2024}, doi={10.1000/one}}"
+                    ),
+                    order=0,
+                ),
+            ),
+        ),
+        SourceBundle(
+            arxiv_id="2501.99994",
+            version=2,
+            status=ProcessingStatus.OK,
+            root_file="refs.bib",
+            files=(
+                SourceFile(
+                    relative_path="refs.bib",
+                    content=(
+                        "@article{same, title={Complete}, author={Ada Lovelace}, "
+                        "year={2024}, doi={10.1000/two}}"
+                    ),
+                    order=0,
+                ),
+            ),
+        ),
+    ]
+
+    bundle = process_references(sources)
+
+    assert len(bundle.entries) == 2
+    assert any(issue.code == "REFERENCE_IDENTITY_CONFLICT" for issue in bundle.diagnostics)
 
 
 def test_malformed_bibtex_entry_emits_partial_diagnostic():
