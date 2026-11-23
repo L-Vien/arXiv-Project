@@ -11,9 +11,19 @@ from pathlib import Path
 import pandas as pd
 
 SEED = 42
-MIN_BIBTEX = 20
 N_MAIN = 5
 N_SPARE = 1
+
+# Tier 0 là chuẩn; các tier sau nới dần nếu range ít dữ liệu
+TIERS = [
+    dict(min_bib=20, max_bib=30, min_refs=8, max_refs=40,
+         ratio=(0.3, 0.9), max_title=0.2, max_author=0.3, max_year=0.4, max_dup=2),
+    dict(max_bib=35),
+    dict(max_refs=60),
+    dict(max_title=0.4, max_author=0.4, ratio=(0.2, 1.0), max_dup=5),
+]
+MIN_TOTAL_BIB = 100      # 5 pub chính thức >= 100 label
+MAX_TRIES = 300
 
 
 def _normalize_arxiv_id(arxiv_id):
@@ -139,85 +149,102 @@ def load_references(corpus_path, paper_ids):
 
 
 def build_inventory(bibtex_path, references_path, paper_ids):
-    """Count BibTeX entries and references for each publication."""
-
-    paper_ids = list(dict.fromkeys(
-        _normalize_arxiv_id(a) for a in paper_ids
-    ))
+    paper_ids = list(dict.fromkeys(_normalize_arxiv_id(a) for a in paper_ids))
     ids = set(paper_ids)
 
-    bib_counts = defaultdict(int)
-
-    for record in _iter_jsonl(bibtex_path):
-        arxiv_id = _normalize_arxiv_id(
-            record.get("arxiv_id", "")
-        )
-
-        if arxiv_id in ids:
-            bib_counts[arxiv_id] += 1
+    bib = defaultdict(lambda: dict(n=0, no_title=0, no_author=0, no_year=0))
+    for r in _iter_jsonl(bibtex_path):
+        a = _normalize_arxiv_id(r.get("arxiv_id", ""))
+        if a not in ids:
+            continue
+        s = bib[a]
+        s["n"] += 1
+        s["no_title"] += not r.get("title")
+        s["no_author"] += not r.get("authors")
+        s["no_year"] += not r.get("year")
 
     refs = load_references(references_path, ids)
 
     rows = []
-
-    for arxiv_id in paper_ids:
-        reference_list = refs.get(arxiv_id, [])
-
+    for a in paper_ids:
+        s = bib[a]
+        n = s["n"]
+        ref_list = refs.get(a, [])
+        arxiv_ids = [
+            str(r["ref_arxiv_id"]).strip().lower()
+            for r in ref_list if r.get("ref_arxiv_id")
+        ]
         rows.append({
-            "arxiv_id": arxiv_id,
-            "bibtex_count": bib_counts[arxiv_id],
-            "reference_count": len(reference_list),
-            "arxiv_reference_count": sum(
-                bool(ref.get("ref_arxiv_id"))
-                for ref in reference_list
-            ),
+            "arxiv_id": a,
+            "bibtex_count": n,
+            "reference_count": len(ref_list),
+            "arxiv_reference_count": len(set(arxiv_ids)),      # unique, khớp candidate list
+            "duplicate_reference_count": len(arxiv_ids) - len(set(arxiv_ids)),
+            "arxiv_ref_ratio": len(set(arxiv_ids)) / n if n else 0.0,
+            "missing_title_rate": s["no_title"] / n if n else 1.0,
+            "missing_author_rate": s["no_author"] / n if n else 1.0,
+            "missing_year_rate": s["no_year"] / n if n else 1.0,
         })
 
-    return (
-        pd.DataFrame(rows)
-        .sort_values("arxiv_id")
-        .reset_index(drop=True)
-    )
+    return pd.DataFrame(rows).sort_values("arxiv_id").reset_index(drop=True)
+
+
+def _filter(inv, p):
+    return inv[
+        inv.bibtex_count.between(p["min_bib"], p["max_bib"])
+        & inv.arxiv_reference_count.between(p["min_refs"], p["max_refs"])
+        & inv.arxiv_ref_ratio.between(*p["ratio"])
+        & (inv.missing_title_rate <= p["max_title"])
+        & (inv.missing_author_rate <= p["max_author"])
+        & (inv.missing_year_rate <= p["max_year"])
+        & (inv.duplicate_reference_count <= p["max_dup"])
+    ]
+
+
+def _assign_partitions(main, spare):
+    """Pub nhỏ nhất đứng đầu (label trước, làm quen tool).
+    Valid/test lấy cỡ trung bình để reviewer đỡ quá tải."""
+    main = main.sort_values(["bibtex_count", "arxiv_reference_count"]).reset_index(drop=True)
+    parts = ["train", "train", "valid", "test", "train"]
+    main["partition"] = parts
+    spare = spare.assign(partition="spare")
+    return pd.concat([main, spare], ignore_index=True)
 
 
 def select_manual(inv, member_id, range_id):
-    """Select 5 main publications and 1 spare publication."""
+    params = {}
+    need = N_MAIN + N_SPARE
 
-    eligible = inv[
-        inv["bibtex_count"] >= MIN_BIBTEX
-    ]
+    for tier_no, override in enumerate(TIERS):
+        params = {**params, **override}
+        pool = _filter(inv, params)
+        if len(pool) < need:
+            continue
 
-    required = N_MAIN + N_SPARE
+        for k in range(MAX_TRIES):
+            pick = pool.sample(n=need, random_state=SEED + k).reset_index(drop=True)
+            main, spare = pick.iloc[:N_MAIN], pick.iloc[N_MAIN:]
+            if main.bibtex_count.sum() < MIN_TOTAL_BIB:
+                continue
+            if not (main.arxiv_ref_ratio < 0.5).any():   # ít nhất 1 pub nhiều no_match
+                continue
 
-    if len(eligible) < required:
-        raise ValueError(
-            f"Only {len(eligible)} eligible publications "
-            f"(bibtex_count >= {MIN_BIBTEX}), "
-            f"but {required} are required."
-        )
+            if tier_no > 0:
+                print(f"[WARN] member {member_id}: phải nới bộ lọc đến tier {tier_no}: {params}")
+            out = _assign_partitions(main, spare)
+            return pd.DataFrame({
+                "arxiv_id": out.arxiv_id,
+                "member_id": member_id,
+                "range_id": range_id,
+                "partition": out.partition,
+                "label_source": "manual",
+                "bibtex_count": out.bibtex_count,
+                "arxiv_reference_count": out.arxiv_reference_count,
+                "filter_tier": tier_no,
+            })
 
-    selected = eligible.sample(
-        n=required,
-        random_state=SEED
-    ).reset_index(drop=True)
-
-    partitions = [
-        "train",
-        "train",
-        "train",
-        "valid",
-        "test",
-        "spare",
-    ]
-
-    return pd.DataFrame({
-        "arxiv_id": selected["arxiv_id"],
-        "member_id": member_id,
-        "range_id": range_id,
-        "partition": partitions,
-        "label_source": "manual",
-    })
-
+    raise ValueError(f"Không chọn được {need} publication đạt chuẩn cho {member_id}; "
+                     f"kiểm tra lại data_inventory.csv.")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -228,8 +255,21 @@ def main():
     parser.add_argument("--member-id", required=True)
     parser.add_argument("--range-id", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--min-bib", type=int)
+    parser.add_argument("--max-bib", type=int)
+    parser.add_argument("--min-refs", type=int)
+    parser.add_argument("--max-refs", type=int)
 
     args = parser.parse_args()
+    
+    overrides = {
+        "min_bib": args.min_bib, "max_bib": args.max_bib,
+        "min_refs": args.min_refs, "max_refs": args.max_refs,
+    }
+    overrides = {k: v for k, v in overrides.items() if v is not None}
+    if overrides:
+        TIERS[0].update(overrides)
+        print(f"[INFO] Override tier 0: {overrides}.")
 
     with open(args.paper_ids, encoding="utf-8") as f:
         paper_ids = [
