@@ -26,7 +26,11 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+try:
+    from datetime import UTC
+except ImportError:
+    UTC = timezone.utc
 from email.utils import parsedate_to_datetime
 from http.client import RemoteDisconnected
 from pathlib import Path
