@@ -223,6 +223,51 @@ class ReferenceValidationTests(unittest.TestCase):
             {"FIELD_BOUNDARY_LEAK", "TITLE_IS_CITATION_BLOB"},
         )
 
+    def test_title_equal_to_journal_is_reported(self) -> None:
+        references = ReferenceBundle(
+            arxiv_id="2501.01234",
+            entries=(
+                BibEntry(
+                    citation_key="venue-only",
+                    entry_type="misc",
+                    title="Mater. Chem. Phys.",
+                    journal="Mater. Chem. Phys.",
+                ),
+            ),
+            citation_maps={1: {}},
+        )
+
+        diagnostics = validate_reference_bundle(references)
+
+        self.assertEqual(
+            [diagnostic.code for diagnostic in diagnostics],
+            ["TITLE_EQUALS_JOURNAL"],
+        )
+
+    def test_unstructured_entry_without_raw_provenance_is_rejected(self) -> None:
+        references = ReferenceBundle(
+            arxiv_id="2501.01234",
+            entries=(
+                BibEntry(
+                    citation_key="text-only",
+                    entry_type="misc",
+                    parse_status="citation_text_only",
+                ),
+            ),
+            citation_maps={1: {"text-only": "text-only"}},
+        )
+
+        diagnostics = validate_reference_bundle(references)
+
+        self.assertEqual(
+            [diagnostic.code for diagnostic in diagnostics],
+            ["MISSING_BIBTEX_PROVENANCE"],
+        )
+        self.assertEqual(
+            diagnostics[0].severity,
+            DiagnosticSeverity.ERROR,
+        )
+
     def test_unresolved_normalized_citations_are_reported_per_version(self) -> None:
         references = ReferenceBundle(
             arxiv_id="2501.01234",

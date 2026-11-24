@@ -91,6 +91,8 @@ BIBTEX_COLUMNS = (
     "doi",
     "journal",
     "url",
+    "title_status",
+    "title_metadata_status",
 )
 
 
@@ -397,6 +399,8 @@ class BibtexRow:
     doi: str
     journal: str
     url: str
+    title_status: str | None = None
+    title_metadata_status: str | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty(self.arxiv_id, "arxiv_id")
@@ -413,6 +417,28 @@ class BibtexRow:
         object.__setattr__(self, "citation_key", entry.citation_key)
         object.__setattr__(self, "entry_type", entry.entry_type)
         object.__setattr__(self, "authors", entry.authors)
+        title_status = self.title_status or (
+            "present" if self.title.strip() else "missing_source"
+        )
+        title_metadata_status = self.title_metadata_status or (
+            "metadata_available"
+            if (
+                self.authors
+                or self.year is not None
+                or self.doi
+                or self.journal
+                or self.url
+            )
+            else "metadata_empty"
+        )
+        if title_status not in {"present", "missing_source", "missing_parser"}:
+            raise ValueError(f"unknown title_status: {title_status!r}")
+        if title_metadata_status not in {"metadata_available", "metadata_empty"}:
+            raise ValueError(
+                f"unknown title_metadata_status: {title_metadata_status!r}"
+            )
+        object.__setattr__(self, "title_status", title_status)
+        object.__setattr__(self, "title_metadata_status", title_metadata_status)
 
 
 @dataclass(frozen=True)

@@ -111,6 +111,12 @@ class TestProcessor(unittest.TestCase):
         self.assertEqual(r.status, STATUS_MISSING)
         self.assertTrue((self.out / "source_status.json").exists())
 
+    def test_missing_status_is_terminal_on_resume(self):
+        first = process_version(self.base / "nope.tar.gz", self.out)
+        second = process_version(self.base / "still-missing.tar.gz", self.out)
+        self.assertEqual(first.status, STATUS_MISSING)
+        self.assertEqual(second.status, STATUS_MISSING)
+
     def test_path_traversal_member_ignored(self):
         tar = self.base / "evil.tar.gz"
         make_tar(tar, {"main.tex": b"x", "../escape.tex": b"evil", "/abs.tex": b"evil"})

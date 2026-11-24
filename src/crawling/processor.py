@@ -207,7 +207,7 @@ def process_version(
     if skip_if_done:
         previous = read_status(output_dir)
         if (previous is not None
-                and previous.status in (STATUS_OK, STATUS_NO_TEX)
+                and previous.status in (STATUS_OK, STATUS_NO_TEX, STATUS_MISSING)
                 and _is_complete(output_dir, previous)):
             logger.info(f"Bỏ qua {output_dir} (đã xử lý: {previous.status})")
             return previous

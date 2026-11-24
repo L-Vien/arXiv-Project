@@ -26,6 +26,7 @@ from src.parsing.validation import (
     effective_status,
     validation_status_for_version,
 )
+from src.parsing.references import title_status_for_entry
 
 
 def _atomic_write_chunks(path: Path, chunks: Iterable[str]) -> None:
@@ -103,6 +104,7 @@ def _hierarchy_row(row: HierarchyRow) -> dict[str, Any]:
 
 
 def _bibtex_row(arxiv_id: str, entry: BibEntry) -> dict[str, Any]:
+    title_status, title_metadata_status = title_status_for_entry(entry)
     row = BibtexRow(
         arxiv_id=arxiv_id,
         citation_key=entry.citation_key,
@@ -113,6 +115,8 @@ def _bibtex_row(arxiv_id: str, entry: BibEntry) -> dict[str, Any]:
         doi=entry.doi,
         journal=entry.journal,
         url=entry.url,
+        title_status=title_status,
+        title_metadata_status=title_metadata_status,
     )
     return {
         "arxiv_id": row.arxiv_id,
@@ -124,12 +128,15 @@ def _bibtex_row(arxiv_id: str, entry: BibEntry) -> dict[str, Any]:
         "doi": row.doi,
         "journal": row.journal,
         "url": row.url,
+        "title_status": row.title_status,
+        "title_metadata_status": row.title_metadata_status,
     }
 
 
 def _bibtex_provenance_row(arxiv_id: str, entry: BibEntry) -> dict[str, Any]:
     """Internal audit metadata; it is intentionally not part of final Parquet."""
 
+    title_status, title_metadata_status = title_status_for_entry(entry)
     return {
         "arxiv_id": arxiv_id,
         "citation_key": entry.citation_key,
@@ -137,6 +144,8 @@ def _bibtex_provenance_row(arxiv_id: str, entry: BibEntry) -> dict[str, Any]:
         "raw_entry": entry.raw_entry,
         "source_kind": entry.source_kind,
         "parse_status": entry.parse_status,
+        "title_status": title_status,
+        "title_metadata_status": title_metadata_status,
     }
 
 

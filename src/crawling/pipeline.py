@@ -1525,6 +1525,27 @@ class DefaultSourceProcessor:
             else:
                 download_result, archive_path, download_seconds = prefetched_download
             if archive_path is None:
+                download_status = str(
+                    download_result.get("status", "permanent_failed")
+                )
+                if download_status not in {
+                    processor.STATUS_MISSING,
+                    "retryable_failed",
+                    "permanent_failed",
+                }:
+                    download_status = "permanent_failed"
+                processor.write_status(
+                    output_dir,
+                    processor.ProcessResult(
+                        status=download_status,
+                        error=str(
+                            download_result.get(
+                                "error",
+                                "source download did not produce an archive",
+                            )
+                        ),
+                    ),
+                )
                 self._emit_progress(
                     "version_failed",
                     arxiv_id,
@@ -1538,7 +1559,13 @@ class DefaultSourceProcessor:
                     self._version_record(
                         versioned_id,
                         download_result,
-                        {"status": "not_started"},
+                        {
+                            "status": (
+                                "missing"
+                                if download_status == processor.STATUS_MISSING
+                                else "not_started"
+                            )
+                        },
                         download_seconds,
                         0.0,
                     )
@@ -1607,10 +1634,13 @@ class DefaultSourceProcessor:
             or bool(result.get("processing", {}).get("retryable"))
             for result in version_results
         )
-        usable = {"ok", "no_tex"}
+        usable = {"ok", "no_tex", "missing"}
+        no_source = {"no_tex", "missing"}
         if version_results and all(status in usable for status in process_statuses):
             source_status = (
-                "success_with_no_tex" if "no_tex" in process_statuses else "success"
+                "success_with_no_tex"
+                if any(status in no_source for status in process_statuses)
+                else "success"
             )
         elif any(status in usable for status in process_statuses):
             source_status = "partial_success"
@@ -1627,7 +1657,11 @@ class DefaultSourceProcessor:
         if process_statuses and all(status == "ok" for status in process_statuses):
             processing_status = "success"
         elif process_statuses and all(status in usable for status in process_statuses):
-            processing_status = "success_with_no_tex"
+            processing_status = (
+                "success_with_no_tex"
+                if any(status in no_source for status in process_statuses)
+                else "success"
+            )
         elif any(status in usable for status in process_statuses):
             processing_status = "partial_success"
         elif all(status == "not_started" for status in process_statuses):
@@ -1860,8 +1894,14 @@ class DefaultSourceProcessor:
                 self._sleep_before_retry(delay, last_status_code)
 
         assert last_error is not None
+        if last_status_code == 404 and not last_retryable:
+            final_status = "missing"
+        elif last_retryable:
+            final_status = "retryable_failed"
+        else:
+            final_status = "permanent_failed"
         return {
-            "status": "retryable_failed" if last_retryable else "permanent_failed",
+            "status": final_status,
             "retryable": last_retryable,
             "attempts": last_attempt,
             "error_type": last_error_type,
@@ -1903,6 +1943,7 @@ class DefaultSourceProcessor:
         if previous is None or previous.status not in {
             processor.STATUS_OK,
             processor.STATUS_NO_TEX,
+            processor.STATUS_MISSING,
         }:
             return None
         total = 0

@@ -284,6 +284,16 @@ def validate_reference_bundle(
                 )
 
     for entry in references.entries:
+        if (
+            entry.parse_status in {"partial", "citation_text_only"}
+            and not (entry.raw_entry or "").strip()
+        ):
+            diagnostics.append(
+                _diagnostic(
+                    "MISSING_BIBTEX_PROVENANCE",
+                    f"entry {entry.citation_key!r} has incomplete metadata without retained source text",
+                )
+            )
         if _UNSAFE_CITATION_KEY.search(entry.citation_key):
             diagnostics.append(
                 _diagnostic(
@@ -340,6 +350,17 @@ def validate_reference_bundle(
                     severity=DiagnosticSeverity.WARNING,
                 )
             )
+        if entry.title and entry.journal:
+            compact_title = re.sub(r"\W+", "", entry.title.casefold())
+            compact_journal = re.sub(r"\W+", "", entry.journal.casefold())
+            if compact_title and compact_title == compact_journal:
+                diagnostics.append(
+                    _diagnostic(
+                        "TITLE_EQUALS_JOURNAL",
+                        f"entry {entry.citation_key!r} title duplicates its journal",
+                        severity=DiagnosticSeverity.WARNING,
+                    )
+                )
 
     return tuple(diagnostics)
 

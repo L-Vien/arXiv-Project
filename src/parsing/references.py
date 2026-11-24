@@ -40,6 +40,15 @@ _ARXIV_PATTERN = re.compile(
     r"(?<![0-9])((?:\d{4}\.\d{4,5}|[a-z][a-z0-9-]+/\d{7})(?:v\d+)?)(?![0-9])",
     re.IGNORECASE,
 )
+_CITATION_COMMAND_PATTERN = re.compile(
+    r"\\(?P<command>[A-Za-z]*cite[A-Za-z]*)\*?"
+    r"(?:\s*\[[^\]]*\]){0,2}\s*\{(?P<keys>[^{}]+)\}",
+    re.IGNORECASE,
+)
+_NOCITE_ALL_PATTERN = re.compile(
+    r"\\nocite\s*\{\s*\*\s*\}",
+    re.IGNORECASE,
+)
 _INVALID_CITATION_KEY = re.compile(
     r"\s|[\x00-\x1f\x7f]|\\|^(?:https?://|doi:)",
     re.IGNORECASE,
@@ -191,6 +200,33 @@ def _strip_reference_comments(content: str) -> str:
     return "".join(lines)
 
 
+def _strip_bibtex_comments(content: str) -> str:
+    """Strip BibTeX comments without removing percent signs inside values."""
+    lines: list[str] = []
+    brace_depth = 0
+    in_quote = False
+    escaped = False
+    for line in content.splitlines(keepends=True):
+        output: list[str] = []
+        for char in line:
+            if char == "\\" and not escaped:
+                escaped = True
+                output.append(char)
+                continue
+            if char == '"' and not escaped and brace_depth == 0:
+                in_quote = not in_quote
+            if char == "{" and not in_quote:
+                brace_depth += 1
+            elif char == "}" and not in_quote and brace_depth:
+                brace_depth -= 1
+            if char == "%" and not escaped and not in_quote and brace_depth == 0:
+                break
+            output.append(char)
+            escaped = False
+        lines.append("".join(output))
+    return "".join(lines)
+
+
 def _normalize_doi(value: str) -> str:
     """Return a stable bare DOI for output and cross-version matching."""
     cleaned = _clean_field_value(value)
@@ -220,11 +256,60 @@ def _normalize_arxiv_id(value: str) -> str:
     return re.sub(r"v\d+$", "", match.group(1), flags=re.IGNORECASE).lower()
 
 
+def _cited_keys(source: SourceBundle) -> set[str] | None:
+    """Return cited keys, ``None`` for ``nocite{*}``, or an empty set."""
+
+    tex = "\n".join(
+        file_obj.content
+        for file_obj in source.files
+        if file_obj.relative_path.lower().endswith(".tex")
+    )
+    tex = _strip_reference_comments(tex)
+    if _NOCITE_ALL_PATTERN.search(tex):
+        return None
+    keys: set[str] = set()
+    for match in _CITATION_COMMAND_PATTERN.finditer(tex):
+        if match.group("command").casefold() == "nocite":
+            keys.update(
+                key.strip()
+                for key in match.group("keys").split(",")
+                if key.strip() != "*"
+            )
+        else:
+            keys.update(key.strip() for key in match.group("keys").split(","))
+    return keys
+
+
+def _replace_href_labels(text: str) -> str:
+    """Replace balanced LaTeX href commands with their visible labels."""
+
+    output: list[str] = []
+    cursor = 0
+    pattern = re.compile(r"\\href(?:@noop)?(?![A-Za-z@])")
+    while match := pattern.search(text, cursor):
+        output.append(text[cursor:match.start()])
+        url_group = _read_braced_group(text, match.end())
+        label_group = (
+            _read_braced_group(text, url_group[1])
+            if url_group is not None
+            else None
+        )
+        if url_group is None or label_group is None:
+            output.append(match.group(0))
+            cursor = match.end()
+            continue
+        output.append(label_group[0])
+        cursor = label_group[1]
+    output.append(text[cursor:])
+    return "".join(output)
+
+
 def _clean_latex_accents(text: str) -> str:
     """Convert common semantic LaTeX to stable display text."""
     if not text:
         return ""
 
+    text = _replace_href_labels(text)
     text = re.sub(
         r"\\href\s*\{[^{}]*\}\s*\{([^{}]*)\}",
         r"\1",
@@ -232,8 +317,9 @@ def _clean_latex_accents(text: str) -> str:
         flags=re.IGNORECASE,
     )
     wrapper = re.compile(
-        r"\\(?:emph|ensuremath|mbox|operatorname|text|textit|textbf|texttt|"
-        r"textnormal|textrm|textsf|mathrm|mathit|mathbf|url)\s*\{([^{}]*)\}",
+        r"\\(?:bibfnamefont|bibnamefont|bibtitlefont|emph|ensuremath|mbox|operatorname|path|"
+        r"text|textit|textbf|texttt|textnormal|textrm|textsf|mathrm|mathit|"
+        r"mathbf|url|JournalTitle)\s*\{([^{}]*)\}",
         re.IGNORECASE,
     )
     while wrapper.search(text):
@@ -245,6 +331,11 @@ def _clean_latex_accents(text: str) -> str:
         '"': "\u0308",
         "^": "\u0302",
         "~": "\u0303",
+        "H": "\u030b",
+        "=": "\u0304",
+        ".": "\u0307",
+        "u": "\u0306",
+        "r": "\u030a",
     }
 
     def compose_accent(match: re.Match[str]) -> str:
@@ -254,12 +345,22 @@ def _clean_latex_accents(text: str) -> str:
         )
 
     text = re.sub(
-        r"\\([`'\"^~])\{?\\([ij])\}?",
+        r"\\([`'\"^~H=.ur])\{\\([ij])\}",
         compose_accent,
         text,
     )
     text = re.sub(
-        r"\\([`'\"^~])\{?([a-zA-Z])\}?",
+        r"\\([`'\"^~H=.ur])\{([a-zA-Z])\}",
+        compose_accent,
+        text,
+    )
+    text = re.sub(
+        r"\\([`'\"^~H=.])\\([ij])",
+        compose_accent,
+        text,
+    )
+    text = re.sub(
+        r"\\([`'\"^~H=.])([a-zA-Z])",
         compose_accent,
         text,
     )
@@ -275,9 +376,15 @@ def _clean_latex_accents(text: str) -> str:
         text = text.replace(pat, rep)
 
     text = re.sub(r"\\v\{([a-zA-Z])\}", lambda m: {"c": "č", "s": "š", "z": "ž", "C": "Č", "S": "Š", "Z": "Ž"}.get(m.group(1), m.group(1)), text)
+    text = re.sub(r"\\v\s*([a-zA-Z])", lambda m: {"c": "č", "s": "š", "z": "ž", "C": "Č", "S": "Š", "Z": "Ž"}.get(m.group(1), m.group(1)), text)
     text = re.sub(r"\\c\{([a-zA-Z])\}", lambda m: {"c": "ç", "C": "Ç"}.get(m.group(1), m.group(1)), text)
     while wrapper.search(text):
         text = wrapper.sub(r"\1", text)
+    text = re.sub(
+        r"\\(?:bf|it|em)(?![A-Za-z@])\s*",
+        "",
+        text,
+    )
     text = text.replace(r"\LaTeX", "LaTeX").replace(r"\TeX", "TeX")
     text = re.sub(r"\\text([A-Z][A-Za-z0-9]*)", r"\1", text)
     for command, replacement in sorted(
@@ -296,8 +403,9 @@ def _clean_latex_accents(text: str) -> str:
     text = text.replace(r"\{", "").replace(r"\}", "")
     text = re.sub(r"\\{2,}", " ", text)
     text = re.sub(
-        r"\\(?:emph|ensuremath|mbox|operatorname|text|textit|textbf|texttt|"
-        r"textnormal|textrm|textsf|mathrm|mathit|mathbf|url)\s*\{",
+        r"\\(?:bibfnamefont|bibnamefont|bibtitlefont|emph|ensuremath|mbox|operatorname|path|"
+        r"text|textit|textbf|texttt|textnormal|textrm|textsf|mathrm|mathit|"
+        r"mathbf|url|JournalTitle)\s*\{",
         "",
         text,
         flags=re.IGNORECASE,
@@ -363,6 +471,24 @@ def _clean_title_value(value: str) -> str:
     if leaked_field is not None:
         title = title[:leaked_field.start()]
     title = title.strip(" \t\r\n,;:'\"")
+    title = re.sub(
+        r"\s*:?[;,.]?\s*(?:see|available\s+(?:at|from))\s+https?://\S+.*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).rstrip(" \t\r\n,;:.")
+    title = re.sub(
+        r"\s*(?:https?://|doi\s*:\s*)\S+.*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).rstrip(" \t\r\n,;:.")
+    title = re.sub(
+        r"\s*(?:\.\s*)?arXiv\s+Preprint\s*\(?\s*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).rstrip(" \t\r\n,;:.")
     if re.fullmatch(r"(?:https?://|doi\s*:).+", title, flags=re.IGNORECASE):
         return ""
     return title
@@ -566,8 +692,66 @@ def _parse_bib_fields(fields_text: str) -> Dict[str, str]:
         if eq_idx != -1:
             f_name = part[:eq_idx].strip().lower()
             f_val = part[eq_idx+1:].strip()
+            if (
+                f_name == "title"
+                and f_name in fields
+                and not f_val.strip("{}\"' ")
+            ):
+                continue
             fields[f_name] = f_val
     return fields
+
+
+def title_status_for_entry(entry: BibEntry) -> tuple[str, str]:
+    """Classify a title and whether other metadata remains available.
+
+    ``missing_parser`` is deliberately conservative: it is used only when the
+    raw source contains an explicit, non-empty title field/wrapper that the
+    normalized entry failed to publish.  All other empty titles are marked
+    ``missing_source`` rather than guessing from prose.  The second value
+    separates the two downstream cases (metadata available vs. no metadata),
+    giving M3 an unambiguous four-way classification for missing titles.
+    """
+
+    metadata_status = (
+        "metadata_available"
+        if (
+            entry.authors
+            or entry.year is not None
+            or entry.doi
+            or entry.journal
+            or entry.url
+        )
+        else "metadata_empty"
+    )
+    if entry.title.strip():
+        return "present", metadata_status
+
+    raw = entry.raw_entry or ""
+    has_explicit_title = False
+    if entry.source_kind == "bibtex" and raw:
+        _, separator, fields_text = raw.partition(",")
+        if separator:
+            fields = _recover_bib_fields(
+                fields_text,
+                _parse_bib_fields(fields_text),
+            )
+            has_explicit_title = bool(_clean_title_value(fields.get("title", "")))
+    else:
+        for match in re.finditer(
+            r"\\bibinfo\s*\{\s*title\s*\}",
+            raw,
+            flags=re.IGNORECASE,
+        ):
+            group = _read_braced_group(raw, match.end())
+            if group is not None and _clean_title_value(group[0]):
+                has_explicit_title = True
+                break
+
+    return (
+        "missing_parser" if has_explicit_title else "missing_source",
+        metadata_status,
+    )
 
 
 def _recover_bib_fields(fields_text: str, fields: Dict[str, str]) -> Dict[str, str]:
@@ -652,6 +836,13 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
                     raw_citation_key = entry_body.strip()
                     fields_text = ""
 
+                # BibTeX permits comments after the citation key and between
+                # fields (for example ``{key, % comment\n title = {...}}``).
+                # Strip them before field-name detection; otherwise the
+                # comment text becomes part of the first field name and the
+                # title silently disappears from the structured output.
+                fields_text = _strip_bibtex_comments(fields_text)
+
                 citation_key = (
                     _safe_citation_key(
                         raw_citation_key,
@@ -679,8 +870,52 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
                 )
 
                 doi = _normalize_doi(field_dict.get("doi", ""))
-                journal = _clean_field_value(field_dict.get("journal", "") or field_dict.get("booktitle", "") or field_dict.get("journaltitle", ""))
+                journal = _clean_field_value(
+                    field_dict.get("journal", "")
+                    or field_dict.get("booktitle", "")
+                    or field_dict.get("journaltitle", "")
+                )
                 url = _extract_url(field_dict)
+                parse_status = "partial" if not entry_closed else "parsed"
+
+                note = field_dict.get("note", "")
+                note_has_structure = bool(
+                    re.search(
+                        r"\\(?:textit|emph|href|url)(?![A-Za-z@])|"
+                        r"\{\s*\\(?:it|em)\s+|"
+                        r"\bdoi\s*:\s*|\b10\.\d{4,9}/",
+                        note,
+                        re.IGNORECASE,
+                    )
+                )
+                if (
+                    note
+                    and note_has_structure
+                    and not any((title, authors, year, doi, journal, url))
+                ):
+                    # Keep formatting commands such as ``\textit{...}`` until
+                    # the rendered-citation parser has identified the title.
+                    # Cleaning first removes the emphasis boundary and makes a
+                    # comma inside the title look like a field separator.
+                    note_text = note
+                    while True:
+                        unwrapped = _unwrap_outer_group(note_text)
+                        if unwrapped == note_text:
+                            break
+                        note_text = unwrapped
+                    note_metadata = _parse_structured_bibitem(note_text)
+                    if note_metadata is not None:
+                        title = note_metadata.get("title", "") or title
+                        authors = note_metadata.get("authors", ()) or authors
+                        year = note_metadata.get("year") or year
+                        doi = note_metadata.get("doi", "") or doi
+                        journal = note_metadata.get("journal", "") or journal
+                        url = note_metadata.get("url", "") or url
+                        parse_status = (
+                            "parsed"
+                            if title
+                            else "partial"
+                        )
 
                 # A syntactically valid entry can legitimately omit the
                 # subset of fields represented by our flat output schema. For
@@ -711,7 +946,7 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
                             raw_citation_key=raw_citation_key,
                             raw_entry=raw_entry,
                             source_kind="bibtex",
-                            parse_status="partial" if not entry_closed else "parsed",
+                            parse_status=parse_status,
                             title=title,
                             authors=authors,
                             year=year,
@@ -735,10 +970,1474 @@ def _parse_bib_content(content: str, file_path: str, diagnostics: List[Diagnosti
     return entries
 
 
+def _parse_rendered_authors(value: str) -> Tuple[str, ...]:
+    """Parse the author block emitted by common BibTeX bibliography styles."""
+
+    cleaned = _clean_field_value(value).strip()
+    if not re.search(
+        r"(?:^|[\s,])(?:[A-Z](?:-[A-Z])?\.){1,3}$",
+        cleaned,
+    ):
+        cleaned = cleaned.rstrip(".")
+    if not cleaned:
+        return ()
+
+    groups = re.split(
+        r"\s+and\s+|,\s+and\s+|;\s*",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    authors: list[str] = []
+    for group in groups:
+        group = re.sub(r"^\s*,?\s*and\s+", "", group, flags=re.IGNORECASE)
+        comma_parts = [part.strip() for part in group.split(",") if part.strip()]
+        surname_first = (
+            len(comma_parts) >= 2
+            and len(comma_parts) % 2 == 0
+            and all(
+                "." not in comma_parts[index]
+                and not re.search(r"\d|https?://", comma_parts[index])
+                and re.match(r"^[A-ZÀ-ÖØ-Þ]", comma_parts[index])
+                and re.fullmatch(
+                    r"[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’-]*(?:\s+[A-Za-zÀ-ÖØ-öø-ÿ'’-]+)*",
+                    comma_parts[index],
+                )
+                and re.fullmatch(
+                    r"(?:[A-ZÀ-ÖØ-Þ](?:[-.][A-ZÀ-ÖØ-Þ])?\.?|"
+                    r"[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’-]+)(?:\s+.*)?",
+                    comma_parts[index + 1],
+                )
+                for index in range(0, len(comma_parts), 2)
+            )
+        )
+        if surname_first:
+            authors.extend(
+                f"{comma_parts[index]}, {comma_parts[index + 1]}"
+                for index in range(0, len(comma_parts), 2)
+            )
+        elif len(comma_parts) > 1 and all(
+            re.match(
+                r"^(?:[A-ZÀ-ÖØ-ÞŠŽČ](?:\.-?[A-ZÀ-ÖØ-ÞŠŽČ])?\.|"
+                r"[A-ZÀ-ÖØ-ÞŠŽČ][a-zà-öø-ÿšžč]+\b)",
+                part,
+            )
+            for part in comma_parts
+        ):
+            authors.extend(comma_parts)
+        elif group.strip(" ,;"):
+            authors.append(group.strip(" ,;"))
+    return tuple(authors)
+
+
+def _looks_like_author_segment(value: str) -> bool:
+    """Recognize an author segment without mistaking an abbreviated venue for it."""
+
+    cleaned = _clean_field_value(value).strip(" \t\r\n,;")
+    cleaned = re.sub(r"^(?:and|&)\s+", "", cleaned, flags=re.IGNORECASE)
+    if ":" in cleaned:
+        return False
+    if re.search(r"[$=<>×±]", cleaned):
+        return False
+    tokens = cleaned.split()
+    if len(tokens) < 2:
+        return False
+
+    parsed_authors = _parse_rendered_authors(cleaned)
+    if len(parsed_authors) >= 2 and _rendered_authors_are_plausible(parsed_authors):
+        return True
+
+    initial = re.compile(
+        r"(?:[A-ZÀ-ÖØ-Þ](?:\.-?[A-Za-zÀ-ÖØ-öø-ÿ])?(?:[A-Za-zÀ-ÖØ-öø-ÿ])?\.){1,3}"
+    )
+    connector = re.compile(
+        r"(?:de|del|der|di|dos?|du|la|le|van|von|bin|al)",
+        re.IGNORECASE,
+    )
+    if not tokens[0].endswith(".") and all(
+        initial.fullmatch(token) for token in tokens[1:]
+    ):
+        return True
+    if initial.fullmatch(tokens[0]) and not tokens[-1].endswith("."):
+        return True
+    for split in range(1, len(tokens)):
+        if all(initial.fullmatch(token) for token in tokens[split:]) and all(
+            not token.endswith(".") for token in tokens[:split]
+        ):
+            return True
+    if not tokens[-1].endswith(".") and all(
+        initial.fullmatch(token) or connector.fullmatch(token)
+        for token in tokens[:-1]
+    ):
+        return True
+    return False
+
+
+def _looks_like_venue_fragment(value: str) -> bool:
+    """Identify a journal fragment using citation punctuation, not title guesses."""
+
+    cleaned = _clean_field_value(value).strip(" \t\r\n,;")
+    if not cleaned:
+        return False
+    if re.search(
+        r"\b(?:journal|section|sect\.?|volume|vol\.?|proceedings|conference|"
+        r"physical\s+review|nature|science|cell)\b",
+        cleaned,
+        re.IGNORECASE,
+    ):
+        return True
+    abbreviations = [
+        token
+        for token in re.findall(r"\b[A-Z][A-Za-z]{1,5}\.", cleaned)
+        if token.rstrip(".") not in {"I", "II", "III", "IV", "V", "VI"}
+    ]
+    return len(abbreviations) >= 1
+
+
+def _rendered_authors_are_plausible(authors: Tuple[str, ...]) -> bool:
+    """Reject prose fragments accidentally captured as rendered author names."""
+
+    if not authors:
+        return False
+    for author in authors:
+        if re.search(r"\d", author):
+            return False
+        words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'’-]+", author)
+        if len(words) < 2 or len(words) > 6 or author.count(",") > 1:
+            return False
+        if any(
+            word.lower()
+            in {
+                "and",
+                "for",
+                "from",
+                "in",
+                "into",
+                "of",
+                "on",
+                "the",
+                "theory",
+                "through",
+                "with",
+            }
+            for word in words
+        ):
+            return False
+        if not any(char.isupper() for char in author):
+            return False
+        if not any(
+            len(word) > 1 and any(char.islower() for char in word)
+            for word in words
+        ):
+            return False
+    return True
+
+
+def _extract_rendered_venue(value: str) -> str:
+    """Return an explicitly formatted venue from a rendered bibliography block."""
+
+    for pattern in (
+        r"\{\s*\\(?:em|it)\s+([^{}]+)\}",
+        r"\\(?:emph|textit)\s*\{([^{}]+)\}",
+        r"\\JournalTitle\s*\{([^{}]+)\}",
+    ):
+        match = re.search(pattern, value, flags=re.IGNORECASE)
+        if match is not None:
+            return _clean_field_value(match.group(1)).strip(" \t\r\n,;")
+    return ""
+
+
+def _extract_href_parts(value: str) -> tuple[str, str] | None:
+    """Read a LaTeX href with balanced URL and visible-label arguments."""
+
+    match = re.search(r"\\href(?:@noop)?(?![A-Za-z@])", value)
+    if match is None:
+        return None
+    url_group = _read_braced_group(value, match.end())
+    label_group = (
+        _read_braced_group(value, url_group[1])
+        if url_group is not None
+        else None
+    )
+    if url_group is None or label_group is None:
+        return None
+    return (
+        _clean_field_value(url_group[0]),
+        _clean_field_value(label_group[0]),
+    )
+
+
+def _extract_doi_wrapper(value: str) -> tuple[str, str] | None:
+    r"""Extract DOI and visible citation text from ``\doi``/``\Doi`` wrappers."""
+
+    for match in re.finditer(
+        r"\\doi(?![A-Za-z@])", value, re.IGNORECASE
+    ):
+        doi_group = _read_braced_group(value, match.end())
+        if doi_group is None:
+            continue
+        label_group = _read_braced_group(value, doi_group[1])
+        doi = _normalize_doi(doi_group[0])
+        if doi and label_group is not None:
+            return doi, label_group[0]
+    return None
+
+
+def _parse_doi_wrapper_bibitem(item_text: str) -> dict[str, Any] | None:
+    """Parse a DOI wrapper whose visible label contains journal metadata."""
+
+    match = re.search(r"\\doi(?![A-Za-z@])", item_text, re.IGNORECASE)
+    wrapper = _extract_doi_wrapper(item_text)
+    if match is None or wrapper is None:
+        return None
+
+    doi, visible_label = wrapper
+    volume_marker = re.search(
+        r"\\textbf\s*\{\s*(?:[A-Z]\s*)?\d|"
+        r"\{\s*\\bf\s*(?=(?:[A-Z]\s*)?\d)",
+        visible_label,
+        re.IGNORECASE,
+    )
+    if volume_marker is None:
+        return None
+
+    authors = _parse_rendered_authors(
+        item_text[:match.start()].rstrip(" \t\r\n,;")
+    )
+    if not _rendered_authors_are_plausible(authors):
+        return None
+
+    journal = _clean_field_value(
+        visible_label[:volume_marker.start()]
+    ).strip(" \t\r\n,;")
+    if not journal:
+        return None
+    return {
+        "authors": authors,
+        "title": "",
+        "year": _last_plausible_year(visible_label),
+        "doi": doi,
+        "journal": journal,
+        "url": f"https://doi.org/{doi}",
+        "parse_status": "partial",
+        "_title_absent": True,
+    }
+
+
+def _parse_href_venue_bibitem(item_text: str) -> dict[str, Any] | None:
+    """Extract metadata when an href label is a venue, not an article title."""
+
+    href_match = re.search(r"\\href(?:@noop)?(?![A-Za-z@])", item_text)
+    if href_match is None:
+        return None
+
+    url_group = _read_braced_group(item_text, href_match.end())
+    label_group = (
+        _read_braced_group(item_text, url_group[1])
+        if url_group is not None
+        else None
+    )
+    if url_group is None or label_group is None:
+        return None
+    raw_label = label_group[0]
+    href_parts = (
+        _clean_field_value(url_group[0]),
+        _clean_field_value(raw_label),
+    )
+    if not re.search(
+        r"\\(?:em|it|emph|textit|textbf|bf)(?![A-Za-z@])|"
+        r"\\JournalTitle(?![A-Za-z@])|"
+        r"\bdoi\b|"
+        r"\b(?:19|20)\d{2}\b|\b\d+\s*[,(:]",
+        raw_label,
+        re.IGNORECASE,
+    ):
+        return None
+
+    journal = _extract_rendered_venue(raw_label)
+    if not journal:
+        volume_marker = re.search(
+            r"\\textbf\s*\{\s*(?:[A-Z]\s*)?\d|"
+            r"\{\s*\\bf\s*(?=(?:[A-Z]\s*)?\d)",
+            raw_label,
+            re.IGNORECASE,
+        )
+        if volume_marker is not None:
+            journal = _clean_field_value(
+                raw_label[:volume_marker.start()]
+            ).strip(" \t\r\n,;")
+        if not journal:
+            volume_marker = re.search(r"\b\d+\s*[,(:]", raw_label)
+            if volume_marker is not None:
+                journal = _clean_field_value(
+                    raw_label[:volume_marker.start()]
+                ).strip(" \t\r\n,;")
+    author_text = re.sub(
+        r"\\newblock(?![A-Za-z@])",
+        " ",
+        item_text[:href_match.start()],
+        flags=re.IGNORECASE,
+    ).rstrip(" \t\r\n,;")
+    author_year = _last_plausible_year(author_text)
+    if author_year is not None:
+        author_text = re.sub(
+            rf"(?:[,;(]\s*)?\b{author_year}\b[.)]?\s*$",
+            "",
+            author_text,
+        ).rstrip(" \t\r\n,;")
+    authors = _parse_rendered_authors(author_text)
+    if re.search(r"(?:https?://|urlprefix|\\url)", journal, re.IGNORECASE):
+        journal = ""
+
+    url, label = href_parts
+    # Some bibliography styles put a real article title before a DOI href,
+    # without an explicit delimiter, e.g. ``Authors 2022 Title J. Field
+    # Robot. 39 ... \href{doi}{doi:...}``.  The generic href parser above
+    # intentionally treats the label as venue metadata and would otherwise
+    # discard that title.  When a publication year separates a plausible
+    # author block from a title and an abbreviated venue precedes a volume,
+    # recover the structured citation explicitly.
+    if re.search(r"\bdoi\b", label, re.IGNORECASE):
+        prefix = item_text[:href_match.start()].rstrip(" \t\r\n,;")
+        year_match = re.search(r"\b((?:19|20)\d{2})\b", prefix)
+        if year_match is not None:
+            prefix_authors = _parse_rendered_authors(
+                prefix[:year_match.start()].rstrip(" \t\r\n,;.")
+            )
+            publication = prefix[year_match.end():].strip(" \t\r\n,;.")
+            volume_matches = list(
+                re.finditer(r"\s+\d+(?:\s|\(|,)", publication)
+            )
+            volume_match = next(
+                (
+                    match
+                    for match in volume_matches
+                    if match.group().strip(" ,(") != year_match.group(1)
+                ),
+                volume_matches[0] if volume_matches else None,
+            )
+            if (
+                publication
+                and volume_match is not None
+                and _rendered_authors_are_plausible(prefix_authors)
+            ):
+                before_volume = publication[:volume_match.start()].rstrip(
+                    " \t\r\n,;"
+                )
+                venue_match = re.search(
+                    r"(?P<venue>(?:[A-Z][A-Za-z]{0,12}\.?\s+){1,5}"
+                    r"[A-Z][A-Za-z]{0,12}\.)$",
+                    before_volume,
+                )
+                venue_start = venue_match.start() if venue_match is not None else None
+                if venue_start is None:
+                    proceedings = re.search(r"\bProc\.", before_volume)
+                    if proceedings is not None:
+                        venue_start = proceedings.start()
+                if venue_start is None:
+                    one_word_venue = re.search(
+                        r"\b[A-Z][A-Za-z]{2,}\s*$",
+                        before_volume,
+                    )
+                    if one_word_venue is not None:
+                        venue_start = one_word_venue.start()
+                if venue_start is not None:
+                    recovered_title = _clean_title_value(
+                        before_volume[:venue_start]
+                    ).strip(" \t\r\n,;:." )
+                    recovered_journal = _clean_field_value(
+                        before_volume[venue_start:]
+                    ).strip(" \t\r\n,;:.")
+                    recovered_journal = re.sub(
+                        r"\s+vol\.?\s*$",
+                        "",
+                        recovered_journal,
+                        flags=re.IGNORECASE,
+                    )
+                    if (
+                        len(recovered_title.split()) >= 3
+                        and recovered_journal
+                        and not _looks_like_venue_fragment(recovered_title)
+                    ):
+                        doi = _normalize_doi(url)
+                        return {
+                            "authors": prefix_authors,
+                            "title": recovered_title,
+                            "year": int(year_match.group(1)),
+                            "doi": doi,
+                            "journal": recovered_journal,
+                            "url": f"https://doi.org/{doi}" if doi else url,
+                            "parse_status": "parsed",
+                        }
+    if not _rendered_authors_are_plausible(authors):
+        return None
+    if not journal:
+        return None
+    return {
+        "authors": authors,
+        "title": "",
+        "year": author_year or _last_plausible_year(label),
+        "doi": _normalize_doi(url),
+        "journal": journal,
+        "url": (
+            f"https://doi.org/{_normalize_doi(url)}"
+            if _normalize_doi(url)
+            else url
+        ),
+        "parse_status": "partial",
+        "_title_absent": True,
+    }
+
+
+def _parse_bibinfo_bibitem(item_text: str) -> dict[str, Any] | None:
+    """Extract fields emitted by REVTeX and related ``\bibinfo`` styles."""
+
+    fields: dict[str, list[str]] = {}
+    for match in re.finditer(r"\\bibinfo(?![A-Za-z@])", item_text):
+        name_group = _read_braced_group(item_text, match.end())
+        value_group = (
+            _read_braced_group(item_text, name_group[1])
+            if name_group is not None
+            else None
+        )
+        if name_group is None or value_group is None:
+            continue
+        name = name_group[0].strip().lower()
+        fields.setdefault(name, []).append(value_group[0])
+
+    if not fields:
+        return None
+
+    parsed_authors = [
+        author
+        for author in (
+            _clean_field_value(value).strip(" \t\r\n,;")
+            for value in fields.get("author", [])
+        )
+        if author
+    ]
+    repaired_authors: list[str] = []
+    index = 0
+    while index < len(parsed_authors):
+        author = parsed_authors[index]
+        next_author = (
+            parsed_authors[index + 1]
+            if index + 1 < len(parsed_authors)
+            else ""
+        )
+        if (
+            re.fullmatch(r"[A-Za-zÀ-ÖØ-öø-ÿ'’-]+", author)
+            and re.fullmatch(r"[A-Z]", next_author)
+        ):
+            repaired_authors.append(f"{next_author}. {author}")
+            index += 2
+            continue
+        if len(author) > 1:
+            repaired_authors.append(author)
+        index += 1
+    authors = tuple(repaired_authors)
+    title = _clean_title_value((fields.get("title") or [""])[0]).rstrip(
+        " \t\r\n.,;:"
+    )
+    journal = _clean_field_value(
+        (fields.get("journal") or fields.get("journaltitle") or [""])[0]
+    ).strip(" \t\r\n,;")
+    year = _year_from_text((fields.get("year") or fields.get("date") or [""])[0])
+    publication_suffix = re.search(
+        r"\s+\([^()]*,\s*((?:19|20)\d{2})\)$",
+        title,
+    )
+    if publication_suffix is not None:
+        year = year or int(publication_suffix.group(1))
+        title = title[:publication_suffix.start()].rstrip(" \t\r\n.,;:")
+    doi = _normalize_doi((fields.get("doi") or [""])[0])
+    url = _extract_url({name: values[0] for name, values in fields.items()})
+    return {
+        "authors": authors,
+        "title": title,
+        "year": year,
+        "doi": doi,
+        "journal": journal,
+        "url": url,
+        "parse_status": "parsed" if title else "partial",
+    }
+
+
+def _last_plausible_year(value: str) -> Optional[int]:
+    """Return the final plausible publication year in a bounded citation tail."""
+
+    cleaned = _clean_field_value(value)
+    years = [
+        int(match.group(1))
+        for match in re.finditer(r"\b(\d{4})\b", cleaned)
+        if 1600 <= int(match.group(1)) <= date.today().year + 1
+    ]
+    if years:
+        return years[-1]
+
+    arxiv_match = re.search(
+        r"\barxiv\s*:\s*(?:[a-z.-]+/)?(?P<year>\d{2})(?:\d{2})[.\d]",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if arxiv_match is None:
+        return None
+    short_year = int(arxiv_match.group("year"))
+    inferred_year = (1900 if short_year >= 91 else 2000) + short_year
+    return inferred_year if inferred_year <= date.today().year + 1 else None
+
+
+def _citation_year(value: str, boundary: int) -> Optional[int]:
+    """Read publication year without treating a DOI or page as evidence."""
+
+    prefix_years = re.findall(
+        r"\b((?:19|20)\d{2})\b",
+        _clean_field_value(value[:boundary]),
+    )
+    if prefix_years:
+        return int(prefix_years[-1])
+
+    tail = re.sub(
+        r"(?:https?://|doi\s*:\s*|\\doi\s*\{)[^\s{}]+",
+        " ",
+        _clean_field_value(value[boundary:]),
+        flags=re.IGNORECASE,
+    )
+    parenthesized = re.search(r"\(\s*((?:19|20)\d{2})\s*\)", tail)
+    if parenthesized is not None:
+        return int(parenthesized.group(1))
+    years = re.findall(r"\b((?:19|20)\d{2})\b", tail)
+    return int(years[0]) if years else None
+
+
+def _parse_quoted_bibitem(item_text: str) -> dict[str, Any] | None:
+    """Extract citations whose title is explicitly delimited by quotation marks."""
+
+    title_match = re.search(r"``(?P<title>.*?),?''|“(?P<unicode_title>.*?)”", item_text)
+    if title_match is None:
+        return None
+
+    raw_title = title_match.group("title") or title_match.group("unicode_title") or ""
+    title = _clean_title_value(raw_title).rstrip(" \t\r\n.,;:")
+    authors = _parse_rendered_authors(item_text[:title_match.start()].rstrip(" \t\r\n,;"))
+    tail = item_text[title_match.end():].lstrip(" \t\r\n,;.")
+    publication_tail = re.split(
+        r"\[?\s*(?:accessed|retrieved)\b",
+        tail,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    venue_boundary = re.search(
+        r"\\(?:textbf|bf)(?![A-Za-z@])|\b(?:19|20)\d{2}\b|"
+        r"\b\d+\s*[,(:]|\(\d{4}\)",
+        tail,
+    )
+    venue_source = tail[:venue_boundary.start()] if venue_boundary is not None else ""
+    journal = _clean_field_value(venue_source).strip(" \t\r\n,;.")
+    if not title or not authors:
+        return None
+    return {
+        "authors": authors,
+        "title": title,
+        "year": _last_plausible_year(publication_tail),
+        "journal": journal,
+        "parse_status": "parsed",
+    }
+
+
+def _formatted_bibliography_spans(value: str) -> list[tuple[int, int, str]]:
+    """Return explicitly italicized/emphasized spans with source offsets."""
+
+    spans: list[tuple[int, int, str]] = []
+    for match in re.finditer(r"\\(?:emph|textit)(?![A-Za-z@])", value):
+        group = _read_braced_group(value, match.end())
+        if group is not None:
+            spans.append((match.start(), group[1], _clean_field_value(group[0])))
+
+    for match in re.finditer(
+        r"\{\s*\\(?:em|it)(?![A-Za-z@])\s+",
+        value,
+    ):
+        group = _read_braced_group(value, match.start())
+        if group is None:
+            continue
+        content = re.sub(
+            r"^\s*\\(?:em|it)(?![A-Za-z@])\s+",
+            "",
+            group[0],
+            count=1,
+        )
+        content = re.split(
+            r"\\bf(?![A-Za-z@])\s+(?=\d)",
+            content,
+            maxsplit=1,
+        )[0]
+        spans.append((match.start(), group[1], _clean_field_value(content)))
+
+    return sorted(set(spans), key=lambda span: (span[0], span[1]))
+
+
+def _parse_emphasized_bibitem(item_text: str) -> dict[str, Any] | None:
+    """Extract citations that explicitly emphasize both title and venue."""
+
+    spans = [
+        span
+        for span in _formatted_bibliography_spans(item_text)
+        if _normalize_text(span[2]) not in {"et al", "and others"}
+    ]
+    newblock_count = len(re.findall(r"\\newblock(?![A-Za-z@])", item_text))
+    if spans:
+        first_span = spans[0]
+        prefix = item_text[:first_span[0]].rstrip(" \t\r\n,;")
+        direct_authors = _parse_rendered_authors(prefix)
+        if (
+            not _rendered_authors_are_plausible(direct_authors)
+            and not re.search(r"(?:https?://|\\href)", prefix, re.IGNORECASE)
+        ):
+            prefix = re.sub(r"\bIn\s*$", "", prefix).rstrip(" \t\r\n,;")
+            for boundary in re.finditer(
+                r"\.\s+(?=[A-ZÀ-ÖØ-Þ{\\])",
+                prefix,
+            ):
+                authors = _parse_rendered_authors(
+                    prefix[:boundary.start() + 1]
+                )
+                title = _clean_title_value(prefix[boundary.end():]).rstrip(
+                    " \t\r\n.,;:"
+                )
+                if title and _rendered_authors_are_plausible(authors):
+                    return {
+                        "authors": authors,
+                        "title": title,
+                        "year": _last_plausible_year(
+                            item_text[first_span[1]:]
+                        ),
+                        "journal": _clean_field_value(first_span[2]).strip(
+                            " \t\r\n,;"
+                        ),
+                        "parse_status": "parsed",
+                    }
+    single_emphasized_title = False
+    if len(spans) == 1:
+        span = spans[0]
+        prefix = item_text[:span[0]].rstrip(" \t\r\n,;")
+        candidate_authors = _parse_rendered_authors(
+            prefix
+        )
+        formatted_tail = item_text[span[1]:]
+        single_emphasized_title = (
+            _rendered_authors_are_plausible(candidate_authors)
+            and (
+                _last_plausible_year(formatted_tail) is not None
+                or re.search(
+                    r"\\(?:textbf|bf)(?![A-Za-z@])|"
+                    r"(?:https?://|\bdoi\s*:|\barxiv\s*:|\bto\s+appear\b)",
+                    formatted_tail,
+                    re.IGNORECASE,
+                )
+            )
+        )
+        if not single_emphasized_title:
+            if re.search(r"(?:https?://|\\href)", prefix, re.IGNORECASE):
+                return None
+            sentence_boundaries = list(
+                re.finditer(r"\.\s+(?=[A-ZÀ-ÖØ-Þ{\\])", prefix)
+            )
+            for boundary in sentence_boundaries:
+                authors = _parse_rendered_authors(prefix[:boundary.start() + 1])
+                title = _clean_title_value(prefix[boundary.end():]).rstrip(
+                    " \t\r\n.,;:"
+                )
+                if title and _rendered_authors_are_plausible(authors):
+                    return {
+                        "authors": authors,
+                        "title": title,
+                        "year": _last_plausible_year(formatted_tail),
+                        "journal": _clean_field_value(span[2]).strip(
+                            " \t\r\n,;"
+                        ),
+                        "parse_status": "parsed",
+                    }
+    if (
+        len(spans) < 2
+        and not (newblock_count == 1 and spans)
+        and not single_emphasized_title
+    ):
+        return None
+
+    title_span = spans[0]
+    title = _clean_title_value(title_span[2]).rstrip(" \t\r\n.,;:")
+    authors = _parse_rendered_authors(
+        item_text[:title_span[0]].rstrip(" \t\r\n,;")
+    )
+    if len(spans) > 1:
+        journal = _clean_field_value(spans[1][2]).strip(" \t\r\n,;")
+    else:
+        plain_tail = item_text[title_span[1]:]
+        venue_match = re.match(
+            r"\s*,\s*([^,()]+),\s*(?:19|20)\d{2}\b",
+            plain_tail,
+        )
+        if venue_match is not None:
+            journal = _clean_field_value(venue_match.group(1)).strip(
+                " \t\r\n,;"
+            )
+        else:
+            venue_start = re.match(r"\s*[,;]\s*", plain_tail)
+            venue_tail = plain_tail[
+                venue_start.end() if venue_start is not None else 0:
+            ]
+            venue_end = re.search(
+                r"\\(?:textbf|bf)(?![A-Za-z@])|"
+                r"\s+\d+(?:\([^)]*\))?\s*(?=[:(,])",
+                venue_tail,
+            )
+            journal = (
+                _clean_field_value(venue_tail[:venue_end.start()]).strip(
+                    " \t\r\n,;"
+                )
+                if venue_end is not None
+                else ""
+            )
+    if not title or not _rendered_authors_are_plausible(authors):
+        return None
+    return {
+        "authors": authors,
+        "title": title,
+        "year": _last_plausible_year(item_text[title_span[1]:]),
+        "journal": journal,
+        "parse_status": "parsed",
+    }
+
+
+def _parse_sentence_bibitem(item_text: str) -> dict[str, Any] | None:
+    """Parse citations with explicit author, title, and standalone-year sentences."""
+
+    match = re.fullmatch(
+        r"(?P<body>.+)\.\s+(?P<year>(?:19|20)\d{2})\.\s*",
+        item_text,
+        flags=re.DOTALL,
+    )
+    if match is not None:
+        body = match.group("body")
+        boundaries = list(re.finditer(r"\.\s+", body))
+        if not boundaries:
+            return None
+        boundary = boundaries[-1]
+        authors = _parse_rendered_authors(body[:boundary.start() + 1])
+        title = _clean_title_value(body[boundary.end():]).rstrip(" \t\r\n.,;:")
+        if not authors or not title:
+            return None
+        return {
+            "authors": authors,
+            "title": title,
+            "year": int(match.group("year")),
+            "journal": "",
+            "parse_status": "parsed",
+        }
+
+    if re.search(r"(?:https?://|\\href|\\url)", item_text, re.IGNORECASE):
+        return None
+    year = _last_plausible_year(item_text)
+
+    boundaries = list(
+        re.finditer(r"\.\s+(?=[A-ZÀ-ÖØ-Þ{\\])", item_text)
+    )
+    for author_boundary in boundaries:
+        authors = _parse_rendered_authors(
+            item_text[:author_boundary.start() + 1]
+        )
+        if not _rendered_authors_are_plausible(authors):
+            continue
+        remainder = item_text[author_boundary.end():]
+        for title_boundary in re.finditer(
+            r"\.\s+(?=[A-ZÀ-ÖØ-Þ{\\])",
+            remainder,
+        ):
+            publication_tail = remainder[title_boundary.end():]
+            volume_marker = re.search(
+                r"\\(?:textbf|bf)(?![A-Za-z@])|"
+                r"\s+\d+(?:\([^)]*\))?\s*(?::|,\s*(?:19|20)\d{2}\b)",
+                publication_tail,
+            )
+            if volume_marker is None:
+                continue
+            title = _clean_title_value(
+                remainder[:title_boundary.start() + 1]
+            ).rstrip(" \t\r\n.,;:")
+            journal = _clean_field_value(
+                publication_tail[:volume_marker.start()]
+            ).strip(" \t\r\n,;.")
+            if not title or not journal or len(journal.split()) > 12:
+                continue
+            return {
+                "authors": authors,
+                "title": title,
+                "year": year,
+                "journal": journal,
+                "parse_status": "parsed",
+            }
+    return None
+
+
+def _parse_colon_bibitem(item_text: str) -> dict[str, Any] | None:
+    """Parse rendered styles that separate authors and title with a colon."""
+
+    for separator in re.finditer(r":\s+", item_text):
+        authors = _parse_rendered_authors(item_text[:separator.start()])
+        if not _rendered_authors_are_plausible(authors):
+            continue
+
+        remainder = item_text[separator.end():]
+        title_boundary = re.search(
+            r"\.\s+(?=[A-ZÀ-ÖØ-Þ{\\]|(?i:arxiv)\b)",
+            remainder,
+        )
+        if title_boundary is None:
+            continue
+        title = _clean_title_value(
+            remainder[:title_boundary.start() + 1]
+        ).rstrip(" \t\r\n.,;:")
+        publication_tail = remainder[title_boundary.end():]
+        venue_end = re.search(
+            r"\\(?:textbf|bf)(?![A-Za-z@])|\{\\bf\s+|"
+            r"\s+\d+(?:\([^)]*\))?\s*(?=[:(,])|"
+            r"\s*\(\s*(?:19|20)\d{2}\s*\)|\barxiv\s*:",
+            publication_tail,
+            re.IGNORECASE,
+        )
+        journal = (
+            _clean_field_value(publication_tail[:venue_end.start()]).strip(
+                " \t\r\n,;"
+            )
+            if venue_end is not None
+            else ""
+        )
+        if not title:
+            continue
+        return {
+            "authors": authors,
+            "title": title,
+            "year": _last_plausible_year(publication_tail),
+            "journal": journal,
+            "parse_status": "parsed",
+        }
+    return None
+
+
+def _parse_bold_volume_bibitem(item_text: str) -> dict[str, Any] | None:
+    """Parse comma styles whose numeric volume is explicitly bold."""
+
+    volume_marker = re.search(
+        r"\\textbf\s*\{\s*(?:[A-Z]\s*)?\d|"
+        r"\{\s*\\bf\s*(?=(?:[A-Z]\s*)?\d)",
+        item_text,
+        re.IGNORECASE,
+    )
+    if volume_marker is None:
+        return None
+
+    prefix = item_text[:volume_marker.start()].rstrip(" \t\r\n{")
+    segments = [
+        segment.strip()
+        for segment in prefix.split(",")
+        if segment.strip()
+    ]
+    if len(segments) < 2:
+        return None
+
+    authors: list[str] = []
+    title_start = 0
+    for index, segment in enumerate(segments[:-1]):
+        if not _looks_like_author_segment(segment):
+            break
+        parsed = _parse_rendered_authors(segment)
+        if not _rendered_authors_are_plausible(parsed):
+            break
+        authors.extend(parsed)
+        title_start = index + 1
+
+    if not authors or title_start >= len(segments):
+        return None
+    before_volume = segments[title_start:]
+    metadata_text = ", ".join(before_volume).strip(" \t\r\n,;")
+    sentence_boundaries = []
+    for candidate in re.finditer(
+        r"\.\s+(?=[A-ZÀ-ÖØ-Þ])", metadata_text
+    ):
+        previous_word = re.search(
+            r"([A-Za-zÀ-ÖØ-öø-ÿ]+)$", metadata_text[:candidate.start()]
+        )
+        if previous_word is not None:
+            word = previous_word.group(1)
+            suffix = metadata_text[candidate.end():]
+            if (
+                (len(word) >= 4 and word[0].islower())
+                or (
+                    len(word) >= 4
+                    and _looks_like_venue_fragment(suffix.split(",", 1)[0])
+                    and not re.match(
+                        r"^[A-Z][A-Za-z]{1,5}\.",
+                        suffix.strip(),
+                    )
+                )
+            ):
+                sentence_boundaries.append(candidate)
+    if sentence_boundaries:
+        boundary = sentence_boundaries[-1]
+        sentence_title = _clean_title_value(
+            metadata_text[:boundary.start()]
+        ).strip(" \t\r\n,;:.")
+        sentence_journal = _clean_field_value(
+            metadata_text[boundary.end():]
+        ).strip(" \t\r\n,;:.")
+        if (
+            sentence_title
+            and sentence_journal
+            and not re.match(
+                r"^(?:[IVX]+|Part)\.",
+                sentence_journal,
+                re.IGNORECASE,
+            )
+        ):
+            doi_wrapper = _extract_doi_wrapper(item_text)
+            return {
+                "authors": tuple(authors),
+                "title": sentence_title,
+                "year": _citation_year(item_text, volume_marker.start()),
+                "doi": (doi_wrapper[0] if doi_wrapper else "")
+                or _normalize_doi(item_text),
+                "journal": sentence_journal,
+                "parse_status": "parsed",
+            }
+    has_year_segment = (
+        len(before_volume) > 1
+        and re.fullmatch(r"(?:19|20)\d{2}", before_volume[-1]) is not None
+    )
+    metadata_segments = before_volume[:-1] if has_year_segment else before_volume
+    if not metadata_segments:
+        return None
+    title_absent = len(metadata_segments) == 1 or all(
+        _looks_like_venue_fragment(segment)
+        for segment in metadata_segments
+    )
+    journal = _clean_field_value(
+        ", ".join(metadata_segments) if title_absent else metadata_segments[-1]
+    ).strip(" \t\r\n,;")
+    if not journal:
+        return None
+    title = "" if title_absent else _clean_title_value(
+        ", ".join(metadata_segments[:-1])
+    ).strip(" \t\r\n,;:.")
+    doi_wrapper = _extract_doi_wrapper(item_text)
+    return {
+        "authors": tuple(authors),
+        "title": title,
+        "year": _citation_year(item_text, volume_marker.start()),
+        "doi": (doi_wrapper[0] if doi_wrapper else "")
+        or _normalize_doi(item_text),
+        "journal": journal,
+        "parse_status": "parsed" if title else "partial",
+        "_title_absent": title_absent,
+    }
+
+
+def _parse_comma_bibitem(item_text: str) -> dict[str, Any] | None:
+    """Parse conventional rendered citations with comma-delimited fields."""
+
+    if re.search(r"\\(?:bibinfo|newblock)(?![A-Za-z@])", item_text):
+        return None
+
+    author_end: int | None = None
+    authors: Tuple[str, ...] = ()
+    for comma in re.finditer(",", item_text):
+        if re.search(r"\d", item_text[:comma.start()]):
+            break
+        segment_start = item_text.rfind(",", 0, comma.start()) + 1
+        segment = item_text[segment_start:comma.start()].strip()
+        candidate = _parse_rendered_authors(item_text[:comma.start()])
+        if (
+            _rendered_authors_are_plausible(candidate)
+            and not (
+                author_end is not None
+                and not _looks_like_author_segment(segment)
+            )
+        ):
+            author_end = comma.end()
+            authors = candidate
+        elif author_end is not None:
+            break
+    if author_end is None:
+        return None
+
+    tail = item_text[author_end:].strip()
+    formatted_spans = [
+        span
+        for span in _formatted_bibliography_spans(tail)
+        if _normalize_text(span[2]) not in {"et al", "and others"}
+    ]
+    journal = ""
+    if formatted_spans:
+        venue_span = formatted_spans[0]
+        venue_start = venue_span[0]
+        href_start = tail.rfind(r"\href", 0, venue_start)
+        if href_start >= 0:
+            venue_start = href_start
+        title_source = tail[:venue_start].rstrip(" \t\r\n,;")
+        journal = _clean_field_value(venue_span[2]).strip(" \t\r\n,;")
+        if re.search(r"(?:https?://|urlprefix|\\url)", journal, re.IGNORECASE):
+            journal = ""
+    elif volume_marker := re.search(r"\\(?:textbf|bf)(?![A-Za-z@])", tail):
+        before_volume = tail[:volume_marker.start()]
+        title_end = before_volume.rfind(",")
+        if title_end < 0:
+            return None
+        title_source = before_volume[:title_end]
+        journal = _clean_field_value(before_volume[title_end + 1:]).strip(
+            " \t\r\n,;"
+        )
+    else:
+        plain_year = re.search(r"\b((?:19|20)\d{2})\b", tail)
+        if plain_year is not None:
+            plain_prefix = tail[:plain_year.start()].strip(" \t\r\n,;")
+            sentence_boundaries = []
+            for candidate in re.finditer(
+                r"\.\s+(?=[A-ZÀ-ÖØ-Þ])", plain_prefix
+            ):
+                previous_word = re.search(
+                    r"([A-Za-zÀ-ÖØ-öø-ÿ]+)$",
+                    plain_prefix[:candidate.start()],
+                )
+                if previous_word is not None:
+                    word = previous_word.group(1)
+                    suffix = plain_prefix[candidate.end():]
+                    if (
+                        (len(word) >= 4 and word[0].islower())
+                        or (
+                            len(word) >= 4
+                            and _looks_like_venue_fragment(
+                                suffix.split(",", 1)[0]
+                            )
+                            and not re.match(
+                                r"^[A-Z][A-Za-z]{1,5}\.",
+                                suffix.strip(),
+                            )
+                        )
+                    ):
+                        sentence_boundaries.append(candidate)
+            if sentence_boundaries:
+                boundary = sentence_boundaries[-1]
+                sentence_title = _clean_title_value(
+                    plain_prefix[:boundary.start()]
+                ).strip(" \t\r\n,;:.")
+                sentence_journal = _clean_field_value(
+                    plain_prefix[boundary.end():]
+                ).strip(" \t\r\n,;:.()")
+                # A one-word suffix such as ``Handbook`` is often part of a
+                # book title (``... rare-earth elements. Handbook, ...``),
+                # not a journal.  Require a multi-word venue here, except for
+                # the common one-word journal names, so we do not truncate a
+                # valid title while still handling ``Title. Nature, ...``.
+                venue_is_unambiguous = (
+                    len(sentence_journal.split()) >= 2
+                    or sentence_journal in {"Science", "Nature", "Cell"}
+                ) and not sentence_journal.lower().startswith("handbook")
+                venue_is_unambiguous = venue_is_unambiguous and not re.match(
+                    r"^(?:[IVX]+|Part)\.",
+                    sentence_journal,
+                    re.IGNORECASE,
+                )
+                if sentence_title and sentence_journal and venue_is_unambiguous:
+                    return {
+                        "authors": authors,
+                        "title": sentence_title,
+                        "year": int(plain_year.group(1)),
+                        "journal": sentence_journal,
+                        "parse_status": "parsed",
+                    }
+            plain_parts = [
+                part.strip()
+                for part in plain_prefix.split(",")
+                if part.strip()
+            ]
+            numeric_part = next(
+                (
+                    index
+                    for index, part in enumerate(plain_parts)
+                    if re.search(r"\b\d+\b|\(\s*\d", part)
+                ),
+                None,
+            )
+            if (
+                numeric_part is not None
+                and numeric_part >= 2
+                and not re.search(
+                    r"\bvol\.?",
+                    plain_parts[numeric_part],
+                    re.IGNORECASE,
+                )
+            ):
+                candidate_title = _clean_title_value(
+                    ", ".join(plain_parts[:numeric_part])
+                ).strip(" \t\r\n,;:.")
+                journal = _clean_field_value(
+                    ", ".join(plain_parts[numeric_part:])
+                ).strip(" \t\r\n,;.")
+                if len(candidate_title.split()) >= 3:
+                    return {
+                        "authors": authors,
+                        "title": candidate_title,
+                        "year": int(plain_year.group(1)),
+                        "journal": journal,
+                        "parse_status": "parsed",
+                    }
+            candidate_title = (
+                _clean_title_value(plain_parts[0]).strip(" \t\r\n,;:.")
+                if plain_parts
+                else ""
+            )
+            if (
+                (
+                    len(candidate_title.split()) >= 3
+                    or (
+                        len(candidate_title.split()) == 2
+                        and len(plain_parts) >= 2
+                        and not _looks_like_author_segment(candidate_title)
+                    )
+                )
+                and not re.search(r"\bet\s+al\b", plain_prefix, re.IGNORECASE)
+                and not _looks_like_venue_fragment(candidate_title)
+                and not _looks_like_author_segment(candidate_title)
+            ):
+                journal = _clean_field_value(
+                    ", ".join(plain_parts[1:])
+                ).strip(" \t\r\n,;.")
+                return {
+                    "authors": authors,
+                    "title": candidate_title,
+                    "year": int(plain_year.group(1)),
+                    "journal": journal,
+                    "parse_status": "parsed",
+                }
+            journal = _clean_field_value(
+                tail[plain_year.end():].lstrip(" \t\r\n,;").split(",", 1)[0]
+            ).strip(" \t\r\n,;.")
+            if re.search(
+                r"(?:https?://|urlprefix|\\url)", journal, re.IGNORECASE
+            ):
+                journal = ""
+            return {
+                "authors": authors,
+                "title": "",
+                "year": int(plain_year.group(1)),
+                "journal": journal,
+                "parse_status": "partial",
+                "_title_absent": True,
+            }
+        title_end = tail.find(",")
+        if title_end < 0:
+            return None
+        title_source = tail[:title_end]
+        publication_tail = tail[title_end + 1:]
+        venue_end = re.search(
+            r"\b(?:19|20)\d{2}\b|https?://|\\(?:url|href)|\bdoi\s*:|\barxiv\s*:",
+            publication_tail,
+            re.IGNORECASE,
+        )
+        if venue_end is not None:
+            journal = _clean_field_value(
+                publication_tail[:venue_end.start()]
+            ).strip(" \t\r\n,;.")
+
+    title = _clean_title_value(title_source).strip(" `\t\r\n.,;:'\"")
+    if not title or re.fullmatch(r"(?:19|20)\d{2}", title):
+        return None
+    publication_tail = re.split(
+        r"\[?\s*(?:accessed|retrieved)\b",
+        tail,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    return {
+        "authors": authors,
+        "title": title,
+        "year": _last_plausible_year(publication_tail),
+        "journal": journal,
+        "parse_status": "parsed",
+    }
+
+
+def _parse_newblock_bibitem(item_text: str) -> dict[str, Any] | None:
+    """Extract stable fields from the block structure emitted by BibTeX styles."""
+
+    blocks = [
+        block.strip()
+        for block in re.split(r"\\newblock(?![A-Za-z@])", item_text)
+        if block.strip()
+    ]
+    if len(blocks) < 2:
+        return None
+
+    doi_block = _extract_href_parts(blocks[1])
+    if doi_block is not None:
+        doi_url, doi_label = doi_block
+        doi = _normalize_doi(doi_url) or _normalize_doi(doi_label)
+        doi_label_clean = _clean_field_value(doi_label)
+        if doi and (
+            re.search(r"(?:path)?doi\s*:", doi_label_clean, re.IGNORECASE)
+            or re.search(r"https?://doi\.org/10\.", doi_label_clean, re.IGNORECASE)
+        ):
+            doi_url = f"https://doi.org/{doi}"
+            candidates = [
+                candidate
+                for parser in (
+                    _parse_bold_volume_bibitem,
+                    _parse_comma_bibitem,
+                    _parse_colon_bibitem,
+                    _parse_sentence_bibitem,
+                )
+                if (candidate := parser(blocks[0])) is not None
+            ]
+            candidate = next(
+                iter(
+                    sorted(
+                        candidates,
+                        key=_structured_candidate_score,
+                        reverse=True,
+                    )
+                ),
+                None,
+            )
+            if candidate is not None and candidate.get("title"):
+                return {
+                    **candidate,
+                    "doi": doi,
+                    "url": doi_url,
+                    "parse_status": "parsed",
+                }
+            author_prefix = blocks[0].split(",", 1)[0]
+            authors = _parse_rendered_authors(author_prefix)
+            return {
+                "authors": authors,
+                "title": "",
+                "year": _last_plausible_year(blocks[0]),
+                "doi": doi,
+                "url": doi_url,
+                "journal": "",
+                "parse_status": "partial",
+                "_title_absent": True,
+            }
+
+    author_year = _last_plausible_year(blocks[0])
+    author_block = blocks[0]
+    if author_year is not None:
+        author_block = re.sub(
+            rf"(?:[,;(]\s*)?\b{author_year}\b[.)]?\s*$",
+            "",
+            author_block,
+        ).rstrip(" \t\r\n,;")
+    authors = _parse_rendered_authors(author_block)
+    title_index = 1
+    explicit_year: Optional[int] = None
+    cleaned_second_block = _clean_field_value(blocks[1]).strip(" \t\r\n.,;()")
+    if re.fullmatch(r"(?:19|20)\d{2}", cleaned_second_block):
+        explicit_year = int(cleaned_second_block)
+        title_index += 1
+    if title_index >= len(blocks):
+        return None
+
+    title_block = blocks[title_index]
+    href_parts = _extract_href_parts(title_block)
+    if href_parts is not None:
+        href_label = _normalize_text(href_parts[1])
+        if href_label in {"doi", "arxiv"} or re.fullmatch(
+            r"(?:doi)?10\d+|(?:arxiv)?\d{4}\d{4,5}",
+            href_label,
+        ):
+            return None
+        title_source = href_parts[1]
+    else:
+        if (
+            re.search(r"(?:https?://|\\url\s*\{)", title_block, re.IGNORECASE)
+            or re.match(
+                r"\s*In\b.*\b(?:editor|editors|proceedings|conference)\b",
+                _clean_field_value(title_block),
+                re.IGNORECASE,
+            )
+        ):
+            return None
+        title_source = title_block
+
+    title_year = _last_plausible_year(title_source)
+    title = _clean_title_value(title_source)
+    if title_year is not None:
+        title = re.sub(
+            rf"(?:[,;(]\s*)?\b{title_year}\b[.)]?\s*$",
+            "",
+            title,
+        )
+    title = title.rstrip(" \t\r\n.,;:")
+    publication_blocks = blocks[title_index + 1:]
+    publication_block = " ".join(publication_blocks)
+    if not authors or not title:
+        return None
+
+    journal = ""
+    for block in publication_blocks:
+        journal = _extract_rendered_venue(block)
+        if journal:
+            break
+
+    return {
+        "authors": authors,
+        "title": title,
+        "year": (
+            explicit_year
+            or _last_plausible_year(publication_block)
+            or title_year
+            or author_year
+        ),
+        "journal": journal,
+        "url": href_parts[0] if href_parts else "",
+        "parse_status": "parsed",
+    }
+
+
+def _structured_candidate_score(candidate: dict[str, Any]) -> int:
+    """Rank candidates by explicit metadata and penalize contaminated fields."""
+
+    title = str(candidate.get("title") or "").strip()
+    journal = str(candidate.get("journal") or "").strip()
+    authors = " ".join(candidate.get("authors") or ())
+    if candidate.get("_title_absent"):
+        return 100
+
+    score = 0
+    score += 4 if title else 0
+    score += min(len(candidate.get("authors") or ()), 4)
+    score += 2 if journal else 0
+    score += 1 if candidate.get("year") is not None else 0
+    score += 1 if candidate.get("doi") else 0
+    score += 3 if len(title.split()) >= 2 else 0
+    if title and journal and _normalize_text(title) == _normalize_text(journal):
+        score -= 20
+    if re.search(r"(?:https?://|doi\s*:|pathdoi:)", title, re.IGNORECASE):
+        score -= 30
+    if re.search(r"(?:https?://|doi\s*:|pathdoi:)", journal, re.IGNORECASE):
+        score -= 30
+    if len(journal.split()) > 12:
+        score -= 12
+    if title and journal and _normalize_text(title) in _normalize_text(journal):
+        score -= 15
+    if re.search(
+        r"\b[A-Z][A-Za-z]{0,5}\.\s+[A-Z][A-Za-z]{0,8}$",
+        title,
+    ):
+        score -= 6
+    if re.search(r"(?:https?://|doi\s*:|href)", authors, re.IGNORECASE):
+        score -= 30
+    if title and _looks_like_venue_fragment(title) and journal:
+        score -= 8
+    return score
+
+
+def _parse_structured_bibitem(item_text: str) -> dict[str, Any] | None:
+    parsers = []
+    if re.search(r"\\bibinfo(?![A-Za-z@])", item_text):
+        parsers.append(_parse_bibinfo_bibitem)
+    if re.search(r"``|“", item_text):
+        parsers.append(_parse_quoted_bibitem)
+    if re.search(r"\\newblock(?![A-Za-z@])", item_text):
+        parsers.append(_parse_newblock_bibitem)
+    if re.search(r"\\doi(?![A-Za-z@])", item_text, re.IGNORECASE):
+        parsers.append(_parse_doi_wrapper_bibitem)
+    if re.search(r"\\href(?:@noop)?(?![A-Za-z@])", item_text):
+        parsers.append(_parse_href_venue_bibitem)
+    if re.search(
+        r"\\(?:emph|textit)(?![A-Za-z@])|"
+        r"\{\s*\\(?:em|it)\s+",
+        item_text,
+    ):
+        parsers.append(_parse_emphasized_bibitem)
+    if re.search(
+        r"\\textbf\s*\{\s*(?:[A-Z]\s*)?\d|"
+        r"\{\s*\\bf\s*(?=(?:[A-Z]\s*)?\d)",
+        item_text,
+        re.IGNORECASE,
+    ):
+        parsers.append(_parse_bold_volume_bibitem)
+    candidates = [
+        candidate
+        for parser in parsers
+        if (candidate := parser(item_text)) is not None
+    ]
+    fallback_parsers = [
+        _parse_comma_bibitem,
+        _parse_sentence_bibitem,
+    ]
+    # Colon-separated author/title styles can coexist with a weaker comma
+    # candidate (which may mistake the second author for the title).  They are
+    # unambiguous when the citation itself has no href/DOI wrapper.
+    if (
+        ":" in item_text
+        and not re.search(r"\\(?:href|doi)(?![A-Za-z@])", item_text, re.IGNORECASE)
+    ):
+        fallback_parsers.insert(0, _parse_colon_bibitem)
+    candidates.extend(
+        candidate
+        for parser in fallback_parsers
+        if (candidate := parser(item_text)) is not None
+    )
+    title_absent = next(
+        (candidate for candidate in candidates if candidate.get("_title_absent")),
+        None,
+    )
+    meaningful_title = any(
+        candidate.get("title")
+        and len(str(candidate.get("title")).split()) >= 3
+        and not re.match(
+            r"^[A-ZÀ-ÖØ-ÞŠŽČ]\.?[,;:]",
+            str(candidate.get("title")).strip(),
+        )
+        and not re.search(r"\d|;", str(candidate.get("title")))
+        and not _looks_like_venue_fragment(str(candidate.get("title")))
+        for candidate in candidates
+    )
+    if title_absent is not None and not meaningful_title:
+        return {
+            key: value
+            for key, value in title_absent.items()
+            if not key.startswith("_")
+        }
+    if meaningful_title:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if not candidate.get("_title_absent")
+        ]
+    if not candidates:
+        return None
+
+    primary = next(
+        iter(sorted(candidates, key=_structured_candidate_score, reverse=True)),
+        candidates[0],
+    ).copy()
+    for candidate in candidates:
+        for field_name in ("authors", "title", "year", "doi", "journal", "url"):
+            if not primary.get(field_name) and candidate.get(field_name):
+                primary[field_name] = candidate[field_name]
+    primary["parse_status"] = "parsed" if primary.get("title") else "partial"
+    return {
+        key: value
+        for key, value in primary.items()
+        if not key.startswith("_")
+    }
+
+
 def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagnostic]) -> List[BibEntry]:
     """Parse \\bibitem entries from TeX or BBL files."""
     content = _strip_reference_comments(content)
     entries: List[BibEntry] = []
+    text_only_count = 0
     item_count = len(re.findall(r"\\bibitem(?![A-Za-z@])", content))
     bibitem_pattern = re.compile(
         r"\\bibitem(?![A-Za-z@])\s*"
@@ -763,33 +2462,24 @@ def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagn
         )
         item_text = match.group("body").strip()
 
-        # A rendered citation may mention several years, future horizons, or
-        # access dates. Without a structured year field there is no reliable
-        # way to identify the publication year, so leave it unknown for M3.
-        year: Optional[int] = None
-        before_year = item_text
-
-        authors: Tuple[str, ...] = ()
-        if before_year:
-            cleaned_before = re.sub(r"\\[a-zA-Z]+(?:\[.*?\])?(?:\{.*?\})?", " ", before_year)
-            cleaned_before = _clean_latex_accents(cleaned_before)
-            author_prefix = cleaned_before.split(".", maxsplit=1)[0].strip()
-            authors = _parse_authors(author_prefix)
+        structured = _parse_structured_bibitem(item_text)
+        title = structured["title"] if structured is not None else ""
+        authors = structured["authors"] if structured is not None else ()
+        year = structured["year"] if structured is not None else None
+        journal = structured["journal"] if structured is not None else ""
 
         cleaned_text = re.sub(r"\\[a-zA-Z]+(?:\[.*?\])?(?:\{.*?\})?", " ", item_text)
         cleaned_text = _clean_latex_accents(cleaned_text)
         cleaned_text = re.sub(r"\s+", " ", cleaned_text)
 
-        doi = _normalize_doi(cleaned_text)
+        doi = (
+            structured.get("doi", "") if structured is not None else ""
+        ) or _normalize_doi(cleaned_text)
 
         url_match = re.search(r"(https?://[^\s]+)", cleaned_text)
-        url = url_match.group(1) if url_match else ""
-
-        # A normal \bibitem body is a rendered citation, not a structured
-        # title field. Publishing it as a title (and historically truncating it
-        # at 100 characters) corrupts matching data. Keep the identity fields
-        # that can be extracted deterministically and record a review signal.
-        title = ""
+        url = (
+            structured.get("url", "") if structured is not None else ""
+        ) or (url_match.group(1) if url_match else "")
 
         if not citation_key:
             diagnostics.append(
@@ -804,14 +2494,16 @@ def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagn
         if not citation_key:
             continue
 
-        diagnostics.append(
-            Diagnostic(
-                severity=DiagnosticSeverity.INFO,
-                code="CITATION_TEXT_ONLY",
-                message="Unstructured \\bibitem body was retained without inventing a title",
-                file_path=file_path,
+        if structured is None or structured["parse_status"] != "parsed":
+            text_only_count += 1
+            diagnostics.append(
+                Diagnostic(
+                    severity=DiagnosticSeverity.INFO,
+                    code="CITATION_TEXT_ONLY",
+                    message="Unstructured \\bibitem body was retained without inventing a title",
+                    file_path=file_path,
+                )
             )
-        )
 
         entries.append(
             BibEntry(
@@ -820,13 +2512,30 @@ def _parse_bibitem_content(content: str, file_path: str, diagnostics: List[Diagn
                 raw_citation_key=raw_citation_key,
                 raw_entry=item_text,
                 source_kind="bibitem",
-                parse_status="citation_text_only",
+                parse_status=(
+                    structured["parse_status"]
+                    if structured is not None
+                    else "citation_text_only"
+                ),
                 title=title,
                 authors=authors,
                 year=year,
                 doi=doi,
-                journal="",
+                journal=journal,
                 url=url,
+            )
+        )
+
+    if text_only_count:
+        diagnostics.append(
+            Diagnostic(
+                severity=DiagnosticSeverity.WARNING,
+                code="BIBTEX_PARTIAL",
+                message=(
+                    f"{text_only_count} of {len(entries)} bibliography entries "
+                    "could not be separated into complete structured metadata"
+                ),
+                file_path=file_path,
             )
         )
 
@@ -999,7 +2708,7 @@ def _parse_harvard_bbl_content(
         author_group = _read_braced_group(content, cursor)
         year_group = _read_braced_group(content, author_group[1]) if author_group else None
         key_group = _read_braced_group(content, year_group[1]) if year_group else None
-        if key_group is None:
+        if author_group is None or year_group is None or key_group is None:
             diagnostics.append(
                 Diagnostic(
                     severity=DiagnosticSeverity.WARNING,
@@ -1141,6 +2850,13 @@ def _reference_group_key(
         norm_authors = "_".join(sorted(_normalize_text(a) for a in entry.authors))
         return f"t_a_y:{norm_title}|{norm_authors}|{entry.year}"
 
+    normalized_raw_entry = _normalize_text(
+        _clean_field_value(entry.raw_entry or "")
+    )
+    if normalized_raw_entry:
+        digest = hashlib.sha256(normalized_raw_entry.encode("utf-8")).hexdigest()
+        return f"raw:{digest}"
+
     return f"unique:{version}_{entry.citation_key}_{sequence}"
 
 
@@ -1163,6 +2879,7 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
     for source in sources:
         if source.status is ProcessingStatus.EMPTY_NO_TEX:
             continue
+        cited_keys = _cited_keys(source)
         source_diagnostics: List[Diagnostic] = []
         bib_entries: List[BibEntry] = []
         supplemental_entries: List[BibEntry] = []
@@ -1211,6 +2928,12 @@ def process_references(sources: Sequence[SourceBundle]) -> ReferenceBundle:
             for entry in supplemental_entries
             if entry.citation_key not in bib_keys
         ]
+        if cited_keys:
+            v_entries = [
+                entry
+                for entry in v_entries
+                if (entry.raw_citation_key or entry.citation_key) in cited_keys
+            ]
         raw_entry_count += len(v_entries)
         v_entries = _merge_same_key_entries(v_entries)
         version_raw_entries[source.version] = v_entries

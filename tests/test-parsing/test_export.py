@@ -107,6 +107,8 @@ def test_export_uses_flat_jsonl_schema_and_version_manifest(tmp_path):
     assert publication_dir.name == "2501-01234"
     assert set(element) == {"element_id", "arxiv_id", "kind", "content"}
     assert bibtex["authors"] == ["A. Author", "B. Author"]
+    assert bibtex["title_status"] == "present"
+    assert bibtex["title_metadata_status"] == "metadata_available"
     assert provenance == {
         "arxiv_id": "2501.01234",
         "citation_key": "vaswani2017",
@@ -114,6 +116,8 @@ def test_export_uses_flat_jsonl_schema_and_version_manifest(tmp_path):
         "raw_entry": None,
         "source_kind": "unknown",
         "parse_status": "parsed",
+        "title_status": "present",
+        "title_metadata_status": "metadata_available",
     }
     assert manifests[0]["status"] == "bibtex_partial"
     assert manifests[1]["status"] == "empty_no_tex"
@@ -211,3 +215,63 @@ def test_batch_writer_reduces_shards_and_finalizes_contract(tmp_path):
     assert json.loads(
         (tmp_path / "validation_report.json").read_text(encoding="utf-8")
     )["status"] == "passed"
+
+
+def test_export_marks_missing_title_source_and_metadata_status(tmp_path):
+    publication = DeduplicatedPublication(
+        arxiv_id="2501.01234",
+        versions=(),
+        elements=(),
+        hierarchy=(),
+    )
+    references = ReferenceBundle(
+        arxiv_id="2501.01234",
+        entries=(
+            BibEntry(
+                citation_key="source-only",
+                entry_type="article",
+                raw_entry="\\bibitem{source-only} Doe, J. Phys. Rev. A 12, 3 (2024).",
+                source_kind="bibitem",
+                parse_status="partial",
+                authors=("Doe, J.",),
+                year=2024,
+                journal="Phys. Rev. A",
+            ),
+            BibEntry(
+                citation_key="parser-gap",
+                entry_type="article",
+                raw_entry="@article{parser-gap, title={Recovered by source}, author={Doe, Jane}}",
+                source_kind="bibtex",
+                parse_status="partial",
+                authors=("Doe, Jane",),
+            ),
+            BibEntry(
+                citation_key="empty",
+                entry_type="misc",
+                raw_entry="\\bibitem{empty} Anonymous.",
+                source_kind="bibitem",
+                parse_status="citation_text_only",
+            ),
+        ),
+        citation_maps={},
+    )
+
+    export_publication(
+        publication=publication,
+        references=references,
+        sources=(),
+        validation_report=ValidationReport(),
+        output_dir=tmp_path,
+    )
+    finalize_run(tmp_path)
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "bibtex.jsonl").read_text().splitlines()
+    ]
+    statuses = {row["citation_key"]: row for row in rows}
+    assert statuses["source-only"]["title_status"] == "missing_source"
+    assert statuses["source-only"]["title_metadata_status"] == "metadata_available"
+    assert statuses["parser-gap"]["title_status"] == "missing_parser"
+    assert statuses["parser-gap"]["title_metadata_status"] == "metadata_available"
+    assert statuses["empty"]["title_status"] == "missing_source"
+    assert statuses["empty"]["title_metadata_status"] == "metadata_empty"

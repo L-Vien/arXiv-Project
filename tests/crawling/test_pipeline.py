@@ -1820,6 +1820,55 @@ class SourceAdapterTests(unittest.TestCase):
         self.assertTrue(pdf_exists)
         self.assertIn(("pdf_fallback_success_count", 1), metrics)
 
+    def test_missing_source_persists_terminal_status_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "cache"
+            cache.mkdir()
+            source_error = HTTPError(
+                "https://export.arxiv.org/src/2609.00001v1",
+                404,
+                "Not Found",
+                {},
+                None,
+            )
+            pdf_error = HTTPError(
+                "https://export.arxiv.org/pdf/2609.00001v1",
+                404,
+                "Not Found",
+                {},
+                None,
+            )
+            adapter = pipeline.DefaultSourceProcessor(
+                root / "corpus", cache, self._config(root)
+            )
+            with (
+                patch("src.crawling.downloader.is_download_complete", return_value=False),
+                patch(
+                    "src.crawling.downloader.download_version",
+                    side_effect=source_error,
+                ),
+                patch(
+                    "src.crawling.downloader.download_pdf",
+                    side_effect=pdf_error,
+                ),
+            ):
+                result = adapter.process(self._metadata())
+
+            status_path = (
+                root
+                / "corpus"
+                / "2609-00001"
+                / "v1"
+                / "source_status.json"
+            )
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["source"]["status"], "success_with_no_tex")
+        self.assertEqual(result["source"]["versions"][0]["status"], "missing")
+        self.assertEqual(status["status"], "missing")
+        self.assertEqual(status["kept_files"], [])
+
     def test_pdf_fallback_429_is_retried(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
