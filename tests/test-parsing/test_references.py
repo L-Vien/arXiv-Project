@@ -2448,6 +2448,36 @@ def test_url_normalization_removes_doi_line_break():
     assert entry.url == "https://doi.org/10.18653/v1/abc-123"
 
 
+def test_href_venue_parser_preserves_tilde_in_url():
+    source = SourceBundle(
+        arxiv_id="2609.99993",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="main.tex",
+                content=(
+                    "\\begin{thebibliography}{1}\n"
+                    "\\bibitem{renyi} P.~Erd\\H{o}s and A.~Hajnal,\n"
+                    "\\href{https://www.renyi.hu/~p_erdos/1964-12.pdf}"
+                    "{\\emph{On complete topological subgraphs of certain graphs}},\n"
+                    "\\emph{Ann. Univ. Sci. Budapest. E\\\"otv\\\"os Sect. Math.}"
+                    "\\textbf{7} (1964), 143--149.\n"
+                    "\\end{thebibliography}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+    assert entry.url == "https://www.renyi.hu/~p_erdos/1964-12.pdf"
+    assert entry.title == "On complete topological subgraphs of certain graphs"
+    assert entry.year == 1964
+    assert entry.journal == "Ann. Univ. Sci. Budapest. Eötvös Sect. Math."
+
+
 def test_doi_and_arxiv_identifiers_are_normalized_for_deduplication():
     source_v1 = SourceBundle(
         arxiv_id="2501.66666",

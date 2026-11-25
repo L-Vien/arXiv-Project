@@ -1317,7 +1317,7 @@ def _parse_href_venue_bibitem(item_text: str) -> dict[str, Any] | None:
         return None
     raw_label = label_group[0]
     href_parts = (
-        _clean_field_value(url_group[0]),
+        _normalize_url_value(url_group[0]),
         _clean_field_value(raw_label),
     )
     if not re.search(
@@ -1366,6 +1366,35 @@ def _parse_href_venue_bibitem(item_text: str) -> dict[str, Any] | None:
         journal = ""
 
     url, label = href_parts
+    # A common old-style bibliography layout links the article title and puts
+    # the venue in the text immediately after the href.  The generic href
+    # parser normally treats the visible label as venue metadata; recover the
+    # actual title when the suffix supplies a distinct venue and year.
+    suffix = item_text[label_group[1]:]
+    linked_title = _clean_title_value(raw_label)
+    suffix_journal = _extract_rendered_venue(suffix)
+    suffix_year = _last_plausible_year(suffix)
+    if (
+        linked_title
+        and len(linked_title.split()) >= 3
+        and not re.search(r"(?:https?://|\\url|\\doi|\bdoi\b)", linked_title, re.IGNORECASE)
+        and suffix_journal
+        and suffix_year is not None
+        and _rendered_authors_are_plausible(authors)
+    ):
+        return {
+            "authors": authors,
+            "title": linked_title,
+            "year": suffix_year,
+            "doi": _normalize_doi(url),
+            "journal": suffix_journal,
+            "url": (
+                f"https://doi.org/{_normalize_doi(url)}"
+                if _normalize_doi(url)
+                else url
+            ),
+            "parse_status": "parsed",
+        }
     # Some bibliography styles put a real article title before a DOI href,
     # without an explicit delimiter, e.g. ``Authors 2022 Title J. Field
     # Robot. 39 ... \href{doi}{doi:...}``.  The generic href parser above
