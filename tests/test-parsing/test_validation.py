@@ -268,6 +268,35 @@ class ReferenceValidationTests(unittest.TestCase):
             {"TITLE_CONTAINS_AUTHOR_LIST"},
         )
 
+    def test_acronym_heavy_titles_are_not_mistaken_for_author_lists(self) -> None:
+        references = ReferenceBundle(
+            arxiv_id="2501.01234",
+            entries=(
+                BibEntry(
+                    citation_key="acronym-title",
+                    entry_type="misc",
+                    title="DINS, a MIP Improvement Heuristic",
+                ),
+                BibEntry(
+                    citation_key="initial-title",
+                    entry_type="misc",
+                    title="MTLD, vocd-D, and HD-D: A Validation Study",
+                ),
+                BibEntry(
+                    citation_key="agn-title",
+                    entry_type="misc",
+                    title="Widespread AGN feedback in a forming brightest cluster galaxy at z = 4.1, unveiled by JWST",
+                ),
+            ),
+            citation_maps={1: {}},
+        )
+
+        diagnostics = validate_reference_bundle(references)
+        assert not any(
+            diagnostic.code == "TITLE_CONTAINS_AUTHOR_LIST"
+            for diagnostic in diagnostics
+        )
+
     def test_title_equal_to_journal_is_reported(self) -> None:
         references = ReferenceBundle(
             arxiv_id="2501.01234",

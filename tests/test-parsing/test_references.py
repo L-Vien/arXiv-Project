@@ -2397,6 +2397,57 @@ def test_doi_normalization_decodes_escaped_urls_and_drops_invalid_values():
     assert entries["invalid"].doi == ""
 
 
+def test_url_normalization_preserves_tilde_and_selects_first_url():
+    source = SourceBundle(
+        arxiv_id="2609.99991",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="refs.bib",
+                content=(
+                    "@misc{tilde, title={Tilde URL}, "
+                    "url={https://www.cs.toronto.edu/~kriz/cifar.html}}\n"
+                    "@misc{multiple, title={Multiple URLs}, "
+                    "url={https://arxiv.org/abs/1234.56789 https://doi.org/10.1234/x}}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entries = {
+        entry.citation_key: entry
+        for entry in process_references([source]).entries
+    }
+
+    assert entries["tilde"].url == "https://www.cs.toronto.edu/~kriz/cifar.html"
+    assert entries["multiple"].url == "https://arxiv.org/abs/1234.56789"
+
+
+def test_url_normalization_removes_doi_line_break():
+    source = SourceBundle(
+        arxiv_id="2609.99992",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="refs.bib",
+                content=(
+                    "@misc{doi_url, title={DOI URL}, "
+                    "url={https://doi.org/\\n 10.18653/v1/abc-123}}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+    assert entry.url == "https://doi.org/10.18653/v1/abc-123"
+
+
 def test_doi_and_arxiv_identifiers_are_normalized_for_deduplication():
     source_v1 = SourceBundle(
         arxiv_id="2501.66666",

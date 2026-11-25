@@ -37,6 +37,16 @@ def _normalize_text(text: str) -> str:
 
 _DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+_AUTHOR_SURNAME_PATTERN = r"[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]{2,}"
+_AUTHOR_INITIALS_PATTERN = r"(?:[A-Z]\.[ \t]*){1,4}"
+_AUTHOR_NAME_PATTERN = (
+    rf"(?:{_AUTHOR_SURNAME_PATTERN}\s*,\s*{_AUTHOR_INITIALS_PATTERN}"
+    rf"|{_AUTHOR_INITIALS_PATTERN}\s+{_AUTHOR_SURNAME_PATTERN})"
+)
+_AUTHOR_LIST_TITLE_PATTERN = re.compile(
+    rf"^\s*{_AUTHOR_NAME_PATTERN}"
+    rf"(?:\s*(?:,|and|&)\s*{_AUTHOR_NAME_PATTERN})+\s*$"
+)
 _ARXIV_PATTERN = re.compile(
     r"(?<![0-9])((?:\d{4}\.\d{4,5}|[a-z][a-z0-9-]+/\d{7})(?:v\d+)?)(?![0-9])",
     re.IGNORECASE,
@@ -474,6 +484,42 @@ def _clean_field_value(val: str) -> str:
     return val
 
 
+def _normalize_url_value(value: str) -> str:
+    """Normalize a URL without applying title/text LaTeX cleanup rules."""
+
+    if not value:
+        return ""
+    value = value.strip()
+    if (value.startswith("{") and value.endswith("}")) or (
+        value.startswith('"') and value.endswith('"')
+    ):
+        value = value[1:-1].strip()
+    # BibTeX commonly escapes a literal tilde in URLs.  The generic LaTeX
+    # cleaner intentionally turns ``~`` into a space, so URLs must bypass it.
+    value = value.replace(r"\~", "~")
+    value = value.replace(r"\%", "%")
+    value = re.sub(r"\\[nr]", " ", value)
+    match = _URL_PATTERN.search(value)
+    if match is None:
+        return ""
+    token = match.group(0).rstrip(".,;)}]")
+    # DOI URLs are sometimes wrapped over whitespace immediately after the
+    # host.  Join that suffix, but preserve the first URL when several URLs
+    # are present in one malformed field.
+    if re.fullmatch(r"https?://(?:doi\.org|dx\.doi\.org)/", token, re.IGNORECASE):
+        doi_url = re.match(
+            r"(?P<scheme>https?://(?:doi\.org|dx\.doi\.org)/)\s*"
+            r"(?P<doi>10\.\d{4,9}/[^\s{}]+)",
+            value[match.start():],
+            re.IGNORECASE,
+        )
+        if doi_url is not None:
+            return (
+                f"{doi_url.group('scheme')}{doi_url.group('doi')}"
+            ).rstrip(".,;)}]")
+    return token
+
+
 def _clean_title_value(value: str) -> str:
     """Clean a title without retaining text leaked from malformed fields."""
 
@@ -632,7 +678,7 @@ def _parse_authors(author_str: str) -> Tuple[str, ...]:
 
 def _extract_url(field_dict: Dict[str, str]) -> str:
     """Extract URL from url field, howpublished, note, eprint, archiveprefix, \\url{}, \\href{}."""
-    url = field_dict.get("url", "")
+    url = _normalize_url_value(field_dict.get("url", ""))
     if not url:
         for key in ("howpublished", "note", "eprint", "archiveprefix", "doi"):
             text = field_dict.get(key, "")
@@ -643,17 +689,19 @@ def _extract_url(field_dict: Dict[str, str]) -> str:
                     break
             href_parts = _extract_href_parts(text)
             if href_parts:
-                url = href_parts[0]
-                break
+                url = _normalize_url_value(href_parts[0])
+                if url:
+                    break
             url_match = re.search(r"\\url\{([^}]+)\}", text)
             if url_match:
-                url = url_match.group(1)
-                break
+                url = _normalize_url_value(url_match.group(1))
+                if url:
+                    break
             http_match = re.search(r"(https?://[^\s{}]+)", text)
             if http_match:
-                url = http_match.group(1)
-                break
-    url = _clean_field_value(url)
+                url = _normalize_url_value(http_match.group(1))
+                if url:
+                    break
     if url and not re.match(r"https?://", url, re.IGNORECASE):
         doi = _normalize_doi(url)
         url_match = _URL_PATTERN.search(url)
@@ -1190,7 +1238,7 @@ def _extract_href_parts(value: str) -> tuple[str, str] | None:
     if url_group is None or label_group is None:
         return None
     return (
-        _clean_field_value(url_group[0]),
+        _normalize_url_value(url_group[0]),
         _clean_field_value(label_group[0]),
     )
 
@@ -2469,16 +2517,8 @@ def _structured_candidate_is_clean(candidate: dict[str, Any]) -> bool:
     title_without_year = re.sub(
         r"\s*\\?\s*\(?\b(?:19|20)\d{2}\b\)?\s*$", "", title
     )
-    comma_parts = [part.strip() for part in title_without_year.split(",")]
-    initial_parts = sum(
-        bool(re.search(r"\b[A-Z](?:[-.]?[A-Z]){1,}\.?\b", part))
-        for part in comma_parts
-    )
-    surname_parts = sum(
-        bool(re.search(r"\b[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’-]{2,}\b", part))
-        for part in comma_parts
-    )
-    if title and len(comma_parts) >= 2 and initial_parts >= 2 and surname_parts >= 2:
+    title_without_year = title_without_year.strip(" \t,;()")
+    if title and _AUTHOR_LIST_TITLE_PATTERN.fullmatch(title_without_year):
         return False
 
     values = [title, journal]

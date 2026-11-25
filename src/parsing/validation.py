@@ -61,22 +61,23 @@ _BIBLIOGRAPHY_MACRO_LEAK_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_AUTHOR_SURNAME_PATTERN = r"[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’\-]{2,}"
+_AUTHOR_INITIALS_PATTERN = r"(?:[A-Z]\.[ \t]*){1,4}"
+_AUTHOR_NAME_PATTERN = (
+    rf"(?:{_AUTHOR_SURNAME_PATTERN}\s*,\s*{_AUTHOR_INITIALS_PATTERN}"
+    rf"|{_AUTHOR_INITIALS_PATTERN}\s+{_AUTHOR_SURNAME_PATTERN})"
+)
+_AUTHOR_LIST_TITLE_PATTERN = re.compile(
+    rf"^\s*{_AUTHOR_NAME_PATTERN}"
+    rf"(?:\s*(?:,|and|&)\s*{_AUTHOR_NAME_PATTERN})+\s*$"
+)
 
 
 def _looks_like_author_list_title(value: str) -> bool:
     cleaned = re.sub(
         r"\s*\\?\s*\(?\b(?:19|20)\d{2}\b\)?\s*$", "", value
-    )
-    parts = [part.strip() for part in cleaned.split(",")]
-    initial_parts = sum(
-        bool(re.search(r"\b[A-Z](?:[-.]?[A-Z]){1,}\.?\b", part))
-        for part in parts
-    )
-    surname_parts = sum(
-        bool(re.search(r"\b[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’-]{2,}\b", part))
-        for part in parts
-    )
-    return len(parts) >= 2 and initial_parts >= 2 and surname_parts >= 2
+    ).strip(" \t,;()")
+    return bool(_AUTHOR_LIST_TITLE_PATTERN.fullmatch(cleaned))
 
 _PARTIAL_DIAGNOSTIC_STATUSES = {
     "BIBTEX_PARTIAL": ProcessingStatus.BIBTEX_PARTIAL,
