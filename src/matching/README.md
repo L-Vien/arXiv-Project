@@ -163,6 +163,10 @@ Mỗi dòng tương ứng với một BibTeX entry. Chỉ dùng các trạng th�
 Giao diện hiển thị metadata của BibTeX (DOI, URL, venue/journal) ở cột trái và
 metadata của từng candidate (DOI, URL, venue, submission date) ở cột phải.
 
+Khi đổi publication hoặc bộ lọc, giao diện tự mở entry đầu tiên còn `status`
+trống. Nếu publication đã được gán nhãn hết, giao diện mở entry đầu tiên để
+review lại.
+
 - `match`: chọn đúng một `groundtruth_arxiv_id`;
 - `no_match`: không có reference arXiv phù hợp, để ground truth rỗng;
 - `uncertain`: chỉ dùng tạm trong lúc review, không được giữ trong file final.

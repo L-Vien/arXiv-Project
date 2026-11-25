@@ -58,6 +58,7 @@ def _load_state(input_path: Path, output_path: Path) -> None:
         st.session_state.loaded_output = destination
         st.session_state.restored_count = restored_count
         st.session_state.current_row = 0
+        st.session_state.pop("active_filter", None)
 
 
 def _save_state(output_path: Path) -> None:
@@ -90,6 +91,15 @@ def _next_pending_row(labels: pd.DataFrame, start: int, row_indexes: list[int]) 
         if not str(labels.at[row_index, "status"]).strip():
             return position
     return min(start + 1, len(row_indexes) - 1)
+
+
+def _first_pending_position(labels: pd.DataFrame, row_indexes: list[int]) -> int:
+    """Return the first unchecked row position, or zero when all are done."""
+
+    for position, row_index in enumerate(row_indexes):
+        if not str(labels.at[row_index, "status"]).strip():
+            return position
+    return 0
 
 
 def _inject_sticky_bibtex_style() -> None:
@@ -190,6 +200,11 @@ def main() -> None:
     if not row_indexes:
         st.success("Không có entry nào phù hợp bộ lọc.")
         return
+
+    active_filter = (publication, status_filter, candidates_only)
+    if st.session_state.get("active_filter") != active_filter:
+        st.session_state.active_filter = active_filter
+        st.session_state.current_row = _first_pending_position(labels, row_indexes)
 
     current_position = min(st.session_state.get("current_row", 0), len(row_indexes) - 1)
     with st.sidebar:
