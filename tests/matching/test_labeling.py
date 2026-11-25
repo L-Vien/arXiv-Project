@@ -76,12 +76,16 @@ def test_candidate_view_keeps_publication_and_submission_years_distinct():
             "ref_publication_year": 2018,
             "ref_submission_date": "2017-06-12",
             "ref_venue": "NeurIPS",
+            "ref_doi": "10.48550/arXiv.1706.03762",
+            "ref_url": "https://arxiv.org/abs/1706.03762",
         }
     )
 
     assert candidate["ref_year"] == "2018"
     assert candidate["ref_submission_date"] == "2017-06-12"
     assert candidate["ref_venue"] == "NeurIPS"
+    assert candidate["ref_doi"] == "10.48550/arXiv.1706.03762"
+    assert candidate["ref_url"] == "https://arxiv.org/abs/1706.03762"
 
 
 def test_rank_candidates_prefers_title_similarity_and_exposes_bibtex_hint():
@@ -125,7 +129,14 @@ def test_prepare_template_uses_only_candidates_of_each_assigned_publication(tmp_
     _write_jsonl(
         bibtex,
         [
-            {"arxiv_id": "2609.07834", "citation_key": "b", "entry_type": "article"},
+            {
+                "arxiv_id": "2609.07834",
+                "citation_key": "b",
+                "entry_type": "article",
+                "doi": "10.1000/example",
+                "journal": "Example Journal",
+                "url": "https://example.test/paper",
+            },
             {"arxiv_id": "2609.07834", "citation_key": "a", "entry_type": "book"},
             {"arxiv_id": "2609.07835", "citation_key": "c", "entry_type": "article"},
             {"arxiv_id": "2609.07836", "citation_key": "ignored", "entry_type": "article"},
@@ -161,6 +172,10 @@ def test_prepare_template_uses_only_candidates_of_each_assigned_publication(tmp_
     assert template["candidate_count"].tolist() == [1, 1, 1]
     candidates = [json.loads(value)[0]["ref_arxiv_id"] for value in template["candidates_json"]]
     assert candidates == ["1706.03762", "1706.03762", "1801.00001"]
+    bibtex_row = template.loc[template["citation_key"] == "b"].iloc[0]
+    assert bibtex_row["bibtex_doi"] == "10.1000/example"
+    assert bibtex_row["bibtex_journal"] == "Example Journal"
+    assert bibtex_row["bibtex_url"] == "https://example.test/paper"
 
 
 def test_prepare_template_rejects_duplicate_assignment_and_bibtex_keys(tmp_path):

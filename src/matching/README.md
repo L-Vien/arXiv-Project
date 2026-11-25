@@ -160,6 +160,9 @@ streamlit run src/matching/labeling_app.py -- \
 
 Mỗi dòng tương ứng với một BibTeX entry. Chỉ dùng các trạng thái:
 
+Giao diện hiển thị metadata của BibTeX (DOI, URL, venue/journal) ở cột trái và
+metadata của từng candidate (DOI, URL, venue, submission date) ở cột phải.
+
 - `match`: chọn đúng một `groundtruth_arxiv_id`;
 - `no_match`: không có reference arXiv phù hợp, để ground truth rỗng;
 - `uncertain`: chỉ dùng tạm trong lúc review, không được giữ trong file final.

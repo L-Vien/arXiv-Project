@@ -217,6 +217,7 @@ def candidate_view(reference: dict) -> dict:
         "ref_title": clean_text(reference.get("ref_title")),
         "ref_authors": clean_text(reference.get("ref_authors")),
         "ref_doi": clean_text(reference.get("ref_doi") or reference.get("doi")),
+        "ref_url": clean_text(reference.get("ref_url") or reference.get("url")),
         "ref_year": clean_text(
             reference.get("ref_publication_year")
             or reference.get("ref_year")
@@ -372,6 +373,7 @@ def prepare_annotation_template(
             "bibtex_year": clean_text(bib.get("year")),
             "bibtex_doi": clean_text(bib.get("doi")),
             "bibtex_url": clean_text(bib.get("url")),
+            "bibtex_journal": clean_text(bib.get("journal")),
 
             "partition": clean_text(assignment.get("partition")),
             "member_id": clean_text(assignment.get("member_id")),

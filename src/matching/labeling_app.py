@@ -225,6 +225,12 @@ def main() -> None:
         st.write(f"**Title:** {_display(row.get('bibtex_title'))}")
         st.write(f"**Authors:** {_display(row.get('bibtex_authors'))}")
         st.write(f"**Year:** {_display(row.get('bibtex_year'))}")
+        st.write(f"**DOI:** {_display(row.get('bibtex_doi')) or '—'}")
+        st.write(f"**URL:** {_display(row.get('bibtex_url')) or '—'}")
+        st.write(
+            f"**Venue / journal:** "
+            f"{_display(row.get('bibtex_journal')) or '—'}"
+        )
         st.write(f"**Current status:** `{_display(row.get('status')) or 'pending'}`")
         confidence_options = ["", "high", "medium", "low"]
         current_confidence = _display(row.get("confidence"))
@@ -286,6 +292,13 @@ def main() -> None:
                         st.caption(
                             f"Authors: {authors or '—'} · Year: {year or '—'}"
                             f"{score_text}"
+                        )
+                        st.caption(
+                            f"DOI: {_display(candidate.get('ref_doi')) or '—'} · "
+                            f"URL: {_display(candidate.get('ref_url')) or '—'} · "
+                            f"Venue: {_display(candidate.get('ref_venue')) or '—'} · "
+                            f"Submission date: "
+                            f"{_display(candidate.get('ref_submission_date')) or '—'}"
                         )
                         if st.button("Chọn candidate này", key=f"match_{row_index}_{number}", use_container_width=True):
                             _set_label(row_index, "match", ref_id)
