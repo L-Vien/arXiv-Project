@@ -223,6 +223,51 @@ class ReferenceValidationTests(unittest.TestCase):
             {"FIELD_BOUNDARY_LEAK", "TITLE_IS_CITATION_BLOB"},
         )
 
+    def test_bibliography_macro_leaks_and_invalid_urls_fail_quality_gate(self) -> None:
+        references = ReferenceBundle(
+            arxiv_id="2501.01234",
+            entries=(
+                BibEntry(
+                    citation_key="macro-leak",
+                    entry_type="misc",
+                    title="bibinfotitleA malformed title",
+                    authors=("bibinfoauthorDoe, Jane",),
+                    url="Not a URL",
+                ),
+            ),
+            citation_maps={1: {}},
+        )
+
+        diagnostics = validate_reference_bundle(references)
+
+        self.assertEqual(
+            {diagnostic.code for diagnostic in diagnostics},
+            {"BIBLIOGRAPHY_MACRO_LEAK", "INVALID_URL"},
+        )
+        self.assertTrue(
+            all(diagnostic.severity is DiagnosticSeverity.ERROR for diagnostic in diagnostics)
+        )
+
+    def test_title_author_list_is_rejected_by_quality_gate(self) -> None:
+        references = ReferenceBundle(
+            arxiv_id="2501.01234",
+            entries=(
+                BibEntry(
+                    citation_key="author-title",
+                    entry_type="misc",
+                    title="Goldie, C.M., Teugels, J.L. (1987)",
+                ),
+            ),
+            citation_maps={1: {}},
+        )
+
+        diagnostics = validate_reference_bundle(references)
+
+        self.assertEqual(
+            {diagnostic.code for diagnostic in diagnostics},
+            {"TITLE_CONTAINS_AUTHOR_LIST"},
+        )
+
     def test_title_equal_to_journal_is_reported(self) -> None:
         references = ReferenceBundle(
             arxiv_id="2501.01234",

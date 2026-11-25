@@ -36,6 +36,7 @@ def _normalize_text(text: str) -> str:
 
 
 _DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
+_URL_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
 _ARXIV_PATTERN = re.compile(
     r"(?<![0-9])((?:\d{4}\.\d{4,5}|[a-z][a-z0-9-]+/\d{7})(?:v\d+)?)(?![0-9])",
     re.IGNORECASE,
@@ -69,6 +70,17 @@ _TITLE_FIELD_LEAK_PATTERN = re.compile(
     r"(?:,\s*|\s{2,})(?:abstract|author|authors|booktitle|doi|eprint|isbn|issn|"
     r"journal|journaltitle|month|note|number|pages|publisher|school|series|url|"
     r"volume|year)\s*=",
+    re.IGNORECASE,
+)
+_BIBLIOGRAPHY_MACRO_LEAK_PATTERN = re.compile(
+    r"\b(?:bibinfo|bibfield|showarticle|showbook|urlprefix|natexlab)"
+    r"[A-Za-z]*",
+    re.IGNORECASE,
+)
+_BIBLIOGRAPHY_MACRO_PATTERN = re.compile(
+    r"\\(?:bibinfo|bibfield|showarticletitle|showbooktitle|showjournal|"
+    r"showissn|showdoi|showurl|urlprefix|natexlab|JournalTitle|bibfnamefont|"
+    r"bibnamefont|bibtitlefont|url|path)(?![A-Za-z@])",
     re.IGNORECASE,
 )
 _BIB_FIELD_ASSIGNMENT_PATTERN = re.compile(
@@ -381,11 +393,12 @@ def _clean_latex_accents(text: str) -> str:
     while wrapper.search(text):
         text = wrapper.sub(r"\1", text)
     text = re.sub(
-        r"\\(?:bf|it|em)(?![A-Za-z@])\s*",
+        r"\\(?:bf|it|em|sc)(?![A-Za-z@])\s*",
         "",
         text,
     )
     text = text.replace(r"\LaTeX", "LaTeX").replace(r"\TeX", "TeX")
+    text = re.sub(r"(?<!\\)\\\s+", " ", text)
     text = re.sub(r"\\text([A-Z][A-Za-z0-9]*)", r"\1", text)
     for command, replacement in sorted(
         _LATEX_COMMAND_REPLACEMENTS.items(),
@@ -455,6 +468,7 @@ def _clean_field_value(val: str) -> str:
     val = "\n".join(cleaned_lines)
     if (val.startswith("{") and val.endswith("}")) or (val.startswith('"') and val.endswith('"')):
         val = val[1:-1].strip()
+    val = _unwrap_bibliography_macros(val)
     val = _clean_latex_accents(val)
     val = re.sub(r"\s+", " ", val).strip()
     return val
@@ -627,9 +641,9 @@ def _extract_url(field_dict: Dict[str, str]) -> str:
                 if normalized_doi:
                     url = f"https://doi.org/{normalized_doi}"
                     break
-            href_match = re.search(r"\\href\{([^}]+)\}\{([^}]+)\}", text)
-            if href_match:
-                url = href_match.group(1)
+            href_parts = _extract_href_parts(text)
+            if href_parts:
+                url = href_parts[0]
                 break
             url_match = re.search(r"\\url\{([^}]+)\}", text)
             if url_match:
@@ -640,6 +654,16 @@ def _extract_url(field_dict: Dict[str, str]) -> str:
                 url = http_match.group(1)
                 break
     url = _clean_field_value(url)
+    if url and not re.match(r"https?://", url, re.IGNORECASE):
+        doi = _normalize_doi(url)
+        url_match = _URL_PATTERN.search(url)
+        url = (
+            f"https://doi.org/{doi}"
+            if doi
+            else url_match.group(0)
+            if url_match
+            else ""
+        )
     if not url:
         arxiv_id = _extract_arxiv_id(field_dict)
         if arxiv_id:
@@ -724,8 +748,13 @@ def title_status_for_entry(entry: BibEntry) -> tuple[str, str]:
         )
         else "metadata_empty"
     )
-    if entry.title.strip():
+    if entry.title.strip() and not _BIBLIOGRAPHY_MACRO_LEAK_PATTERN.search(
+        entry.title
+    ):
         return "present", metadata_status
+
+    if entry.title.strip():
+        return "missing_parser", metadata_status
 
     raw = entry.raw_entry or ""
     has_explicit_title = False
@@ -1389,10 +1418,12 @@ def _parse_href_venue_bibitem(item_text: str) -> dict[str, Any] | None:
 
 
 def _parse_bibinfo_bibitem(item_text: str) -> dict[str, Any] | None:
-    """Extract fields emitted by REVTeX and related ``\bibinfo`` styles."""
+    """Extract fields emitted by REVTeX and related bibliography styles."""
 
     fields: dict[str, list[str]] = {}
-    for match in re.finditer(r"\\bibinfo(?![A-Za-z@])", item_text):
+    author_wrapper_spans: list[tuple[int, int]] = []
+
+    for match in re.finditer(r"\\bibfield(?![A-Za-z@])", item_text):
         name_group = _read_braced_group(item_text, match.end())
         value_group = (
             _read_braced_group(item_text, name_group[1])
@@ -1402,7 +1433,53 @@ def _parse_bibinfo_bibitem(item_text: str) -> dict[str, Any] | None:
         if name_group is None or value_group is None:
             continue
         name = name_group[0].strip().lower()
+        author_wrapper_spans.append((match.start(), value_group[1]))
+        if name != "author":
+            fields.setdefault(name, []).append(value_group[0])
+            continue
+
+        person_values: list[str] = []
+        for person_match in re.finditer(
+            r"\\bibinfo(?![A-Za-z@])", value_group[0]
+        ):
+            person_name = _read_braced_group(value_group[0], person_match.end())
+            person_value = (
+                _read_braced_group(value_group[0], person_name[1])
+                if person_name is not None
+                else None
+            )
+            if (
+                person_name is not None
+                and person_value is not None
+                and person_name[0].strip().lower() in {"author", "person"}
+            ):
+                person_values.append(person_value[0])
+        fields.setdefault("author", []).extend(
+            person_values or [value_group[0]]
+        )
+
+    for match in re.finditer(r"\\bibinfo(?![A-Za-z@])", item_text):
+        name_group = _read_braced_group(item_text, match.end())
+        value_group = (
+            _read_braced_group(item_text, name_group[1])
+            if name_group is not None
+            else None
+        )
+        if name_group is None or value_group is None:
+            continue
+        if any(start <= match.start() < end for start, end in author_wrapper_spans):
+            continue
+        name = name_group[0].strip().lower()
+        name = "author" if name == "person" else name
         fields.setdefault(name, []).append(value_group[0])
+
+    for macro_name in ("showarticletitle", "showbooktitle"):
+        for match in re.finditer(
+            rf"\\{macro_name}(?![A-Za-z@])", item_text, re.IGNORECASE
+        ):
+            value_group = _read_braced_group(item_text, match.end())
+            if value_group is not None:
+                fields.setdefault("title", []).append(value_group[0])
 
     if not fields:
         return None
@@ -1438,9 +1515,16 @@ def _parse_bibinfo_bibitem(item_text: str) -> dict[str, Any] | None:
     title = _clean_title_value((fields.get("title") or [""])[0]).rstrip(
         " \t\r\n.,;:"
     )
-    journal = _clean_field_value(
-        (fields.get("journal") or fields.get("journaltitle") or [""])[0]
-    ).strip(" \t\r\n,;")
+    journal_source = (fields.get("journal") or fields.get("journaltitle") or [""])[0]
+    journal = ""
+    if not re.search(
+        r"\\(?:bibinfo|bibfield)\s*\{\s*title\s*\}",
+        journal_source,
+        re.IGNORECASE,
+    ):
+        journal = _clean_field_value(journal_source).strip(" \t\r\n,;")
+    if not journal:
+        journal = _extract_rendered_venue(item_text)
     year = _year_from_text((fields.get("year") or fields.get("date") or [""])[0])
     publication_suffix = re.search(
         r"\s+\([^()]*,\s*((?:19|20)\d{2})\)$",
@@ -1459,6 +1543,7 @@ def _parse_bibinfo_bibitem(item_text: str) -> dict[str, Any] | None:
         "journal": journal,
         "url": url,
         "parse_status": "parsed" if title else "partial",
+        "_macro_authoritative": True,
     }
 
 
@@ -1466,6 +1551,19 @@ def _last_plausible_year(value: str) -> Optional[int]:
     """Return the final plausible publication year in a bounded citation tail."""
 
     cleaned = _clean_field_value(value)
+    # Page ranges and arXiv identifiers contain four-digit fragments that are
+    # not publication years (e.g. ``1645--1654`` and ``1609.07307``).
+    arxiv_years = [
+        int(match.group(1))
+        for match in re.finditer(r"\b(\d{4})\.\d{4,5}(?:v\d+)?\b", cleaned)
+    ]
+    cleaned = re.sub(r"\b\d{4}\s*[-–—]+\s*\d{4}\b", " ", cleaned)
+    cleaned = re.sub(
+        r"\b(?:\d{4}\.\d{4,5}|[a-z][a-z0-9-]+/\d{7})(?:v\d+)?\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     years = [
         int(match.group(1))
         for match in re.finditer(r"\b(\d{4})\b", cleaned)
@@ -1473,6 +1571,12 @@ def _last_plausible_year(value: str) -> Optional[int]:
     ]
     if years:
         return years[-1]
+    if arxiv_years:
+        arxiv_prefix = arxiv_years[-1]
+        short_year = arxiv_prefix // 100
+        inferred_year = (1900 if short_year >= 91 else 2000) + short_year
+        if 1600 <= inferred_year <= date.today().year + 1:
+            return inferred_year
 
     arxiv_match = re.search(
         r"\barxiv\s*:\s*(?:[a-z.-]+/)?(?P<year>\d{2})(?:\d{2})[.\d]",
@@ -1623,6 +1727,20 @@ def _parse_emphasized_bibitem(item_text: str) -> dict[str, Any] | None:
         candidate_authors = _parse_rendered_authors(
             prefix
         )
+        prefix_year = _last_plausible_year(prefix)
+        if (
+            prefix_year is not None
+            and not _rendered_authors_are_plausible(candidate_authors)
+        ):
+            return {
+                "authors": (),
+                "title": _clean_title_value(span[2]).rstrip(
+                    " \t\r\n.,;:"
+                ),
+                "year": prefix_year,
+                "journal": "",
+                "parse_status": "partial",
+            }
         formatted_tail = item_text[span[1]:]
         single_emphasized_title = (
             _rendered_authors_are_plausible(candidate_authors)
@@ -2312,6 +2430,7 @@ def _structured_candidate_score(candidate: dict[str, Any]) -> int:
         return 100
 
     score = 0
+    score += 100 if candidate.get("_macro_authoritative") else 0
     score += 4 if title else 0
     score += min(len(candidate.get("authors") or ()), 4)
     score += 2 if journal else 0
@@ -2340,9 +2459,43 @@ def _structured_candidate_score(candidate: dict[str, Any]) -> int:
     return score
 
 
+def _structured_candidate_is_clean(candidate: dict[str, Any]) -> bool:
+    """Reject candidates whose values still contain bibliography macro names."""
+
+    title = str(candidate.get("title") or "").strip()
+    journal = str(candidate.get("journal") or "").strip()
+    if title and journal and _normalize_text(title) == _normalize_text(journal):
+        return False
+    title_without_year = re.sub(
+        r"\s*\\?\s*\(?\b(?:19|20)\d{2}\b\)?\s*$", "", title
+    )
+    comma_parts = [part.strip() for part in title_without_year.split(",")]
+    initial_parts = sum(
+        bool(re.search(r"\b[A-Z](?:[-.]?[A-Z]){1,}\.?\b", part))
+        for part in comma_parts
+    )
+    surname_parts = sum(
+        bool(re.search(r"\b[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’-]{2,}\b", part))
+        for part in comma_parts
+    )
+    if title and len(comma_parts) >= 2 and initial_parts >= 2 and surname_parts >= 2:
+        return False
+
+    values = [title, journal]
+    values.extend(candidate.get("authors") or ())
+    return not any(
+        value and _BIBLIOGRAPHY_MACRO_LEAK_PATTERN.search(str(value))
+        for value in values
+    )
+
+
 def _parse_structured_bibitem(item_text: str) -> dict[str, Any] | None:
     parsers = []
-    if re.search(r"\\bibinfo(?![A-Za-z@])", item_text):
+    if re.search(
+        r"\\(?:bibinfo|bibfield|showarticletitle|showbooktitle)(?![A-Za-z@])",
+        item_text,
+        re.IGNORECASE,
+    ):
         parsers.append(_parse_bibinfo_bibitem)
     if re.search(r"``|“", item_text):
         parsers.append(_parse_quoted_bibitem)
@@ -2369,6 +2522,7 @@ def _parse_structured_bibitem(item_text: str) -> dict[str, Any] | None:
         candidate
         for parser in parsers
         if (candidate := parser(item_text)) is not None
+        and _structured_candidate_is_clean(candidate)
     ]
     fallback_parsers = [
         _parse_comma_bibitem,
@@ -2386,6 +2540,7 @@ def _parse_structured_bibitem(item_text: str) -> dict[str, Any] | None:
         candidate
         for parser in fallback_parsers
         if (candidate := parser(item_text)) is not None
+        and _structured_candidate_is_clean(candidate)
     )
     title_absent = next(
         (candidate for candidate in candidates if candidate.get("_title_absent")),
@@ -2578,6 +2733,45 @@ def _read_braced_group(text: str, position: int) -> tuple[str, int] | None:
                 return text[position + 1:cursor], cursor + 1
         cursor += 1
     return None
+
+
+def _unwrap_bibliography_macros(value: str) -> str:
+    """Expand known bibliography wrappers without flattening their arguments.
+
+    REVTeX and a few BibTeX styles emit semantic wrappers such as
+    ``\\bibinfo{title}{...}`` and ``\\bibfield{author}{...}``.  The generic
+    LaTeX cleaner cannot safely handle those two-argument macros: removing the
+    backslash first turns them into values such as ``bibinfotitle...``.  Read
+    balanced arguments here and retain only the semantic value.
+    """
+
+    text = value
+    for _ in range(64):
+        match = _BIBLIOGRAPHY_MACRO_PATTERN.search(text)
+        if match is None:
+            break
+
+        macro = match.group(0).lstrip("\\").lower()
+        if macro == "urlprefix":
+            text = text[:match.start()] + text[match.end():]
+            continue
+        first = _read_braced_group(text, match.end())
+        if first is None:
+            break
+
+        if macro in {"bibinfo", "bibfield", "href"}:
+            second = _read_braced_group(text, first[1])
+            if second is None:
+                break
+            replacement = second[0]
+            end = second[1]
+        else:
+            replacement = first[0]
+            end = first[1]
+
+        text = text[:match.start()] + replacement + text[end:]
+
+    return text
 
 
 def _year_from_text(

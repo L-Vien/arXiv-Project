@@ -55,6 +55,28 @@ _TITLE_CITATION_BLOB_RE = re.compile(
     r"^(?:https?://|doi\s*:))",
     re.IGNORECASE,
 )
+_BIBLIOGRAPHY_MACRO_LEAK_RE = re.compile(
+    r"\b(?:bibinfo|bibfield|showarticle|showbook|urlprefix|natexlab)"
+    r"[A-Za-z]*",
+    re.IGNORECASE,
+)
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _looks_like_author_list_title(value: str) -> bool:
+    cleaned = re.sub(
+        r"\s*\\?\s*\(?\b(?:19|20)\d{2}\b\)?\s*$", "", value
+    )
+    parts = [part.strip() for part in cleaned.split(",")]
+    initial_parts = sum(
+        bool(re.search(r"\b[A-Z](?:[-.]?[A-Z]){1,}\.?\b", part))
+        for part in parts
+    )
+    surname_parts = sum(
+        bool(re.search(r"\b[A-Z][A-Za-zÀ-ÖØ-öø-ÿ'’-]{2,}\b", part))
+        for part in parts
+    )
+    return len(parts) >= 2 and initial_parts >= 2 and surname_parts >= 2
 
 _PARTIAL_DIAGNOSTIC_STATUSES = {
     "BIBTEX_PARTIAL": ProcessingStatus.BIBTEX_PARTIAL,
@@ -328,6 +350,30 @@ def validate_reference_bundle(
                     "RESIDUAL_LATEX",
                     f"entry {entry.citation_key!r} still contains a LaTeX command",
                     severity=DiagnosticSeverity.WARNING,
+                )
+            )
+        if any(
+            value and _BIBLIOGRAPHY_MACRO_LEAK_RE.search(value)
+            for value in (entry.title, entry.journal, *entry.authors)
+        ):
+            diagnostics.append(
+                _diagnostic(
+                    "BIBLIOGRAPHY_MACRO_LEAK",
+                    f"entry {entry.citation_key!r} retains a bibliography macro token",
+                )
+            )
+        if entry.title and _looks_like_author_list_title(entry.title):
+            diagnostics.append(
+                _diagnostic(
+                    "TITLE_CONTAINS_AUTHOR_LIST",
+                    f"entry {entry.citation_key!r} title looks like an author list",
+                )
+            )
+        if entry.url and not _URL_RE.fullmatch(entry.url):
+            diagnostics.append(
+                _diagnostic(
+                    "INVALID_URL",
+                    f"entry {entry.citation_key!r} has a non-URL value in url",
                 )
             )
         contaminated_values = (entry.title, entry.journal, *entry.authors)

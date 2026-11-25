@@ -792,6 +792,198 @@ def test_structured_bibinfo_bibitem_extracts_clean_metadata():
     assert entry.parse_status == "parsed"
 
 
+def test_bibinfo_nested_title_is_not_selected_as_newblock_blob():
+    source = SourceBundle(
+        arxiv_id="2501.99990",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="main.tex",
+                content=(
+                    "\\begin{thebibliography}{1}\n"
+                    "\\bibitem{aiyappa2024emergence}\n"
+                    "\\bibinfo{author}{Aiyappa, R.}, "
+                    "\\bibinfo{author}{Flammini, A.} \\& "
+                    "\\bibinfo{author}{Ahn, Y.-Y.}\n"
+                    "\\newblock \\bibinfo{journal}{\\bibinfo{title}{"
+                    "Emergence of simple and complex contagion dynamics from "
+                    "weighted belief networks}}.\n"
+                    "\\newblock {\\emph{\\JournalTitle{Science Advances}}} "
+                    "\\textbf{\\bibinfo{volume}{10}}, "
+                    "\\bibinfo{pages}{eadh4439} (\\bibinfo{year}{2024}).\n"
+                    "\\end{thebibliography}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+
+    assert entry.title == (
+        "Emergence of simple and complex contagion dynamics from weighted belief networks"
+    )
+    assert entry.authors == ("Aiyappa, R.", "Flammini, A.", "Ahn, Y.-Y.")
+    assert entry.journal == "Science Advances"
+    assert entry.year == 2024
+    assert "bibinfo" not in entry.title
+
+
+def test_bibfield_person_and_showarticle_macros_are_structured():
+    source = SourceBundle(
+        arxiv_id="2501.99991",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="main.tex",
+                content=(
+                    "\\begin{thebibliography}{1}\n"
+                    "\\bibitem{surfrad}\n"
+                    "\\bibfield{author}{\\bibinfo{person}{John~A. Augustine}, "
+                    "\\bibinfo{person}{John~J. DeLuisi}, {and} "
+                    "\\bibinfo{person}{Charles~N. Long}.}\n"
+                    "\\bibinfo{year}{2000}.\n"
+                    "\\newblock \\showarticletitle{SURFRAD---A National Surface "
+                    "Radiation Budget Network for Atmospheric Research}.\n"
+                    "\\newblock \\bibinfo{journal}{\\emph{Bulletin of the "
+                    "American Meteorological Society}}.\n"
+                    "\\end{thebibliography}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+
+    assert entry.title == (
+        "SURFRAD---A National Surface Radiation Budget Network for Atmospheric Research"
+    )
+    assert entry.authors == (
+        "John A. Augustine",
+        "John J. DeLuisi",
+        "Charles N. Long",
+    )
+    assert entry.year == 2000
+    assert entry.journal == "Bulletin of the American Meteorological Society"
+
+
+def test_rendered_page_range_does_not_become_publication_year():
+    source = SourceBundle(
+        arxiv_id="2501.99992",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="main.tex",
+                content=(
+                    "\\begin{thebibliography}{1}\n"
+                    "\\bibitem{bennis} D.~Bennis and N.~Mahdou, "
+                    "\\emph{Gorenstein global dimensions and cotorsion dimension "
+                    "of rings}, Comm. Algebra \\textbf{37} (2009), no.~5, "
+                    "1709--1718.\n"
+                    "\\end{thebibliography}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+
+    assert entry.year == 2009
+
+
+def test_non_url_bibtex_url_value_is_discarded():
+    source = SourceBundle(
+        arxiv_id="2501.99993",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="refs.bib",
+                content=(
+                    "@article{brokenurl,\n"
+                    "  title={CFDLLMBench: A benchmark},\n"
+                    "  author={Doe, Jane},\n"
+                    "  year={2025},\n"
+                    "  url={CFDLLMBench: A benchmark}\n"
+                    "}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+
+    assert entry.url == ""
+
+
+def test_single_emphasis_title_is_not_reused_as_venue_for_arxiv_citation():
+    source = SourceBundle(
+        arxiv_id="2501.99994",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="main.tex",
+                content=(
+                    "\\begin{thebibliography}{1}\n"
+                    "\\bibitem{mmo} E.~Mainini, D.~Mukherjee, R.~Ognibene,\n"
+                    "\\emph{On fractional critical problems with multi-polar Hardy "
+                    "potentials},\n"
+                    "arXiv:2604.27492.\n"
+                    "\\end{thebibliography}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+
+    assert entry.title == "On fractional critical problems with multi-polar Hardy potentials"
+    assert entry.journal == ""
+    assert entry.title != entry.journal
+
+
+def test_author_year_prefix_does_not_become_title():
+    source = SourceBundle(
+        arxiv_id="2501.99995",
+        version=1,
+        status=ProcessingStatus.OK,
+        root_file="main.tex",
+        files=(
+            SourceFile(
+                relative_path="main.tex",
+                content=(
+                    "\\begin{thebibliography}{1}\n"
+                    "\\bibitem{regular-variation}"
+                    "{\\sc Bingham. N.H., Goldie, C.M., Teugels, J.L.} \\ (1987)\n"
+                    "{\\em Regular Variation}\n"
+                    "Cambridge University Press, Cambridge.\n"
+                    "\\end{thebibliography}"
+                ),
+                order=0,
+            ),
+        ),
+    )
+
+    entry = process_references([source]).entries[0]
+
+    assert entry.title == "Regular Variation"
+    assert "Goldie" not in entry.title
+    assert entry.year == 1987
+
+
 def test_bibinfo_repairs_split_surname_and_initial_author_fields():
     source = SourceBundle(
         arxiv_id="2501.99976",

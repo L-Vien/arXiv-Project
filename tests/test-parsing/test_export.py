@@ -252,6 +252,14 @@ def test_export_marks_missing_title_source_and_metadata_status(tmp_path):
                 source_kind="bibitem",
                 parse_status="citation_text_only",
             ),
+            BibEntry(
+                citation_key="macro-gap",
+                entry_type="misc",
+                raw_entry="\\bibitem{macro-gap} \\bibinfo{title}{Recovered}",
+                source_kind="bibitem",
+                parse_status="parsed",
+                title="bibinfotitleRecovered",
+            ),
         ),
         citation_maps={},
     )
@@ -275,3 +283,4 @@ def test_export_marks_missing_title_source_and_metadata_status(tmp_path):
     assert statuses["parser-gap"]["title_metadata_status"] == "metadata_available"
     assert statuses["empty"]["title_status"] == "missing_source"
     assert statuses["empty"]["title_metadata_status"] == "metadata_empty"
+    assert statuses["macro-gap"]["title_status"] == "missing_parser"
