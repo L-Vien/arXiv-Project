@@ -37,10 +37,10 @@ def iter_jsonl_rows(path: Path) -> Iterator[dict[str, Any]]:
             yield row
 
 
-def iter_bibtex_records(data_root: Path, range_id: str) -> Iterator[BibtexRecord]:
-    """Yield normalized BibTeX records for one M2 range."""
+def iter_bibtex_records_from_file(path: Path) -> Iterator[BibtexRecord]:
+    """Yield normalized BibTeX records from an explicit M2 JSONL file."""
 
-    path = _range_directory(data_root, "m2", range_id) / "bibtex.jsonl"
+    path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"missing M2 BibTeX output: {path}")
     for line_number, row in enumerate(iter_jsonl_rows(path), start=1):
@@ -55,16 +55,33 @@ def iter_bibtex_records(data_root: Path, range_id: str) -> Iterator[BibtexRecord
                 doi=row.get("doi"),
                 journal=row.get("journal"),
                 url=row.get("url"),
+                title_status=row.get("title_status"),
+                title_metadata_status=row.get("title_metadata_status"),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise InputDataError(f"invalid BibTeX row at {path}:{line_number}") from error
 
 
-def iter_reference_documents(data_root: Path, range_id: str) -> Iterator[tuple[str, list[dict[str, Any]]]]:
-    """Yield one citing-paper ID and its raw M1 references at a time."""
+def iter_bibtex_records(data_root: Path, range_id: str) -> Iterator[BibtexRecord]:
+    """Yield normalized BibTeX records from the conventional M2 layout."""
 
-    corpus_range = _range_directory(data_root, "corpus", range_id)
-    for paper_directory in sorted(path for path in corpus_range.iterdir() if path.is_dir()):
+    path = _range_directory(data_root, "m2", range_id) / "bibtex.jsonl"
+    yield from iter_bibtex_records_from_file(path)
+
+
+def iter_reference_documents_from_directory(
+    references_directory: Path,
+) -> Iterator[tuple[str, list[dict[str, Any]]]]:
+    """Yield raw M1 reference documents from an explicit range directory."""
+
+    references_directory = Path(references_directory)
+    if not references_directory.is_dir():
+        raise FileNotFoundError(
+            f"missing M1 references directory: {references_directory}"
+        )
+    for paper_directory in sorted(
+        path for path in references_directory.iterdir() if path.is_dir()
+    ):
         path = paper_directory / "references.json"
         if not path.is_file():
             raise FileNotFoundError(f"missing M1 reference output: {path}")
@@ -84,10 +101,24 @@ def iter_reference_documents(data_root: Path, range_id: str) -> Iterator[tuple[s
         yield arxiv_id, references
 
 
-def iter_matchable_reference_records(data_root: Path, range_id: str) -> Iterator[ReferenceRecord]:
-    """Yield only references that have an arXiv target and can form candidates."""
+def iter_reference_documents(
+    data_root: Path,
+    range_id: str,
+) -> Iterator[tuple[str, list[dict[str, Any]]]]:
+    """Yield raw M1 references from the conventional corpus layout."""
 
-    for document_arxiv_id, references in iter_reference_documents(data_root, range_id):
+    corpus_range = _range_directory(data_root, "corpus", range_id)
+    yield from iter_reference_documents_from_directory(corpus_range)
+
+
+def iter_matchable_reference_records_from_directory(
+    references_directory: Path,
+) -> Iterator[ReferenceRecord]:
+    """Yield matchable references from an explicit M1 range directory."""
+
+    for document_arxiv_id, references in iter_reference_documents_from_directory(
+        references_directory
+    ):
         for reference in references:
             try:
                 reference_arxiv_id = normalize_arxiv_id(reference.get("arxiv_id"))
@@ -102,8 +133,22 @@ def iter_matchable_reference_records(data_root: Path, range_id: str) -> Iterator
                     ref_authors=reference.get("ref_authors"),
                     ref_submission_date=reference.get("ref_submission_date"),
                     ref_s2_id=reference.get("ref_s2_id"),
+                    ref_doi=reference.get("ref_doi"),
+                    ref_publication_date=reference.get("ref_publication_date"),
+                    ref_publication_year=reference.get("ref_publication_year"),
+                    ref_venue=reference.get("ref_venue"),
                 )
             except (KeyError, TypeError, ValueError) as error:
                 raise InputDataError(
                     f"invalid matchable reference in citing publication {document_arxiv_id}"
                 ) from error
+
+
+def iter_matchable_reference_records(
+    data_root: Path,
+    range_id: str,
+) -> Iterator[ReferenceRecord]:
+    """Yield matchable references from the conventional corpus layout."""
+
+    corpus_range = _range_directory(data_root, "corpus", range_id)
+    yield from iter_matchable_reference_records_from_directory(corpus_range)

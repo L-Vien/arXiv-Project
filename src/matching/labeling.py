@@ -218,9 +218,17 @@ def candidate_view(reference: dict) -> dict:
         "ref_authors": clean_text(reference.get("ref_authors")),
         "ref_doi": clean_text(reference.get("ref_doi") or reference.get("doi")),
         "ref_year": clean_text(
-            reference.get("ref_year")
+            reference.get("ref_publication_year")
+            or reference.get("ref_year")
             or reference.get("year")
-            or reference.get("ref_submission_date")
+        ),
+
+        "ref_submission_date": clean_text(
+            reference.get("ref_submission_date")
+        ),
+
+        "ref_venue": clean_text(
+            reference.get("ref_venue") or reference.get("venue")
         ),
     }
 
@@ -618,7 +626,30 @@ def command_validate(args):
 
 
 # ============================================================
-# 7. CLI
+# 7. COMMAND: PREPARE REVIEW BUNDLE
+# ============================================================
+
+def command_prepare_review(args):
+    from .review import prepare_review_bundle
+
+    result = prepare_review_bundle(
+        input_path=args.input,
+        output_dir=args.output_dir,
+        prefill_no_candidates=not args.no_prefill_no_candidates,
+    )
+
+    print("\nReview bundle created successfully!")
+    print("-----------------------------------")
+    print(f"Master review file: {result['master_path']}")
+    print(f"Summary: {result['summary_path']}")
+    print(f"Entries: {result['total_entries']}")
+    print(f"Prefilled no-match entries: {result['prefilled_no_candidate_entries']}")
+    print(f"Publication files: {len(result['publication_files'])}")
+    return 0
+
+
+# ============================================================
+# 8. CLI
 # ============================================================
 
 def build_parser():
@@ -649,6 +680,33 @@ def build_parser():
                           help="Allow independently verified ground truth "
                                "outside the candidate list.")
     validate.set_defaults(func=command_validate)
+
+    review = sub.add_parser(
+        "prepare-review",
+        help="Create a compact review bundle and prefill no-candidate rows.",
+    )
+
+    review.add_argument(
+        "--input",
+        required=True,
+        help="Raw annotation template CSV or Parquet.",
+    )
+
+    review.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory for the master file and publication files.",
+    )
+
+    review.add_argument(
+        "--no-prefill-no-candidates",
+        action="store_true",
+        help="Leave rows with zero candidates pending.",
+    )
+
+    review.set_defaults(
+        func=command_prepare_review
+    )
 
     return parser
 

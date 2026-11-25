@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
 import json
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Mapping
 
-from .contracts import BibtexRecord, CandidatePair, Partition, ReferenceRecord, normalize_arxiv_id
-from .loading import iter_bibtex_records, iter_matchable_reference_records
+from .contracts import (
+    BibtexRecord,
+    CandidatePair,
+    Partition,
+    ReferenceRecord,
+    normalize_arxiv_id,
+)
+from .loading import (
+    iter_bibtex_records,
+    iter_bibtex_records_from_file,
+    iter_matchable_reference_records,
+    iter_matchable_reference_records_from_directory,
+)
 
 
 @dataclass(frozen=True)
@@ -36,7 +47,7 @@ class ValidationReport:
     def add(self, code: str, message: str, arxiv_id: str | None = None) -> None:
         self.issues.append(ValidationIssue(code, message, arxiv_id))
 
-    def extend(self, other: "ValidationReport") -> None:
+    def extend(self, other: ValidationReport) -> None:
         self.checked_records += other.checked_records
         self.issues.extend(other.issues)
 
@@ -139,6 +150,29 @@ def validate_range_inputs(data_root: Path, range_id: str, allowed_paper_ids: set
     return report
 
 
+def validate_input_paths(
+    bibtex_path: Path,
+    references_path: Path,
+    allowed_paper_ids: set[str],
+) -> ValidationReport:
+    """Validate M2 BibTeX and M1 references supplied as explicit paths."""
+
+    report = ValidationReport("input-paths")
+    report.extend(
+        validate_bibtex_records(
+            iter_bibtex_records_from_file(bibtex_path),
+            allowed_paper_ids,
+        )
+    )
+    report.extend(
+        validate_reference_records(
+            iter_matchable_reference_records_from_directory(references_path),
+            allowed_paper_ids,
+        )
+    )
+    return report
+
+
 def write_validation_report(report: ValidationReport, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
@@ -148,14 +182,56 @@ def _paper_ids(path: Path) -> set[str]:
     return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Validate one M3 range against its frozen paper-ID list.")
-    parser.add_argument("--data-root", required=True, type=Path)
-    parser.add_argument("--range-id", required=True)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Validate M1/M2 inputs against a frozen paper-ID list."
+    )
+    parser.add_argument("--bibtex", type=Path, help="Path to the M2 bibtex.jsonl file.")
+    parser.add_argument(
+        "--references",
+        type=Path,
+        help="Path to the M1 range directory containing paper folders.",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        help="Legacy data root containing m2/<range> and corpus/<range>.",
+    )
+    parser.add_argument("--range-id", help="Range name used with --data-root.")
     parser.add_argument("--paper-ids", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     arguments = parser.parse_args()
-    report = validate_range_inputs(arguments.data_root, arguments.range_id, _paper_ids(arguments.paper_ids))
+    uses_explicit_paths = arguments.bibtex is not None or arguments.references is not None
+    uses_legacy_layout = arguments.data_root is not None or arguments.range_id is not None
+
+    if uses_explicit_paths and uses_legacy_layout:
+        parser.error(
+            "use either --bibtex/--references or --data-root/--range-id, not both"
+        )
+    if uses_explicit_paths:
+        if arguments.bibtex is None or arguments.references is None:
+            parser.error("--bibtex and --references must be provided together")
+        report = validate_input_paths(
+            arguments.bibtex,
+            arguments.references,
+            _paper_ids(arguments.paper_ids),
+        )
+    elif arguments.data_root is not None and arguments.range_id is not None:
+        report = validate_range_inputs(
+            arguments.data_root,
+            arguments.range_id,
+            _paper_ids(arguments.paper_ids),
+        )
+    else:
+        parser.error(
+            "provide --bibtex/--references or --data-root/--range-id"
+        )
+
     write_validation_report(report, arguments.output)
     print(f"{report.scope}: {report.error_count} error(s); report: {arguments.output}")
 

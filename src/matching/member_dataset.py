@@ -37,7 +37,7 @@ SCHEMAS: dict[str, pa.Schema] = {
     ]),
     "references": pa.schema([
         pa.field("arxiv_id", pa.string(), nullable=False),
-        pa.field("ref_arxiv_id", pa.string(), nullable=True),
+        pa.field("ref_arxiv_id", pa.string(), nullable=False),
         pa.field("ref_title", pa.string(), nullable=True),
         pa.field("ref_authors", pa.list_(pa.string()), nullable=True),
         pa.field("ref_submission_date", pa.string(), nullable=True),
@@ -338,7 +338,7 @@ def _canonicalize_batch(
             batch.schema.get_field_index(field.name)
         )
 
-        if field.name == "arxiv_id":
+        if field.name in {"arxiv_id", "ref_arxiv_id"}:
             values = [
                 normalize_arxiv_id(value.as_py())
                 if value.is_valid else None
@@ -407,6 +407,15 @@ def _filter_batch(
             keep.append(
                 ids_in_manifest_range(normalized, member_row)
             )
+
+    if table == "references":
+        ref_arxiv = canonical.column(
+            canonical.schema.get_field_index("ref_arxiv_id")
+        )
+        keep = [
+            included and value.is_valid and value.as_py() is not None
+            for included, value in zip(keep, ref_arxiv)
+        ]
 
     if not any(keep):
         empty_arrays = [

@@ -4,13 +4,33 @@ import pandas as pd
 import pytest
 
 from src.matching.selection import (
-    MIN_BIBTEX,
     N_MAIN,
     N_SPARE,
     build_inventory,
     load_references,
     select_manual,
 )
+
+
+def _inventory_rows(count):
+    rows = []
+    for number in range(1, count + 1):
+        bibtex_count = 19 + number
+        arxiv_reference_count = 8
+        rows.append(
+            {
+                "arxiv_id": f"2609.{number:05d}",
+                "bibtex_count": bibtex_count,
+                "reference_count": arxiv_reference_count,
+                "arxiv_reference_count": arxiv_reference_count,
+                "duplicate_reference_count": 0,
+                "arxiv_ref_ratio": arxiv_reference_count / bibtex_count,
+                "missing_title_rate": 0.0,
+                "missing_author_rate": 0.0,
+                "missing_year_rate": 0.0,
+            }
+        )
+    return rows
 
 
 def _write_json(path, value):
@@ -97,34 +117,32 @@ def test_build_inventory_counts_bibtex_and_reference_quality(tmp_path):
 
 
 def test_select_manual_filters_eligibility_and_assigns_partitions_deterministically():
-    inventory = pd.DataFrame(
-        {
-            "arxiv_id": [f"2609.{number:05d}" for number in range(1, 9)],
-            "bibtex_count": [MIN_BIBTEX - 1] + [MIN_BIBTEX] * 7,
-        }
-    )
+    inventory = pd.DataFrame(_inventory_rows(8))
+    ineligible = inventory.iloc[0].copy()
+    ineligible["arxiv_id"] = "2609.99999"
+    ineligible["bibtex_count"] = 19
+    ineligible["arxiv_ref_ratio"] = 8 / 19
+    inventory = pd.concat([pd.DataFrame([ineligible]), inventory], ignore_index=True)
 
     selected = select_manual(inventory, "24127023", "range-01")
     repeated = select_manual(inventory, "24127023", "range-01")
 
     assert len(selected) == N_MAIN + N_SPARE
     assert selected.equals(repeated)
-    assert "2609.00001" not in set(selected["arxiv_id"])
-    assert selected["partition"].tolist() == [
-        "train", "train", "train", "valid", "test", "spare"
-    ]
+    assert "2609.99999" not in set(selected["arxiv_id"])
+    assert selected["partition"].value_counts().to_dict() == {
+        "train": 3,
+        "valid": 1,
+        "test": 1,
+        "spare": 1,
+    }
     assert set(selected["member_id"]) == {"24127023"}
     assert set(selected["range_id"]) == {"range-01"}
     assert set(selected["label_source"]) == {"manual"}
 
 
 def test_select_manual_requires_six_eligible_publications():
-    inventory = pd.DataFrame(
-        {
-            "arxiv_id": ["2609.00001"] * (N_MAIN + N_SPARE - 1),
-            "bibtex_count": [MIN_BIBTEX] * (N_MAIN + N_SPARE - 1),
-        }
-    )
+    inventory = pd.DataFrame(_inventory_rows(N_MAIN + N_SPARE - 1))
 
-    with pytest.raises(ValueError, match="6 are required"):
+    with pytest.raises(ValueError, match="Không chọn được 6 publication"):
         select_manual(inventory, "24127023", "range-01")

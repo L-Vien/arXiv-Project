@@ -18,6 +18,7 @@ _VERSION_SUFFIX = re.compile(r"v\d+$", re.IGNORECASE)
 _ARXIV_URL_PREFIX = re.compile(r"^https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/", re.IGNORECASE)
 _ARXIV_PREFIX = re.compile(r"^arxiv\s*:\s*", re.IGNORECASE)
 _DOI_PREFIX = re.compile(r"^(?:doi\s*:\s*|https?://(?:dx\.)?doi\.org/)", re.IGNORECASE)
+_DOI_VALUE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 
 
 class LabelSource(str, Enum):
@@ -73,13 +74,14 @@ def normalize_arxiv_id(value: str | None) -> str | None:
 
 
 def normalize_doi(value: str | None) -> str | None:
-    """Return a lowercase DOI without a resolver URL or ``doi:`` prefix."""
+    """Return a validated lowercase DOI without a resolver URL or prefix."""
 
     normalized = _optional_text(value)
     if normalized is None:
         return None
     normalized = _DOI_PREFIX.sub("", normalized).strip().lower()
-    return normalized or None
+    match = _DOI_VALUE.search(normalized)
+    return match.group(0).rstrip(".,;:)]}").lower() if match else None
 
 
 def _authors(value: Iterable[str] | None) -> tuple[str, ...]:
@@ -120,6 +122,8 @@ class BibtexRecord:
     doi: str | None = None
     journal: str | None = None
     url: str | None = None
+    title_status: str | None = None
+    title_metadata_status: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "arxiv_id", _required_arxiv_id(self.arxiv_id, "arxiv_id"))
@@ -132,6 +136,28 @@ class BibtexRecord:
         object.__setattr__(self, "doi", normalize_doi(self.doi))
         object.__setattr__(self, "journal", _optional_text(self.journal))
         object.__setattr__(self, "url", _optional_text(self.url))
+        title_status = self.title_status or (
+            "present" if self.title is not None else "missing_source"
+        )
+        title_metadata_status = self.title_metadata_status or (
+            "metadata_available"
+            if (
+                self.authors
+                or self.year is not None
+                or self.doi
+                or self.journal
+                or self.url
+            )
+            else "metadata_empty"
+        )
+        if title_status not in {"present", "missing_source", "missing_parser"}:
+            raise ValueError(f"unknown title_status: {title_status!r}")
+        if title_metadata_status not in {"metadata_available", "metadata_empty"}:
+            raise ValueError(
+                f"unknown title_metadata_status: {title_metadata_status!r}"
+            )
+        object.__setattr__(self, "title_status", title_status)
+        object.__setattr__(self, "title_metadata_status", title_metadata_status)
 
 
 @dataclass(frozen=True)
@@ -142,6 +168,10 @@ class ReferenceRecord:
     ref_authors: tuple[str, ...] = ()
     ref_submission_date: str | None = None
     ref_s2_id: str | None = None
+    ref_doi: str | None = None
+    ref_publication_date: str | None = None
+    ref_publication_year: int | None = None
+    ref_venue: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "arxiv_id", _required_arxiv_id(self.arxiv_id, "arxiv_id"))
@@ -150,6 +180,14 @@ class ReferenceRecord:
         object.__setattr__(self, "ref_authors", _authors(self.ref_authors))
         object.__setattr__(self, "ref_submission_date", _optional_text(self.ref_submission_date))
         object.__setattr__(self, "ref_s2_id", _optional_text(self.ref_s2_id))
+        object.__setattr__(self, "ref_doi", normalize_doi(self.ref_doi))
+        object.__setattr__(self, "ref_publication_date", _optional_text(self.ref_publication_date))
+        if self.ref_publication_year is not None:
+            if isinstance(self.ref_publication_year, bool) or not isinstance(self.ref_publication_year, int):
+                raise TypeError("ref_publication_year must be an integer or None")
+            if not 1600 <= self.ref_publication_year <= 2100:
+                raise ValueError("ref_publication_year is outside the accepted range")
+        object.__setattr__(self, "ref_venue", _optional_text(self.ref_venue))
 
 
 @dataclass(frozen=True)

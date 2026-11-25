@@ -5,9 +5,13 @@ import pytest
 
 from src.matching.labeling import (
     LABEL_COLUMNS,
+    build_parser,
+    candidate_view,
     get_candidates,
+    hint_arxiv_id,
     load_references,
     prepare_annotation_template,
+    rank_candidates,
     save_table,
     validate_labels,
 )
@@ -63,6 +67,40 @@ def test_get_candidates_skips_missing_ids_and_deduplicates_normalized_ids():
         "1706.03762",
         "hep-th/9901001",
     ]
+
+
+def test_candidate_view_keeps_publication_and_submission_years_distinct():
+    candidate = candidate_view(
+        {
+            "ref_arxiv_id": "1706.03762",
+            "ref_publication_year": 2018,
+            "ref_submission_date": "2017-06-12",
+            "ref_venue": "NeurIPS",
+        }
+    )
+
+    assert candidate["ref_year"] == "2018"
+    assert candidate["ref_submission_date"] == "2017-06-12"
+    assert candidate["ref_venue"] == "NeurIPS"
+
+
+def test_rank_candidates_prefers_title_similarity_and_exposes_bibtex_hint():
+    candidates = [
+        {"ref_arxiv_id": "1801.00001", "ref_title": "Unrelated Paper"},
+        {"ref_arxiv_id": "1706.03762", "ref_title": "Attention Is All You Need"},
+    ]
+
+    ranked = rank_candidates("Attention Is All You Need", candidates)
+
+    assert [candidate["ref_arxiv_id"] for candidate in ranked] == [
+        "1706.03762",
+        "1801.00001",
+    ]
+    assert ranked[0]["score"] > ranked[1]["score"]
+    assert hint_arxiv_id(
+        {"url": "https://arxiv.org/abs/1706.03762v2"},
+        ranked,
+    ) == "1706.03762"
 
 
 def test_prepare_template_uses_only_candidates_of_each_assigned_publication(tmp_path):
@@ -160,10 +198,17 @@ def test_validate_labels_checks_status_groundtruth_and_candidate_membership():
     }
     labels = pd.DataFrame([row])
 
-    assert validate_labels(labels) == []
+    errors, warnings = validate_labels(labels)
+
+    assert errors == []
+    assert warnings == ["Publication 2609.07834 has only 1 labels (< 20)."]
+
     labels.loc[0, "groundtruth_arxiv_id"] = "1801.00001"
-    assert any("not in the candidate list" in error for error in validate_labels(labels))
-    assert validate_labels(labels, allow_outside_candidates=True) == []
+    errors, _ = validate_labels(labels)
+    assert any("not in the candidate list" in error for error in errors)
+
+    errors, _ = validate_labels(labels, allow_outside_candidates=True)
+    assert errors == []
 
 
 def test_validate_labels_rejects_invalid_final_and_duplicate_rows():
@@ -180,10 +225,55 @@ def test_validate_labels_rejects_invalid_final_and_duplicate_rows():
     }
     labels = pd.DataFrame([row, row], columns=LABEL_COLUMNS)
 
-    errors = validate_labels(labels, allow_uncertain=False)
+    errors, warnings = validate_labels(labels, allow_uncertain=False)
 
     assert any("Duplicate (arxiv_id, citation_key)" in error for error in errors)
     assert any("uncertain is not allowed" in error for error in errors)
+    assert warnings == ["Publication 2609.07834 has only 2 labels (< 20)."]
+
+
+def test_validate_labels_requires_independent_reviewer_for_final_valid_rows():
+    row = {
+        "arxiv_id": "2609.07834",
+        "citation_key": "key",
+        "groundtruth_arxiv_id": "",
+        "label_source": "manual",
+        "status": "no_match",
+        "annotator": "member-a",
+        "reviewer": "",
+        "confidence": "high",
+        "notes": "",
+        "partition": "valid",
+    }
+    labels = pd.DataFrame([row])
+
+    errors, _ = validate_labels(labels, final=True)
+    assert any("reviewer required" in error for error in errors)
+
+    labels.loc[0, "reviewer"] = "member-a"
+    errors, _ = validate_labels(labels, final=True)
+    assert any("reviewer must differ" in error for error in errors)
+
+    labels.loc[0, "reviewer"] = "member-b"
+    errors, _ = validate_labels(labels, final=True)
+    assert errors == []
+
+
+def test_build_parser_supports_prepare_review_command():
+    args = build_parser().parse_args(
+        [
+            "prepare-review",
+            "--input",
+            "labels_template.csv",
+            "--output-dir",
+            "review",
+        ]
+    )
+
+    assert args.command == "prepare-review"
+    assert args.input == "labels_template.csv"
+    assert args.output_dir == "review"
+    assert args.no_prefill_no_candidates is False
 
 
 def test_save_table_writes_csv_and_rejects_unsupported_extension(tmp_path):

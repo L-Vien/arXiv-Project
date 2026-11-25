@@ -43,6 +43,8 @@ millions of rows. It accepts a portable `data_root` and a `range_id`:
 iter_bibtex_records(data_root, range_id) -> Iterator[BibtexRecord]
 iter_matchable_reference_records(data_root, range_id) -> Iterator[ReferenceRecord]
 iter_reference_documents(data_root, range_id) -> Iterator[(arxiv_id, raw_references)]
+iter_bibtex_records_from_file(path) -> Iterator[BibtexRecord]
+iter_matchable_reference_records_from_directory(path) -> Iterator[ReferenceRecord]
 ```
 
 `iter_bibtex_records` reads `m2/<range_id>/bibtex.jsonl` one row at a time.
@@ -53,6 +55,27 @@ for the final Hugging Face `references` table.
 
 This is the handoff contract for Quốc Học and Bảo Nhi: they consume normalized
 `BibtexRecord` and `ReferenceRecord`, never machine-specific paths or raw JSON.
+The explicit-path variants support member-specific storage layouts and are the
+preferred interface for CLI validation.
+
+### 3.2 Metadata semantics used by M3
+
+The public `references` Parquet table keeps the required course schema only.
+M3 reads the M1 schema-v2 working records, whose additional fields are retained
+in the corpus and loader contract:
+
+| Field | Meaning | Use in matching |
+| --- | --- | --- |
+| `bibtex.year` | Year declared by the citation itself | Compare to candidate publication year; retain null when absent. |
+| `ref_publication_year` / `ref_publication_date` | Bibliographic publication metadata from Semantic Scholar | Weak compatibility feature; may differ from preprint timing. |
+| `ref_submission_date` | First submission of the candidate's arXiv record | Separate temporal feature; never substituted for publication year. |
+| `doi` / `ref_doi` | Canonical bare DOI, if present | Exact equality is a strong positive; missing DOI is not a negative. |
+| `journal` / `ref_venue` | Citation container and candidate venue | Weak normalized similarity feature; a mismatch is not a rejection. |
+
+Feature engineering must use explicit missingness flags (for example
+`both_doi_present`, `publication_year_available`) rather than coercing unknown
+values to empty strings or zero. DOI equality may be used as a high-confidence
+rule or feature; title and author evidence remain necessary when DOI is absent.
 
 ## 4. Canonical values and missing-value policy
 
